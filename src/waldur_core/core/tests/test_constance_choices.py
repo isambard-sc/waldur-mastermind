@@ -26,6 +26,13 @@ class ConstanceAdminFormChoicesTest(TestCase):
         with self.assertRaises(forms.ValidationError):
             field.clean("not-a-valid-layout")
 
+    def test_the_brics_layout_is_a_choice(self):
+        """Fork-only: HomePort's src/auth/layouts/brics/ is registered as
+        "brics", so the value must be exactly that."""
+        field = self.form.fields["LOGIN_PAGE_LAYOUT"]
+        self.assertIn(("brics", "BriCS"), list(field.choices))
+        self.assertEqual(field.clean("brics"), "brics")
+
     def test_multiple_choice_field_becomes_multi_select(self):
         field = self.form.fields["DISABLED_OFFERING_TYPES"]
         self.assertIsInstance(field, forms.MultipleChoiceField)
@@ -91,3 +98,14 @@ class ConstanceChoicesTest(test.APITestCase):
 
         response = self.client.get(self.url)
         self.assertEqual(response.data["DISABLED_OFFERING_TYPES"], [])
+
+    def test_the_brics_login_layout_can_be_saved(self):
+        response = self.client.post(self.url, {"LOGIN_PAGE_LAYOUT": "brics"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response = self.client.get(self.url)
+        self.assertEqual(response.data["LOGIN_PAGE_LAYOUT"], "brics")
+
+    def test_an_unknown_login_layout_is_still_rejected(self):
+        response = self.client.post(self.url, {"LOGIN_PAGE_LAYOUT": "not-a-layout"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("LOGIN_PAGE_LAYOUT", response.data)

@@ -100,8 +100,11 @@ This document lists all mixin classes found in the Waldur codebase.
 | [`ResourceDetailsMixin`](#resourcedetailsmixin) | `waldur_mastermind.marketplace.models` | Mixin combining resource details with cost estimation |
 | [`SafeAttributesMixin`](#safeattributesmixin) | `waldur_mastermind.marketplace.models` | Mixin for safe attribute handling |
 | [`MemberSyncFieldsMixin`](#membersyncfieldsmixin) | `waldur_mastermind.marketplace.serializers` | Adds agent-reported sync fields to a UserRole-shaped serializer |
+| [`UserProfileAttributeFieldsMixin`](#userprofileattributefieldsmixin) | `waldur_mastermind.marketplace.serializers` | Read-only ``user_<attr>`` fields for the personal-data attributes an offering... |
 | [`DerivedLimitsOrderMixin`](#derivedlimitsordermixin) | `waldur_mastermind.marketplace.tests.test_derived_limits` | No description available |
 | [`LimitActionPermissionMixin`](#limitactionpermissionmixin) | `waldur_mastermind.marketplace.tests.test_order_creation_permission` | No description available |
+| [`ScopeHelperAgreementMixin`](#scopehelperagreementmixin) | `waldur_mastermind.marketplace.tests.test_scope_helpers_by_permission` | Each helper must list exactly the scopes has_permission allows |
+| [`GrantMixin`](#grantmixin) | `waldur_mastermind.marketplace.tests.test_slug_permissions` | No description available |
 | [`ConnectedOfferingDetailsMixin`](#connectedofferingdetailsmixin) | `waldur_mastermind.marketplace.views` | Mixin to provide offering details action for connected resources |
 | [`ConnectedResourceDetailsMixin`](#connectedresourcedetailsmixin) | `waldur_mastermind.marketplace.views` | Mixin to provide resource details action for connected resources |
 | [`OfferingUsageMixin`](#offeringusagemixin) | `waldur_mastermind.marketplace.views` | Shared logic for customer/project per-offering usage ViewSets |
@@ -109,13 +112,18 @@ This document lists all mixin classes found in the Waldur codebase.
 | [`TenantMixin`](#tenantmixin) | `waldur_mastermind.marketplace_openstack.processors` | No description available |
 | [`SelectiveDNSMockMixin`](#selectivednsmockmixin) | `waldur_mastermind.marketplace_remote.tests.dns_utils` | Mixin class that provides selective DNS mocking for test classes |
 | [`ContainerExecutorMixin`](#containerexecutormixin) | `waldur_mastermind.marketplace_script.utils` | Mixin to execute scripts in containers for marketplace script processing |
+| [`AppserviceErrorCountMixin`](#appserviceerrorcountmixin) | `waldur_mastermind.matrix_chat.views` | Counts the view's 4xx and 5xx answers for the webhook_errors diagnostic |
 | [`MatrixEnabledWriteGuardMixin`](#matrixenabledwriteguardmixin) | `waldur_mastermind.matrix_chat.views` | Reject mutating requests while the Matrix integration is disabled |
 | [`EstimatedCostPolicyMixin`](#estimatedcostpolicymixin) | `waldur_mastermind.policy.models` | Make subclasses preserve the alters_data attribute on overridden methods |
 | [`OfferingPolicySerializerMixin`](#offeringpolicyserializermixin) | `waldur_mastermind.policy.serializers` | This mixin provides several extensions to stock Serializer class:  1 |
 | [`CallNotArchivedCreateMixin`](#callnotarchivedcreatemixin) | `waldur_mastermind.proposal.serializers` | Provide the ``validate_call_not_archived`` hook used by ``ActionMethodMixin |
+| [`ApplicantIdentityTestMixin`](#applicantidentitytestmixin) | `waldur_mastermind.proposal.tests.test_applicant_identity_paths` | No description available |
 | [`AssignmentBatchTestMixin`](#assignmentbatchtestmixin) | `waldur_mastermind.proposal.tests.test_assignment_batch_notifications` | No description available |
+| [`ApplicantRolesMixin`](#applicantrolesmixin) | `waldur_mastermind.proposal.tests.test_notification_roles` | No description available |
 | [`ManagerSetupMixin`](#managersetupmixin) | `waldur_mastermind.proposal.tests.test_pool_invitation_expiry` | No description available |
+| [`ProposalAdminMixin`](#proposaladminmixin) | `waldur_mastermind.proposal.tests.test_proposal_admin` | No description available |
 | [`ProposalComplianceTestMixin`](#proposalcompliancetestmixin) | `waldur_mastermind.proposal.tests.test_proposal_compliance` | Common setup for proposal compliance tests |
+| [`ProposalTeamMixin`](#proposalteammixin) | `waldur_mastermind.proposal.tests.test_proposal_team` | No description available |
 | [`InvitationAcceptanceMixin`](#invitationacceptancemixin) | `waldur_mastermind.proposal.views` | Mixin providing common logic for accepting/declining reviewer pool invitations |
 | [`BackendNameMixin`](#backendnamemixin) | `waldur_mastermind.support.models` | Make subclasses preserve the alters_data attribute on overridden methods |
 | [`FileMixin`](#filemixin) | `waldur_mastermind.support.models` | Mixin to provide file-related functionality and properties |
@@ -128,7 +136,10 @@ This document lists all mixin classes found in the Waldur codebase.
 | [`TenantQuotaMixin`](#tenantquotamixin) | `waldur_openstack.models` | It allows to update both service settings and shared tenant quotas |
 | [`LimitedPerTypeThrottleMixin`](#limitedpertypethrottlemixin) | `waldur_openstack.tasks` | No description available |
 | [`TenantMixin`](#tenantmixin) | `waldur_openstack.tests.factories` | No description available |
+| [`SharedSubnetMixin`](#sharedsubnetmixin) | `waldur_openstack.tests.test_rbac_shared_subnet_actions` | No description available |
+| [`UnmanagedOwnerShareMixin`](#unmanagedownersharemixin) | `waldur_openstack.tests.test_unmanaged_owner_share` | No description available |
 | [`LBaaSAuditMixin`](#lbaasauditmixin) | `waldur_openstack.views` | Emit lifecycle audit events for LBaaS resources on create/update/delete |
+| [`UnmanagedOwnerReadOnlyMixin`](#unmanagedownerreadonlymixin) | `waldur_openstack.views` | Refuse write actions on a tenant Waldur does not manage, and on its networks |
 | [`DataciteMixin`](#datacitemixin) | `waldur_pid.mixins` | A marker model for models that can be registered with PIDs and referred to in... |
 | [`RoleMixin`](#rolemixin) | `waldur_rancher.models` | Make subclasses preserve the alters_data attribute on overridden methods |
 | [`SettingsMixin`](#settingsmixin) | `waldur_rancher.models` | Make subclasses preserve the alters_data attribute on overridden methods |
@@ -803,7 +814,12 @@ but remains active for list views (where parent is a ListSerializer).
 
 **Description:**
 
-Ensures that slug is editable only by staff
+Ensures that slug is editable only by staff.
+
+A serializer that sets ``slug_create_permission`` also accepts a slug on
+create from a caller holding that permission, checked on the scope that
+``get_slug_permission_scope`` returns. Defining such a serializer without
+the hook fails at import, so the check cannot be left out.
 
 **Base classes:** `Serializer`
 
@@ -1411,6 +1427,21 @@ which is distinct from any real state.
 
 **Base classes:** `Serializer`
 
+### UserProfileAttributeFieldsMixin
+
+**Module:** `waldur_mastermind.marketplace.serializers`
+
+**Description:**
+
+Read-only ``user_<attr>`` fields for the personal-data attributes an
+offering may expose to its service provider (OfferingUserAttributeConfig).
+
+Sources are relative to an object with a ``user`` attribute, so the mixin
+serves both offering users and user role grants. Username, full name and
+email are declared by the serializers themselves.
+
+**Base classes:** `Serializer`
+
 ### DerivedLimitsOrderMixin
 
 **Module:** `waldur_mastermind.marketplace.tests.test_derived_limits`
@@ -1420,6 +1451,20 @@ which is distinct from any real state.
 ### LimitActionPermissionMixin
 
 **Module:** `waldur_mastermind.marketplace.tests.test_order_creation_permission`
+
+**Description:** No description available.
+
+### ScopeHelperAgreementMixin
+
+**Module:** `waldur_mastermind.marketplace.tests.test_scope_helpers_by_permission`
+
+**Description:**
+
+Each helper must list exactly the scopes has_permission allows.
+
+### GrantMixin
+
+**Module:** `waldur_mastermind.marketplace.tests.test_slug_permissions`
 
 **Description:** No description available.
 
@@ -1450,9 +1495,10 @@ Shared logic for customer/project per-offering usage ViewSets.
 Subclasses provide:
 
 - `queryset` — Customer or Project queryset (the route lookup target)
-- `_scope_resources(scope, offering=None)` — returns the non-terminated
+- `_scope_resources(scope, offering=None)` — returns the resources at this
 
-  resources visible at this scope, optionally filtered to one offering
+  scope (non-terminated unless `include_terminated` is set), optionally
+  filtered to one offering
 
 ### PublicViewsetMixin
 
@@ -1492,6 +1538,14 @@ class MyTestClass(SelectiveDNSMockMixin, test.APITransactionTestCase):
 **Description:**
 
 Mixin to execute scripts in containers for marketplace script processing.
+
+### AppserviceErrorCountMixin
+
+**Module:** `waldur_mastermind.matrix_chat.views`
+
+**Description:**
+
+Counts the view's 4xx and 5xx answers for the webhook_errors diagnostic.
 
 ### MatrixEnabledWriteGuardMixin
 
@@ -1626,15 +1680,33 @@ The hook is looked up by name on the serializer and called with the parent
 Call. It keeps archived calls read-only across their nested-create surface
 (offerings / resource templates / workflow steps).
 
+### ApplicantIdentityTestMixin
+
+**Module:** `waldur_mastermind.proposal.tests.test_applicant_identity_paths`
+
+**Description:** No description available.
+
 ### AssignmentBatchTestMixin
 
 **Module:** `waldur_mastermind.proposal.tests.test_assignment_batch_notifications`
 
 **Description:** No description available.
 
+### ApplicantRolesMixin
+
+**Module:** `waldur_mastermind.proposal.tests.test_notification_roles`
+
+**Description:** No description available.
+
 ### ManagerSetupMixin
 
 **Module:** `waldur_mastermind.proposal.tests.test_pool_invitation_expiry`
+
+**Description:** No description available.
+
+### ProposalAdminMixin
+
+**Module:** `waldur_mastermind.proposal.tests.test_proposal_admin`
 
 **Description:** No description available.
 
@@ -1645,6 +1717,12 @@ Call. It keeps archived calls read-only across their nested-create surface
 **Description:**
 
 Common setup for proposal compliance tests.
+
+### ProposalTeamMixin
+
+**Module:** `waldur_mastermind.proposal.tests.test_proposal_team`
+
+**Description:** No description available.
 
 ### InvitationAcceptanceMixin
 
@@ -1753,6 +1831,18 @@ It allows to update both service settings and shared tenant quotas.
 
 **Description:** No description available.
 
+### SharedSubnetMixin
+
+**Module:** `waldur_openstack.tests.test_rbac_shared_subnet_actions`
+
+**Description:** No description available.
+
+### UnmanagedOwnerShareMixin
+
+**Module:** `waldur_openstack.tests.test_unmanaged_owner_share`
+
+**Description:** No description available.
+
 ### LBaaSAuditMixin
 
 **Module:** `waldur_openstack.views`
@@ -1764,6 +1854,18 @@ Emit lifecycle audit events for LBaaS resources on create/update/delete.
 Designed to be mixed into ViewSets that also use ExecutorMixin. The events
 fire from the API request thread, so they carry actor context (user, IP,
 request id) auto-attached by CaptureEventContextMiddleware.
+
+### UnmanagedOwnerReadOnlyMixin
+
+**Module:** `waldur_openstack.views`
+
+**Description:**
+
+Refuse write actions on a tenant Waldur does not manage, and on its networks.
+
+Such a tenant is an OpenStack project that only shares networks with
+managed tenants. Waldur holds no credentials for it, and the project and its
+networks are not Waldur's to change, so it is only ever read.
 
 ### DataciteMixin
 

@@ -237,6 +237,22 @@ options:
 
 ```
 
+## backfill_provider_project_groups
+
+Create POSIX project groups for projects that already have resources at a service provider with project groups enabled, and allocate missing GIDs.
+
+```bash
+
+usage: waldur backfill_provider_project_groups [--provider PROVIDER]
+                                               [--dry-run]
+
+options:
+  --provider PROVIDER  Limit the run to the service provider with the given
+                       UUID. May be given multiple times.
+  --dry-run            Report what would be done without writing anything.
+
+```
+
 ## check_provider_helpdesks
 
 Check connectivity of all active provider helpdesks.
@@ -900,9 +916,35 @@ options:
 
 ```
 
+## init_matrix_settings
+
+Seed Matrix Constance settings from the environment. Each seedable setting is read from the environment variable of the same name; other MATRIX_* variables are ignored. Both waldur-helm and waldur-docker-compose set them. Supplied values are overwritten on every run, because the deployment owns them. MATRIX_ENABLED, when not supplied, is switched on only at the first seeding, when neither the tokens marker nor an appservice token is stored, so an administrator who turns chat off keeps it off. Appservice tokens already in Constance that the deployment did not seed are never replaced.
+
 ## init_service_desk_defaults
 
 Seed the terminal issue statuses, and the default request type used by the built-in service desk. Existing rows are left untouched, so the command is safe to re-run. Request types are seeded only when the active backend is one Waldur owns; a deployment backed by a remote service desk gets its types from there.
+
+## link_matrix_account
+
+Link a Waldur user to a Matrix account that already exists on the homeserver. Provisioning refuses to take over accounts this Waldur did not create; use this once you know the account belongs to the user.
+
+```bash
+
+usage: waldur link_matrix_account [--all] [username] [matrix_user_id]
+
+positional arguments:
+  username        Waldur username
+  matrix_user_id  e.g. @alice:chat.example.org
+
+options:
+  --all           Link every user without a Matrix profile to the existing
+                  account with their generated Matrix ID. Only for a Waldur
+                  database that was restored or reset against a homeserver
+                  whose accounts all belong to this Waldur's users. Users with
+                  '+' in their username provisioned before Waldur kept '+'
+                  have '_' in its place; link them by hand.
+
+```
 
 ## list_missing_resources
 
@@ -1040,6 +1082,10 @@ options:
                         defined in DB.
 
 ```
+
+## matrix_bot
+
+Run the Matrix bot: Waldur's encrypted member of every Waldur room. It answers commands and posts everything Waldur sends as the bot. Run exactly one; a second process refuses to start while the first holds the bot's lease. Until the homeserver and appservice are configured it waits, and when they change it starts over with the new settings.
 
 ## migrate_fresh
 
@@ -1451,10 +1497,66 @@ Re-encrypt stored secrets under the current FIELD_ENCRYPTION_KEY. Run this after
 
 ```bash
 
-usage: waldur reencrypt_fields [--dry-run]
+usage: waldur reencrypt_fields [--dry-run] [--encrypt-plaintext-settings]
 
 options:
-  --dry-run  Report what would be re-encrypted without writing anything
+  --dry-run             Report what would be re-encrypted without writing
+                        anything
+  --encrypt-plaintext-settings
+                        Also encrypt secret Constance settings stored in
+                        clear, e.g. saved by a pod of an older release during
+                        a rolling upgrade
+
+```
+
+## register_matrix_appservice
+
+Register Waldur's appservice on a Conduit-family homeserver (Tuwunel) via its admin-room command, so no operator has to paste the registration YAML into a Matrix client. Synapse is not supported — it loads appservices from app_service_config_files at startup instead. It acts as the bootstrap admin, @waldur-bootstrap. The first run creates it through the homeserver's shared-secret registration, keyed with MATRIX_USER_REGISTRATION_SECRET, which must also be the homeserver's registration_shared_secret; later runs sign in as it. Set MATRIX_BOOTSTRAP_PASSWORD in the environment and keep it: it is the bootstrap admin's password, and without it no bootstrap admin is created. Set MATRIX_ADMIN_TOKEN to an admin's access token to act as that admin instead, which later runs need when password login is off on the homeserver. The bootstrap admin is signed out when the command ends; an admin token is not.
+
+```bash
+
+usage: waldur register_matrix_appservice --url URL
+                                         [--homeserver-url HOMESERVER_URL]
+                                         [--registration-token REGISTRATION_TOKEN]
+                                         [--admin-token ADMIN_TOKEN]
+                                         [--admin-room ADMIN_ROOM]
+                                         [--bootstrap-localpart BOOTSTRAP_LOCALPART]
+                                         [--as-token AS_TOKEN]
+                                         [--hs-token HS_TOKEN]
+
+options:
+  --url URL             Base URL of the Waldur instance, as reachable from the
+                        homeserver.
+  --homeserver-url HOMESERVER_URL
+                        Homeserver client-server API URL (default:
+                        MATRIX_HOMESERVER_URL).
+  --registration-token REGISTRATION_TOKEN
+                        Homeserver registration token, which must also be its
+                        registration_shared_secret: the bootstrap admin is
+                        created through the shared-secret registration keyed
+                        with it (default: MATRIX_USER_REGISTRATION_SECRET from
+                        Constance). Whoever holds it can create homeserver
+                        admins. Prefer setting it there, from the environment
+                        through the deployment: an argument shows up in
+                        process listings.
+  --admin-token ADMIN_TOKEN
+                        Access token of an existing homeserver admin, used
+                        instead of registering a bootstrap user. Prefer the
+                        MATRIX_ADMIN_TOKEN environment variable: an argument
+                        shows up in process listings.
+  --admin-room ADMIN_ROOM
+                        Admin room ID, if it cannot be discovered
+                        automatically.
+  --bootstrap-localpart BOOTSTRAP_LOCALPART
+                        Localpart of the bootstrap admin user to create.
+  --as-token AS_TOKEN   Override as_token (default: MATRIX_APPSERVICE_AS_TOKEN
+                        from Constance). Prefer setting it there, from the
+                        environment through the deployment: an argument shows
+                        up in process listings.
+  --hs-token HS_TOKEN   Override hs_token (default: MATRIX_APPSERVICE_HS_TOKEN
+                        from Constance). Prefer setting it there, from the
+                        environment through the deployment: an argument shows
+                        up in process listings.
 
 ```
 
@@ -1464,7 +1566,7 @@ Remove Django event log records with stale content types.
 
 ## reprovision_matrix_rooms
 
-Reset every active Matrix room and provisioned user profile so the homeserver rebuilds them. Use after moving to a new homeserver, whose room ids and user tokens are different from the old one's. Do not run it against the homeserver the rooms already live on: old rooms are not deleted, so each one keeps its history while Waldur replaces it with an empty room. Equivalent to POST /api/admin/matrix/reprovision/, for deployments where reaching the API as staff is harder than reaching a shell.
+Reset every active Matrix room and provisioned user profile so the homeserver rebuilds them. Use after moving to a new homeserver, whose room ids and user accounts are different from the old one's. Do not run it against the homeserver the rooms already live on: old rooms are not deleted, so each one keeps its history while Waldur replaces it with an empty room. Equivalent to POST /api/admin/matrix/reprovision/, for deployments where reaching the API as staff is harder than reaching a shell.
 
 ```bash
 

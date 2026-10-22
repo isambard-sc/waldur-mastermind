@@ -531,23 +531,61 @@ class ServiceAccountState:
 
 class ResourceApiKeyStates:
     # Reuses the resource state vocabulary so the portal renders keys with the
-    # standard StateIndicator: Creating/Updating show a spinner, OK is green,
-    # Erred is red. There is no Terminating: the key count is fixed at
-    # provisioning and rotation replaces a value in place, so no consumer action
-    # removes a key.
+    # standard StateIndicator: Creating/Updating/Deleting show a spinner, OK is
+    # green, Erred is red. Paused is a settled state: the key keeps its value but
+    # the backend refuses it. Deleted is terminal and soft — the row survives so
+    # the usage it reported stays part of the resource's history.
     CREATING = "Creating"
     OK = "OK"
     UPDATING = "Updating"
+    PAUSED = "Paused"
+    DELETING = "Deleting"
+    DELETED = "Deleted"
     ERRED = "Erred"
 
     CHOICES = (
         (CREATING, CREATING),
         (OK, OK),
         (UPDATING, UPDATING),
+        (PAUSED, PAUSED),
+        (DELETING, DELETING),
+        (DELETED, DELETED),
         (ERRED, ERRED),
     )
 
     VALUES = [val for (_, val) in CHOICES]
+
+
+class ResourceApiKeyActions:
+    """A command Waldur sends the site agent about one resource API key.
+
+    Carried as ``action`` in the command payload and stored as the key's
+    ``pending_action`` while the agent works on it, so the portal can tell a
+    rotation from a pause although both show the key as Updating.
+    """
+
+    CREATE = "create"
+    ROTATE = "rotate"
+    PAUSE = "pause"
+    RESUME = "resume"
+    DELETE = "delete"
+    UPDATE = "update"
+
+    CHOICES = (
+        (CREATE, "Create"),
+        (ROTATE, "Rotate"),
+        (PAUSE, "Pause"),
+        (RESUME, "Resume"),
+        (DELETE, "Delete"),
+        (UPDATE, "Update"),
+    )
+
+    VALUES = [val for (val, _) in CHOICES]
+
+    # Commands that tell the agent the key's limits and model allowlist. A resume
+    # carries them too: settings edited while the key was paused are applied
+    # when it comes back.
+    CARRY_SETTINGS = (CREATE, UPDATE, RESUME)
 
 
 ServiceAccountStatesType = Literal[
@@ -646,66 +684,4 @@ class ResourceAction:
         (VIEW_DETAILS, _("View details")),
         (SYNCHRONIZE, _("Synchronize")),
         (VERSION_HISTORY, _("Version history")),
-    )
-
-
-class KpiAggregations:
-    """How a KPI's datapoints roll up into one project-level figure.
-
-    The names match the OpenTelemetry aggregations a metric already carries, so
-    a service emitting OTel metrics maps onto these directly instead of
-    learning a second vocabulary for the same idea.
-    """
-
-    SUM = "sum"
-    AVERAGE = "avg"
-    LAST = "last"
-    MIN = "min"
-    MAX = "max"
-
-    CHOICES = (
-        (SUM, _("Sum")),
-        (AVERAGE, _("Average")),
-        (LAST, _("Last value")),
-        (MIN, _("Minimum")),
-        (MAX, _("Maximum")),
-    )
-
-
-class KpiDirections:
-    """Which way a KPI has to move to count as an improvement.
-
-    A dashboard cannot infer this: more course completions is good, more
-    unresolved tickets is not, and the same number carries either meaning
-    depending on what it measures.
-    """
-
-    HIGHER_IS_BETTER = "up"
-    LOWER_IS_BETTER = "down"
-    NEUTRAL = "neutral"
-
-    CHOICES = (
-        (HIGHER_IS_BETTER, _("Higher is better")),
-        (LOWER_IS_BETTER, _("Lower is better")),
-        (NEUTRAL, _("Neutral")),
-    )
-
-
-class KpiCadences:
-    """How often the service is expected to report a KPI.
-
-    The dashboard shows this next to the figure and uses it to say when a
-    declared KPI is overdue its first report.
-    """
-
-    DAILY = "daily"
-    WEEKLY = "weekly"
-    MONTHLY = "monthly"
-    QUARTERLY = "quarterly"
-
-    CHOICES = (
-        (DAILY, _("Daily")),
-        (WEEKLY, _("Weekly")),
-        (MONTHLY, _("Monthly")),
-        (QUARTERLY, _("Quarterly")),
     )

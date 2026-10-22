@@ -117,7 +117,13 @@ class EventType(StrEnum):
     MARKETPLACE_RESOURCE_UPDATE_END_DATE_SUCCEEDED = (
         "marketplace_resource_update_end_date_succeeded"
     )
+    MARKETPLACE_RESOURCE_API_KEY_REQUESTED = "marketplace_resource_api_key_requested"
     MARKETPLACE_RESOURCE_API_KEY_ROTATED = "marketplace_resource_api_key_rotated"
+    MARKETPLACE_RESOURCE_API_KEY_PAUSED = "marketplace_resource_api_key_paused"
+    MARKETPLACE_RESOURCE_API_KEY_RESUMED = "marketplace_resource_api_key_resumed"
+    MARKETPLACE_RESOURCE_API_KEY_UPDATED = "marketplace_resource_api_key_updated"
+    MARKETPLACE_RESOURCE_API_KEY_DELETED = "marketplace_resource_api_key_deleted"
+    MARKETPLACE_RESOURCE_API_KEY_FAILED = "marketplace_resource_api_key_failed"
     MARKETPLACE_RESOURCE_API_KEY_REVEALED = "marketplace_resource_api_key_revealed"
     MARKETPLACE_RESOURCE_UPDATE_FAILED = "marketplace_resource_update_failed"
     MARKETPLACE_RESOURCE_UPDATE_LIMITS_FAILED = (
@@ -267,8 +273,16 @@ class EventType(StrEnum):
     PROJECT_PERMISSION_REVIEW_CLOSED = "project_permission_review_closed"
     PROPOSAL_CANCELED = "proposal_canceled"
     PROPOSAL_DOCUMENT_ADDED = "proposal_document_added"
+    PROPOSAL_DRAFT_CARRIED_OVER = "proposal_draft_carried_over"
     PROPOSAL_DOCUMENT_REMOVED = "proposal_document_removed"
+    PROPOSAL_DECISION_REOPENED = "proposal_decision_reopened"
+    PROPOSAL_REJECTED_AT_ROUND_COMPLETION = "proposal_rejected_at_round_completion"
     PROPOSAL_WORKFLOW_ADVANCED = "proposal_workflow_advanced"
+    ROUND_CLOSED = "round_closed"
+    ROUND_DECISION_STARTED = "round_decision_started"
+    ROUND_EVALUATION_STARTED = "round_evaluation_started"
+    ROUND_RESULTS_PUBLISHED = "round_results_published"
+    ROUND_UNDECIDED_PROPOSALS_REJECTED = "round_undecided_proposals_rejected"
     QUERY_EXECUTED = "query_executed"
     INCREASE_OF_CUSTOMER_CREDIT_DUE_TO_AFFILIATE_FEE = (
         "increase_of_customer_credit_due_to_affiliate_fee"
@@ -424,6 +438,10 @@ class EventType(StrEnum):
     USER_PASSWORD_UPDATED = "user_password_updated"
     USER_PASSWORD_UPDATED_BY_STAFF = "user_password_updated_by_staff"
     USER_PASSWORD_REMOVED_BY_STAFF = "user_password_removed_by_staff"
+    MATRIX_PASSWORD_GENERATED = "matrix_password_generated"
+    MATRIX_RECOVERY_KEY_ESCROWED = "matrix_recovery_key_escrowed"
+    MATRIX_RECOVERY_KEY_VIEWED = "matrix_recovery_key_viewed"
+    MATRIX_ENCRYPTION_RESET_STARTED = "matrix_encryption_reset_started"
     USER_UPDATE_SUCCEEDED = "user_update_succeeded"
     USER_GROUP_INVITATION_UPDATED = "user_group_invitation_updated"
     USER_INVITATION_UPDATED = "user_invitation_updated"
@@ -651,7 +669,15 @@ EVENT_GROUP_MAPPING = {
         EventType.PROPOSAL_CANCELED,
         EventType.PROPOSAL_DOCUMENT_ADDED,
         EventType.PROPOSAL_DOCUMENT_REMOVED,
+        EventType.PROPOSAL_DRAFT_CARRIED_OVER,
+        EventType.PROPOSAL_DECISION_REOPENED,
+        EventType.PROPOSAL_REJECTED_AT_ROUND_COMPLETION,
         EventType.PROPOSAL_WORKFLOW_ADVANCED,
+        EventType.ROUND_CLOSED,
+        EventType.ROUND_DECISION_STARTED,
+        EventType.ROUND_EVALUATION_STARTED,
+        EventType.ROUND_RESULTS_PUBLISHED,
+        EventType.ROUND_UNDECIDED_PROPOSALS_REJECTED,
     ],
     EventGroup.PROVIDERS: [
         EventType.MARKETPLACE_PROVIDER_PROJECT_GROUP_GID_UPDATED,
@@ -718,8 +744,14 @@ EVENT_GROUP_MAPPING = {
         EventType.MARKETPLACE_RESOURCE_TERMINATE_REQUESTED,
         EventType.MARKETPLACE_RESOURCE_TERMINATE_SUCCEEDED,
         EventType.MARKETPLACE_RESOURCE_UNLINKED,
+        EventType.MARKETPLACE_RESOURCE_API_KEY_DELETED,
+        EventType.MARKETPLACE_RESOURCE_API_KEY_FAILED,
+        EventType.MARKETPLACE_RESOURCE_API_KEY_PAUSED,
+        EventType.MARKETPLACE_RESOURCE_API_KEY_REQUESTED,
+        EventType.MARKETPLACE_RESOURCE_API_KEY_RESUMED,
         EventType.MARKETPLACE_RESOURCE_API_KEY_REVEALED,
         EventType.MARKETPLACE_RESOURCE_API_KEY_ROTATED,
+        EventType.MARKETPLACE_RESOURCE_API_KEY_UPDATED,
         EventType.MARKETPLACE_RESOURCE_UPDATE_CANCELED,
         EventType.MARKETPLACE_RESOURCE_UPDATE_END_DATE_SUCCEEDED,
         EventType.MARKETPLACE_RESOURCE_UPDATE_FAILED,
@@ -909,6 +941,10 @@ EVENT_GROUP_MAPPING = {
         EventType.USER_PASSWORD_UPDATED,
         EventType.USER_PASSWORD_UPDATED_BY_STAFF,
         EventType.USER_PASSWORD_REMOVED_BY_STAFF,
+        EventType.MATRIX_PASSWORD_GENERATED,
+        EventType.MATRIX_RECOVERY_KEY_ESCROWED,
+        EventType.MATRIX_RECOVERY_KEY_VIEWED,
+        EventType.MATRIX_ENCRYPTION_RESET_STARTED,
         EventType.USER_UPDATE_SUCCEEDED,
         EventType.USER_GROUP_INVITATION_UPDATED,
         EventType.USER_INVITATION_UPDATED,
@@ -1060,6 +1096,11 @@ class ObservableObjectType(Enum):
     # knows the older type keeps working -- and one that does not recognise this
     # one drops it with a warning rather than mis-handling it.
     SERVICE_PROVIDER_ACCOUNT = "service_provider_account"
+    # A provider project group created, numbered or deleted, or project groups
+    # switched on or off for the provider. Delivered to every offering of the
+    # provider, so the agent writing a shared directory hears it at once rather
+    # than on its next periodic pass.
+    SERVICE_PROVIDER_PROJECT_GROUP = "service_provider_project_group"
     # Proposal-domain state changes, scoped to the call and its organiser so
     # consumers bound to a call or a proposal receive them.
     CALL = "call"

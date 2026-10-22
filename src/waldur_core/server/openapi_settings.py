@@ -4,6 +4,7 @@ from waldur_core.logging.enums import ObservableObjectType, QueueKind
 from waldur_core.onboarding.enums import VerificationStatus
 from waldur_core.permissions.enums import TYPE_MAP
 from waldur_core.server.constance_settings import (
+    MATRIX_EXTERNAL_LOGIN_METHOD_CHOICES,
     NOTIFY_SYSTEM_CHOICES,
     OFFERING_TYPE_CHOICES,
     ONBOARDING_VALIDATION_CHOICES,
@@ -24,12 +25,14 @@ from waldur_mastermind.marketplace.enums import (
     OfferingUserStates,
     OrderStates,
     OrderTypes,
+    ResourceApiKeyActions,
     ResourceApiKeyStates,
     ResourceStates,
     RobotAccountStates,
     ServiceAccountState,
     SwitchBillingModes,
 )
+from waldur_mastermind.marketplace_metrics import enums as metrics_enums
 from waldur_mastermind.marketplace_site_agent.enums import AgentServiceState
 from waldur_mastermind.proposal.enums import (
     WORKFLOW_STEPS_CHOICES,
@@ -86,6 +89,10 @@ SPECTACULAR_SETTINGS = {
     "COMPONENT_SPLIT_REQUEST": True,
     "SCHEMA_PATH_PREFIX": "/api/",
     "ENUM_NAME_OVERRIDES": {
+        "MetricKindEnum": metrics_enums.MetricKinds.CHOICES,
+        # Shared by the Constance setting and the credentials response, so the
+        # SDK gets one named type instead of a generic MethodEnum.
+        "MatrixExternalLoginMethodEnum": MATRIX_EXTERNAL_LOGIN_METHOD_CHOICES,
         # A rule's "project_field" would otherwise take ProjectFieldEnum, the
         # name of the projects endpoints' field selector.
         "SramProjectRuleField": sram_enums.ProjectField.choices,
@@ -111,6 +118,7 @@ SPECTACULAR_SETTINGS = {
         "KeycloakUserGroupMembershipState": KeycloakUserGroupMembershipState.CHOICES,
         "RancherCatalogScopeType": CatalogScopeTypeChoices,
         "ResourceApiKeyState": ResourceApiKeyStates.VALUES,
+        "ResourceApiKeyAction": ResourceApiKeyActions.CHOICES,
         "RobotAccountStates": RobotAccountStates.VALUES,
         "ChecklistOperators": checklist_enums.OPERATORS,
         "ServiceAccountState": ServiceAccountState.VALUES,

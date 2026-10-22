@@ -77,9 +77,7 @@ class FormbricksFlowKeySettingTest(test.APITestCase):
         self.assertIsNone(self.call.formbricks_flow_key)
 
     def test_change_refused_once_any_proposal_exists(self):
-        factories.ProposalFactory(
-            round=self.fixture.round, state=ProposalStates.DRAFT
-        )
+        factories.ProposalFactory(round=self.fixture.round, state=ProposalStates.DRAFT)
 
         response = self.patch("AIRR-GW")
 
@@ -93,9 +91,7 @@ class FormbricksFlowKeySettingTest(test.APITestCase):
     def test_clearing_refused_once_any_proposal_exists(self):
         self.call.formbricks_flow_key = "AIRR-GW"
         self.call.save(update_fields=["formbricks_flow_key"])
-        factories.ProposalFactory(
-            round=self.fixture.round, state=ProposalStates.DRAFT
-        )
+        factories.ProposalFactory(round=self.fixture.round, state=ProposalStates.DRAFT)
 
         response = self.patch(None)
 
@@ -108,9 +104,7 @@ class FormbricksFlowKeySettingTest(test.APITestCase):
     def test_switching_flows_refused_once_any_proposal_exists(self):
         self.call.formbricks_flow_key = "AIRR-GW"
         self.call.save(update_fields=["formbricks_flow_key"])
-        factories.ProposalFactory(
-            round=self.fixture.round, state=ProposalStates.DRAFT
-        )
+        factories.ProposalFactory(round=self.fixture.round, state=ProposalStates.DRAFT)
 
         response = self.patch("AIRR-RA")
 
@@ -123,9 +117,7 @@ class FormbricksFlowKeySettingTest(test.APITestCase):
     def test_resending_the_current_value_is_not_a_change(self):
         self.call.formbricks_flow_key = "AIRR-GW"
         self.call.save(update_fields=["formbricks_flow_key"])
-        factories.ProposalFactory(
-            round=self.fixture.round, state=ProposalStates.DRAFT
-        )
+        factories.ProposalFactory(round=self.fixture.round, state=ProposalStates.DRAFT)
 
         response = self.patch("AIRR-GW")
 
@@ -148,9 +140,7 @@ class FormbricksFlowKeysEndpointTest(test.APITestCase):
         response = self.client.get(self.url)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(
-            {row["key"] for row in response.data}, {"AIRR-GW", "AIRR-RA"}
-        )
+        self.assertEqual({row["key"] for row in response.data}, {"AIRR-GW", "AIRR-RA"})
 
     def test_anonymous_user_is_rejected(self):
         response = self.client.get(self.url)

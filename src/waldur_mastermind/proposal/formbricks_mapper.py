@@ -109,8 +109,7 @@ def serialize_form_responses(proposal, step_keys=None):
         # for any question_id missing from it - rows written before this
         # field existed, or if the schema fetch failed for that submission.
         order = {
-            question_id: index
-            for index, question_id in enumerate(step.question_order)
+            question_id: index for index, question_id in enumerate(step.question_order)
         }
         questions = sorted(
             (

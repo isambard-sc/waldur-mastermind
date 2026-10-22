@@ -93,6 +93,7 @@ from waldur_mastermind.marketplace.enums import (
     LimitPeriods,
     OfferingUserStates,
     OrderStates,
+    ResourceApiKeyActions,
     ResourceStates,
     RobotAccountStates,
     UsageLimitAction,
@@ -104,7 +105,7 @@ from waldur_mastermind.marketplace.enums import (
 )
 from waldur_mastermind.marketplace_openstack import get_mb_component_types
 
-from . import models, plugins, posix_ids
+from . import managers, models, plugins, posix_ids
 from . import project_groups as provider_project_groups
 from .enums import BASIC_OFFERING as BASIC_PLUGIN_NAME
 from .enums import OrderTypes
@@ -1462,6 +1463,12 @@ def _force_approve_pending_terminate_order(pending_order):
     )
 
 
+# Where TERMINATE_RESOURCE may be held for a resource: project manager/admin,
+# customer owner, or the service provider. Shared by the terminate endpoint and
+# the scheduled termination, which must pick an actor the endpoint accepts.
+TERMINATE_RESOURCE_SOURCES = ["project", "project.customer", "offering.customer"]
+
+
 def terminate_resource(
     resource, user, termination_comment=None, scheduled=False, order_author=None
 ):
@@ -1574,10 +1581,12 @@ def schedule_resources_termination(resources, termination_comment=None, user=Non
         # `user` would short-circuit the fallback chain on the next iteration
         # and attribute every later resource to the first resource's actor.
         #
-        # Inactive candidates are skipped: the actor authenticates the internal
-        # termination request, and an inactive user is rejected with HTTP 401
-        # "User inactive or deleted.", so the resource would never be
-        # terminated.
+        # The actor authenticates the internal termination request, so a
+        # candidate the terminate endpoint would refuse is skipped: an inactive
+        # user gets HTTP 401 "User inactive or deleted.", and one who can no
+        # longer terminate the resource -- removed from the project after
+        # requesting its end date, say -- gets HTTP 403. Either way the
+        # resource would never be terminated.
         actor = next(
             (
                 candidate
@@ -1586,7 +1595,14 @@ def schedule_resources_termination(resources, termination_comment=None, user=Non
                     resource.end_date_requested_by,
                     resource.project.end_date_requested_by,
                 )
-                if candidate is not None and candidate.is_active
+                if candidate is not None
+                and candidate.is_active
+                and permission_utils.has_permission_on_any_source(
+                    candidate,
+                    PermissionEnum.TERMINATE_RESOURCE,
+                    resource,
+                    TERMINATE_RESOURCE_SOURCES,
+                )
             ),
             None,
         )
@@ -2023,7 +2039,59 @@ def _accumulate_hourly_usage(
     )
 
 
-def get_current_period_usage(resource, limit_period=None):
+def _billing_period_date(value):
+    """The date a DateField lookup compares billing_period with for ``value``."""
+    return models.ComponentUsage._meta.get_field("billing_period").get_prep_value(value)
+
+
+def _in_usage_period(billing_period, effective_period) -> bool:
+    """``billing_period`` falls in the period ``get_current_period_usage`` sums."""
+    if effective_period in (None, LimitPeriods.MONTH):
+        return billing_period == _billing_period_date(
+            core_utils.month_start(datetime.date.today())
+        )
+    if effective_period == LimitPeriods.QUARTERLY:
+        return (
+            _billing_period_date(core_utils.get_current_quarter_start())
+            <= billing_period
+            <= _billing_period_date(core_utils.get_current_quarter_end())
+        )
+    if effective_period == LimitPeriods.ANNUAL:
+        return billing_period.year >= datetime.date.today().year
+    return True
+
+
+def load_current_period_usages(resources) -> dict:
+    """The ComponentUsage rows ``get_current_period_usage`` reads, per resource id.
+
+    One query for a page of resources instead of one per component of each.
+    Only this year's rows are loaded unless a component sums its whole history.
+    """
+    resources = [
+        resource for resource in resources if resource.is_limit_based and resource.plan
+    ]
+    if not resources:
+        return {}
+    usages = models.ComponentUsage.objects.filter(
+        resource__in=resources
+    ).select_related("plan_period__plan")
+    sums_whole_history = any(
+        effective.limit_period
+        not in (None, LimitPeriods.MONTH, LimitPeriods.QUARTERLY, LimitPeriods.ANNUAL)
+        for resource in resources
+        for effective in billing_mode.resolve_for_resource(resource).components.values()
+    )
+    if not sums_whole_history:
+        usages = usages.filter(
+            billing_period__gte=datetime.date(datetime.date.today().year, 1, 1)
+        )
+    result = {resource.id: [] for resource in resources}
+    for usage in usages:
+        result[usage.resource_id].append(usage)
+    return result
+
+
+def get_current_period_usage(resource, limit_period=None, usages=None):
     """Get per-component usage for a resource in the current period.
 
     Shared between the resource serializer (panel display) and the
@@ -2039,6 +2107,9 @@ def get_current_period_usage(resource, limit_period=None):
         limit_period: Override period for all components.
             If None, each component's own limit_period is used.
 
+        usages: The resource's ComponentUsage rows, as loaded for a page by
+            ``load_current_period_usages``. Queried per component when omitted.
+
     Returns:
         dict[str, float]: Component type → aggregated usage amount
     """
@@ -2048,30 +2119,22 @@ def get_current_period_usage(resource, limit_period=None):
         component = effective.component
         effective_period = limit_period or effective.limit_period
 
-        usages = models.ComponentUsage.objects.filter(
-            resource=resource, component=component
-        )
-
-        if effective_period in (None, LimitPeriods.MONTH):
-            month_start = core_utils.month_start(datetime.date.today())
-            usages = usages.filter(billing_period=month_start)
-        elif effective_period == LimitPeriods.QUARTERLY:
-            quarter_start = core_utils.get_current_quarter_start()
-            quarter_end = core_utils.get_current_quarter_end()
-            usages = usages.filter(
-                billing_period__gte=quarter_start, billing_period__lte=quarter_end
-            )
-        elif effective_period == LimitPeriods.ANNUAL:
-            usages = usages.filter(billing_period__year__gte=datetime.date.today().year)
-        elif effective_period == LimitPeriods.TOTAL:
-            pass  # Sum all usages
+        if usages is not None:
+            period_rows = [
+                row
+                for row in usages
+                if row.component_id == component.id
+                and _in_usage_period(row.billing_period, effective_period)
+            ]
+        else:
+            period_rows = _query_period_usages(resource, component, effective_period)
 
         # After a switch between a usage plan and a limit plan the month holds
         # rows of both semantics (accumulated core-hours next to a peak core
         # count). Only rows billed the same way as the current plan count.
         rows = [
             row
-            for row in usages.select_related("plan_period__plan")
+            for row in period_rows
             if billing_mode.resolve_component(
                 component, row.plan_period.plan if row.plan_period else resource.plan
             ).billing_type
@@ -2093,6 +2156,29 @@ def get_current_period_usage(resource, limit_period=None):
         result[component.type] = float(total)
 
     return result
+
+
+def _query_period_usages(resource, component, effective_period):
+    """The rows of ``component`` in its current period, queried for one resource."""
+    usages = models.ComponentUsage.objects.filter(
+        resource=resource, component=component
+    )
+
+    if effective_period in (None, LimitPeriods.MONTH):
+        month_start = core_utils.month_start(datetime.date.today())
+        usages = usages.filter(billing_period=month_start)
+    elif effective_period == LimitPeriods.QUARTERLY:
+        quarter_start = core_utils.get_current_quarter_start()
+        quarter_end = core_utils.get_current_quarter_end()
+        usages = usages.filter(
+            billing_period__gte=quarter_start, billing_period__lte=quarter_end
+        )
+    elif effective_period == LimitPeriods.ANNUAL:
+        usages = usages.filter(billing_period__year__gte=datetime.date.today().year)
+    elif effective_period == LimitPeriods.TOTAL:
+        pass  # Sum all usages
+
+    return usages.select_related("plan_period__plan")
 
 
 def get_effective_component_limit(resource, component):
@@ -2202,10 +2288,215 @@ def evaluate_usage_limit_restriction(resource):
             locked.save(update_fields=list(update_fields))
             _emit_usage_limit_event(locked, flag, applied=True)
         elif not over_limit and locked.usage_limit_restriction == flag:
+            if flag == "paused" and is_held_by_project_grace(locked):
+                # The project grace period still wants the resource paused. The
+                # restriction is kept, so the periodic re-evaluation lifts it
+                # once the grace period no longer holds the resource.
+                return
             setattr(locked, flag, False)
             locked.usage_limit_restriction = ""
             locked.save(update_fields=[flag, "usage_limit_restriction"])
             _emit_usage_limit_event(locked, flag, applied=False)
+
+
+def is_held_by_project_grace(resource) -> bool:
+    """Whether the project grace period keeps ``resource`` paused.
+
+    A project past its end date but still inside its grace period has its
+    resources paused, on offerings that support pausing and do not opt out of
+    the grace period (those are terminated on the raw end date instead). Every
+    mechanism that lifts a pause automatically must leave such a resource
+    paused, whoever set the flag first.
+    """
+    plugin_options = resource.offering.plugin_options or {}
+    return bool(
+        plugin_options.get("supports_pausing")
+        and not plugin_options.get("disable_grace_period")
+        and resource.project.is_in_grace_period
+    )
+
+
+def pause_for_project_grace(resource) -> bool:
+    """Pause ``resource`` because its project is in the grace period.
+
+    Marks the pause as the grace period's own (``paused_by_grace_period``) so it
+    can be lifted when the project leaves the grace period. A resource that is
+    already paused is left alone and not claimed: that pause belongs to whoever
+    set it. Returns True if the resource was paused.
+    """
+    if resource.paused:
+        return False
+    resource.paused = True
+    resource.paused_by_grace_period = True
+    resource.save(update_fields=["paused", "paused_by_grace_period"])
+    logger.info(
+        "Resource %s paused due to project %s entering grace period",
+        resource.uuid,
+        resource.project.uuid,
+    )
+    event_logger.emit(
+        "Resource {resource_name} has been paused because "
+        "project {project_name} has entered the grace period.",
+        event_type=EventType.MARKETPLACE_RESOURCE_PAUSED,
+        event_context={"resource": resource, "project": resource.project},
+        scopes=[resource, resource.project, resource.project.customer],
+    )
+    return True
+
+
+# Events after which a pause can no longer be attributed to the grace period: a
+# policy paused or unpaused the resource, or its paused flag was changed by
+# anything else (staff, per-resource policy evaluation) -- such saves are logged
+# as a resource update naming the field.
+_LATER_PAUSE_CHANGE = Q(
+    event__event_type__in=(
+        EventType.RESET_PAUSING,
+        EventType.REQUEST_PAUSING,
+        EventType.REQUEST_SLURM_RESOURCE_PAUSING,
+    )
+) | Q(
+    event__event_type=EventType.MARKETPLACE_RESOURCE_UPDATE_SUCCEEDED,
+    # "Field 'paused'" when it is the first changed field, "field 'paused'" after
+    event__message__icontains="field 'paused'",
+)
+
+
+def adopt_grace_period_pauses() -> int:
+    """Mark grace-period pauses that do not carry ``paused_by_grace_period``.
+
+    A resource still paused whose last pause-related change is the grace-period
+    pause event (only ``pause_for_project_grace`` emits it) was paused by the
+    grace period, even if the marker is missing -- pauses from before the marker
+    existed, or a marker lost on the way. Marking them lets
+    ``release_project_grace_pauses`` lift them once their project leaves the
+    grace period, including projects whose end date was already extended.
+    Returns the number of resources marked.
+    """
+    feed = logging_models.Feed.objects.filter(
+        content_type=ContentType.objects.get_for_model(models.Resource),
+        object_id=OuterRef("pk"),
+    )
+    last_grace_pause = (
+        feed.filter(event__event_type=EventType.MARKETPLACE_RESOURCE_PAUSED)
+        .order_by("-event__created")
+        .values("event__created")[:1]
+    )
+    unmarked = (
+        models.Resource.objects.filter(
+            paused=True,
+            paused_by_grace_period=False,
+            offering__plugin_options__supports_pausing=True,
+        )
+        .exclude(state__in=(ResourceStates.TERMINATED, ResourceStates.TERMINATING))
+        .exclude(usage_limit_restriction=UsageLimitAction.FLAG[UsageLimitAction.PAUSE])
+        .annotate(last_grace_pause=Subquery(last_grace_pause))
+        .filter(last_grace_pause__isnull=False)
+    )
+    later_change = feed.filter(
+        _LATER_PAUSE_CHANGE, event__created__gt=OuterRef("last_grace_pause")
+    )
+    adopted = list(
+        unmarked.annotate(changed_since=Exists(later_change))
+        .filter(changed_since=False)
+        .values_list("pk", flat=True)
+    )
+    if adopted:
+        models.Resource.objects.filter(pk__in=adopted).update(
+            paused_by_grace_period=True
+        )
+        logger.info("Marked %s resources as paused by grace period", len(adopted))
+    return len(adopted)
+
+
+# Checks (resource -> bool) telling whether a mechanism that pauses resources
+# on its own still wants a resource paused. Apps that pause resources register
+# theirs in AppConfig.ready() -- the policy app does -- so marketplace does not
+# depend on them.
+PAUSE_KEEPERS = []
+
+
+def another_reason_keeps_paused(resource) -> bool:
+    """Whether a usage-limit restriction or a registered keeper still wants ``resource`` paused.
+
+    Checked before an automatic mechanism lifts a pause it does not own alone:
+    the grace-period release, and SLURM policies lifting pauses under their limit.
+    """
+    return resource.usage_limit_restriction == UsageLimitAction.FLAG[
+        UsageLimitAction.PAUSE
+    ] or any(keeper(resource) for keeper in PAUSE_KEEPERS)
+
+
+def release_project_grace_pauses(resources) -> list:
+    """Lift the grace-period pause from resources whose project left the grace period.
+
+    Only pauses the grace period set itself (``paused_by_grace_period``) are
+    considered. A project that is now expired keeps its resources paused until
+    they are terminated. The marker is always cleared, but ``paused`` stays set
+    while another automatic reason still applies: a usage-limit restriction, or
+    any registered keeper (``PAUSE_KEEPERS``: a firing cost policy,
+    usage over a SLURM policy's grace limit). Returns the resources that were
+    unpaused.
+    """
+    candidate_ids = list(
+        resources.filter(paused_by_grace_period=True)
+        .exclude(state__in=(ResourceStates.TERMINATED, ResourceStates.TERMINATING))
+        .values_list("pk", flat=True)
+    )
+    if not candidate_ids:
+        return []
+
+    unpaused = []
+    with transaction.atomic():
+        for resource in (
+            models.Resource.objects.filter(pk__in=candidate_ids)
+            .select_related("offering", "project__customer")
+            .select_for_update(of=("self",))
+            .order_by("pk")
+        ):
+            if not resource.paused_by_grace_period:
+                continue
+            if is_held_by_project_grace(resource) or resource.project.is_expired:
+                continue
+            resource.paused_by_grace_period = False
+            update_fields = ["paused_by_grace_period"]
+            if resource.paused and not another_reason_keeps_paused(resource):
+                resource.paused = False
+                update_fields.append("paused")
+                unpaused.append(resource)
+            resource.save(update_fields=update_fields)
+
+    for resource in unpaused:
+        logger.info(
+            "Resource %s unpaused because project %s is no longer in grace period",
+            resource.uuid,
+            resource.project.uuid,
+        )
+        event_logger.emit(
+            "Resource {resource_name} has been unpaused because "
+            "project {project_name} is no longer in the grace period.",
+            event_type=EventType.RESET_PAUSING,
+            event_context={"resource": resource, "project": resource.project},
+            scopes=[resource, resource.project, resource.project.customer],
+        )
+    return unpaused
+
+
+def filter_resources_for_usage_stats(resources, include_terminated=False):
+    """Narrow `resources` to the ones the stats endpoints aggregate.
+
+    Terminated resources are left out unless `include_terminated` is set, and
+    even then only those with usage reported in the current month are kept:
+    nothing older is counted, so loading every resource the scope ever had
+    would only cost queries.
+    """
+    terminated = models.Resource.States.TERMINATED
+    if not include_terminated:
+        return resources.exclude(state=terminated)
+    today = datetime.date.today()
+    with_usage_this_month = models.ComponentUsage.objects.filter(
+        billing_period__year=today.year, billing_period__month=today.month
+    ).values("resource_id")
+    return resources.filter(~Q(state=terminated) | Q(id__in=with_usage_this_month))
 
 
 def get_components_usage_data(resources, for_current_month=False):
@@ -2218,6 +2509,12 @@ def get_components_usage_data(resources, for_current_month=False):
     VPC-level allocation and individual-VM usage are not double-counted.
     OpenStack RAM and storage values are stored in MB; they are divided by
     1024 before returning so the caller always receives GB.
+
+    Terminated resources (present only when the caller asked for them) never
+    add to `limit`, which is the cap the scope holds now, and contribute only
+    usage reported in the current month. Their share of `usage` and
+    `limit_usage` is also reported as `usage_terminated` and
+    `limit_usage_terminated`.
     """
     MB_COMPONENT_TYPES = get_mb_component_types()
 
@@ -2240,10 +2537,13 @@ def get_components_usage_data(resources, for_current_month=False):
     component_usage = defaultdict(float)
     component_limit = defaultdict(float)
     component_limit_usage = defaultdict(float)
+    component_usage_terminated = defaultdict(float)
+    component_limit_usage_terminated = defaultdict(float)
 
     current_date = datetime.date.today()
 
     for resource in resources:
+        is_terminated = resource.state == models.Resource.States.TERMINATED
         usage_components = resource.offering.components.filter(
             billing_type=BillingTypes.USAGE
         )
@@ -2252,7 +2552,7 @@ def get_components_usage_data(resources, for_current_month=False):
         )
 
         for component_type, limit in resource.limits.items():
-            if limit is None:
+            if limit is None or is_terminated:
                 continue
             # Assign limit to the correct billing_type bucket
             if limit_components.filter(type=component_type).exists():
@@ -2265,7 +2565,7 @@ def get_components_usage_data(resources, for_current_month=False):
 
         for component in usage_components:
             key = (component.type, BillingTypes.USAGE)
-            if for_current_month:
+            if for_current_month or is_terminated:
                 usages = models.ComponentUsage.objects.filter(
                     resource=resource,
                     component=component,
@@ -2274,6 +2574,8 @@ def get_components_usage_data(resources, for_current_month=False):
                 )
                 total_usage = usages.aggregate(total=Sum("usage"))["total"] or 0
                 component_usage[key] += float(total_usage)
+                if is_terminated:
+                    component_usage_terminated[key] += float(total_usage)
             else:
                 latest = (
                     models.ComponentUsage.objects.filter(
@@ -2285,13 +2587,19 @@ def get_components_usage_data(resources, for_current_month=False):
                 if latest:
                     component_usage[key] += float(latest.usage)
 
-        limit_override = LimitPeriods.MONTH if for_current_month else None
+        limit_override = (
+            LimitPeriods.MONTH if for_current_month or is_terminated else None
+        )
         limit_period_usage = get_current_period_usage(
             resource, limit_period=limit_override
         )
         for component in limit_components:
             key = (component.type, BillingTypes.LIMIT)
             component_limit_usage[key] += limit_period_usage.get(component.type, 0)
+            if is_terminated:
+                component_limit_usage_terminated[key] += limit_period_usage.get(
+                    component.type, 0
+                )
 
     components_data = {}
     # Track keys whose values need MB→GB conversion (OpenStack offerings only).
@@ -2310,6 +2618,8 @@ def get_components_usage_data(resources, for_current_month=False):
                 "billing_type": component.billing_type,
                 "usage": component_usage.get(key, 0),
                 "limit_usage": component_limit_usage.get(key, 0),
+                "usage_terminated": component_usage_terminated.get(key, 0),
+                "limit_usage_terminated": component_limit_usage_terminated.get(key, 0),
                 "limit": component_limit.get(key, None),
                 "offering_name": component.offering.name,
                 "offering_uuid": component.offering.uuid.hex,
@@ -2325,6 +2635,8 @@ def get_components_usage_data(resources, for_current_month=False):
         data = components_data[key]
         data["usage"] = round(data["usage"] / 1024, 2)
         data["limit_usage"] = round(data["limit_usage"] / 1024, 2)
+        data["usage_terminated"] = round(data["usage_terminated"] / 1024, 2)
+        data["limit_usage_terminated"] = round(data["limit_usage_terminated"] / 1024, 2)
         if data["limit"] is not None:
             data["limit"] = round(data["limit"] / 1024, 2)
         if data["measured_unit"] == "MB":
@@ -2390,6 +2702,47 @@ def _resolve_period_bounds(limit_period, today=None, period_offset=0):
     return start, start, label
 
 
+def _earliest_usage_window_start(components, period_offset=0):
+    """Earliest billing period any of `components` can show usage from.
+
+    Covers each component's own limit period shifted by `period_offset`, and
+    for monthly components also the rolling six months the timeseries widens
+    them to. None when a component counts lifetime usage (TOTAL).
+    """
+    today = datetime.date.today()
+    starts = []
+    for limit_period in {c.limit_period or LimitPeriods.MONTH for c in components}:
+        if limit_period == LimitPeriods.TOTAL:
+            return None
+        start, _, _ = _resolve_period_bounds(limit_period, today, period_offset)
+        starts.append(start)
+        if limit_period == LimitPeriods.MONTH:
+            six_months_back, _, _ = _resolve_period_bounds(
+                LimitPeriods.MONTH, today, -5
+            )
+            starts.append(six_months_back)
+    return min(starts) if starts else None
+
+
+def narrow_terminated_to_usage_window(resources, period_offset=0):
+    """Keep live resources, and terminated ones only if they can contribute.
+
+    The per-offering views only count usage inside each component's limit
+    period, so a terminated resource with no usage since the earliest such
+    period adds nothing; leaving it out keeps an organization's whole
+    history from being loaded. Lifetime (TOTAL) components keep every
+    terminated resource that reported any usage.
+    """
+    components = models.OfferingComponent.objects.filter(
+        offering_id__in=resources.values("offering_id")
+    ).only("limit_period")
+    start = _earliest_usage_window_start(components, period_offset)
+    usage = models.ComponentUsage.objects.filter(resource=OuterRef("pk"))
+    if start is not None:
+        usage = usage.filter(billing_period__gte=start)
+    return resources.filter(~Q(state=models.Resource.States.TERMINATED) | Exists(usage))
+
+
 def get_components_usage_data_per_offering(resources):
     """Aggregate per-component usage and limit stats per offering.
 
@@ -2404,6 +2757,10 @@ def get_components_usage_data_per_offering(resources):
     prevent double-counting with the parent tenant offering.
     OpenStack RAM and storage values are stored in MB; they are divided
     by 1024 before returning so the caller always receives GB.
+
+    Terminated resources, when present, are left out of `limit`; their share
+    of the period's usage is reported as `usage_terminated` /
+    `limit_usage_terminated`.
     """
     today = datetime.date.today()
     MB_COMPONENT_TYPES = get_mb_component_types()
@@ -2438,48 +2795,53 @@ def get_components_usage_data_per_offering(resources):
             component.limit_period or LimitPeriods.MONTH, today
         )
 
+        # A subquery rather than the Python list, so the IDs stay in SQL.
         usage_qs = models.ComponentUsage.objects.filter(
-            resource__in=offering_resources, component=component
+            resource__in=resources.filter(offering_id=offering.id),
+            component=component,
         )
         if period_start is not None:
             usage_qs = usage_qs.filter(billing_period__gte=period_start)
         if period_end is not None:
             usage_qs = usage_qs.filter(billing_period__lte=period_end)
-        period_usage = float(usage_qs.aggregate(total=Sum("usage"))["total"] or 0)
+        totals = usage_qs.aggregate(
+            total=Sum("usage"),
+            terminated=Sum(
+                "usage",
+                filter=Q(resource__state=models.Resource.States.TERMINATED),
+            ),
+        )
+        period_usage = float(totals["total"] or 0)
+        period_usage_terminated = float(totals["terminated"] or 0)
 
-        # Sum resource.limits[component.type] across the offering's resources.
-        # Track presence so we emit None when no limit is set anywhere.
-        total_limit = 0.0
-        any_limit = False
-        for resource in offering_resources:
-            limit_val = (resource.limits or {}).get(component.type)
-            if limit_val is None:
-                continue
-            try:
-                total_limit += float(limit_val)
-                any_limit = True
-            except (TypeError, ValueError):
-                continue
+        # An offering used only by terminated resources that reported nothing
+        # in this period has nothing to show.
+        if not period_usage and all(
+            r.state == models.Resource.States.TERMINATED for r in offering_resources
+        ):
+            continue
 
+        limit_value = _sum_offering_limits(offering_resources, component.type)
+
+        usage = limit_usage = 0.0
+        usage_terminated = limit_usage_terminated = 0.0
         if component.billing_type == BillingTypes.USAGE:
             usage = period_usage
-            limit_usage = 0.0
+            usage_terminated = period_usage_terminated
         elif component.billing_type == BillingTypes.LIMIT:
-            usage = 0.0
             limit_usage = period_usage
-        else:
-            usage = 0.0
-            limit_usage = 0.0
+            limit_usage_terminated = period_usage_terminated
 
         # OpenStack persists RAM and storage in MB; convert to GB for the caller.
         measured_unit = component.measured_unit
-        limit_value = total_limit if any_limit else None
         if (
             offering.type == OPENSTACK_TENANT_OFFERING
             and component.type in MB_COMPONENT_TYPES
         ):
             usage = round(usage / 1024, 2)
             limit_usage = round(limit_usage / 1024, 2)
+            usage_terminated = round(usage_terminated / 1024, 2)
+            limit_usage_terminated = round(limit_usage_terminated / 1024, 2)
             if limit_value is not None:
                 limit_value = round(limit_value / 1024, 2)
             if measured_unit == "MB":
@@ -2494,6 +2856,8 @@ def get_components_usage_data_per_offering(resources):
                 "billing_type": component.billing_type,
                 "usage": usage,
                 "limit_usage": limit_usage,
+                "usage_terminated": usage_terminated,
+                "limit_usage_terminated": limit_usage_terminated,
                 "limit": limit_value,
                 "offering_name": offering.name,
                 "offering_uuid": offering.uuid.hex,
@@ -2528,12 +2892,15 @@ def _select_offering_component(offering, component_type=None):
 def _sum_offering_limits(resources, component_type):
     """Sum per-resource limits for one component type across the queryset.
 
+    Terminated resources are skipped: the cap is what the scope holds now.
     Returns the float total, or None if no resource declared a limit for
     that component type (so the caller can render "no cap" rather than 0).
     """
     total = 0.0
     any_limit = False
     for resource in resources:
+        if resource.state == models.Resource.States.TERMINATED:
+            continue
         limit_val = (resource.limits or {}).get(component_type)
         if limit_val is None:
             continue
@@ -2621,11 +2988,21 @@ def get_offering_usage_timeseries(
 
     bucketed = (
         usage_qs.values("billing_period")
-        .annotate(total=Sum("usage"))
+        .annotate(
+            total=Sum("usage"),
+            terminated=Sum(
+                "usage",
+                filter=Q(resource__state=models.Resource.States.TERMINATED),
+            ),
+        )
         .order_by("billing_period")
     )
     buckets = [
-        {"billing_period": b["billing_period"], "usage": float(b["total"] or 0)}
+        {
+            "billing_period": b["billing_period"],
+            "usage": float(b["total"] or 0),
+            "usage_terminated": float(b["terminated"] or 0),
+        }
         for b in bucketed
     ]
 
@@ -2684,18 +3061,26 @@ def get_offering_usage_by_project(
             {
                 "project_uuid": project.uuid.hex,
                 "project_name": project.name,
+                "is_removed": project.is_removed,
                 "usage": 0.0,
-                "_buckets": defaultdict(float),
+                "usage_terminated": 0.0,
+                "_buckets": defaultdict(
+                    lambda: {"usage": 0.0, "usage_terminated": 0.0}
+                ),
             },
         )
+        bucket = entry["_buckets"][cu.billing_period]
         entry["usage"] += usage_val
-        entry["_buckets"][cu.billing_period] += usage_val
+        bucket["usage"] += usage_val
+        if cu.resource.state == models.Resource.States.TERMINATED:
+            entry["usage_terminated"] += usage_val
+            bucket["usage_terminated"] += usage_val
 
     projects = []
     for entry in by_project.values():
         bucket_dict = entry.pop("_buckets")
         entry["buckets"] = [
-            {"billing_period": k, "usage": v} for k, v in sorted(bucket_dict.items())
+            {"billing_period": k, **v} for k, v in sorted(bucket_dict.items())
         ]
         projects.append(entry)
     projects.sort(key=lambda p: p["usage"], reverse=True)
@@ -5036,9 +5421,16 @@ def get_provider_approvers(order):
     if config.NOTIFY_STAFF_ABOUT_APPROVALS:
         users |= User.objects.filter(is_staff=True, is_active=True)
 
-    users |= get_users_with_permission(
-        order.offering.customer, PermissionEnum.APPROVE_ORDER
-    )
+    provider_customer = order.offering.customer
+    users |= get_users_with_permission(provider_customer, PermissionEnum.APPROVE_ORDER)
+
+    service_provider = models.ServiceProvider.objects.filter(
+        customer=provider_customer
+    ).first()
+    if service_provider:
+        users |= get_users_with_permission(
+            service_provider, PermissionEnum.APPROVE_ORDER
+        )
 
     users |= get_users_with_permission(order.offering, PermissionEnum.APPROVE_ORDER)
 
@@ -5114,14 +5506,17 @@ def get_new_order_notification_recipients(order) -> list[str]:
 
 
 def check_pending_order_exists(resource):
-    return models.Order.objects.filter(
-        resource=resource,
-        state__in=(
-            OrderStates.PENDING_CONSUMER,
-            OrderStates.PENDING_PROVIDER,
-            OrderStates.EXECUTING,
-        ),
-    ).exists()
+    states = (
+        OrderStates.PENDING_CONSUMER,
+        OrderStates.PENDING_PROVIDER,
+        OrderStates.EXECUTING,
+    )
+    # A subset of OrderStates.PENDING_STATES, so the page-wide prefetch of
+    # pending orders made by list views answers it without a query.
+    prefetched = getattr(resource, "prefetched_pending_orders", None)
+    if prefetched is not None:
+        return any(order.state in states for order in prefetched)
+    return models.Order.objects.filter(resource=resource, state__in=states).exists()
 
 
 def get_pending_consumer_terminate_order(resource):
@@ -5621,7 +6016,7 @@ def notification_about_project_ending(end_date):
             "user": user,
             "end_date": end_date,
             "count_projects": len(projects),
-            "delta": (end_date - timezone.datetime.today().date()).days,
+            "delta": (end_date - timezone.localdate()).days,
         }
         logger.info(
             "Sending notification to user %s about %d projects",
@@ -6714,14 +7109,15 @@ def publish_offering_resources_sync_request(offering: models.Offering, user) -> 
     return True
 
 
-def _log_api_key_rotation(api_key: models.ResourceApiKey) -> None:
-    """Log a rotation command with the identifiers useful for support triage."""
+def _log_api_key_command(api_key: models.ResourceApiKey, action: str) -> None:
+    """Log a key command with the identifiers useful for support triage."""
     resource = api_key.resource
     project = resource.project
     customer = project.customer
     logger.info(
-        "API key rotation requested for key %s of resource %s (%s), "
+        "API key %s requested for key %s of resource %s (%s), "
         "project %s (%s), organization %s (%s)",
+        action,
         api_key.uuid.hex,
         resource.name,
         resource.uuid.hex,
@@ -6732,26 +7128,31 @@ def _log_api_key_rotation(api_key: models.ResourceApiKey) -> None:
     )
 
 
-def publish_api_key_event(api_key: models.ResourceApiKey) -> bool:
-    """Ask connected site agents to rotate a resource API key.
+def publish_api_key_event(api_key: models.ResourceApiKey, action: str) -> bool:
+    """Ask connected site agents to carry out a command on a resource API key.
 
     The agent owns key generation: this only sends a slim command (no key
-    material). Rotation is the only command — the key count is fixed at
-    provisioning and a rotation replaces a value in place — so the action is not
-    a parameter. The agent performs the backend change and reports back via the
-    provider endpoints. Returns True if at least one agent subscription received
+    material). The agent performs the backend change and reports back via the
+    provider endpoints. Commands that configure the key also carry its limits and
+    model allowlist. Returns True if at least one agent subscription received
     the command.
     """
+    if action not in ResourceApiKeyActions.VALUES:
+        raise ValueError(f"Unknown API key action: {action}")
     resource = api_key.resource
-    _log_api_key_rotation(api_key)
+    _log_api_key_command(api_key, action)
     payload = {
         "resource_uuid": resource.uuid.hex,
         "resource_backend_id": resource.backend_id,
         "api_key_uuid": api_key.uuid.hex,
         "client_id": api_key.client_id,
-        # Still on the wire: the agent dispatches on it and rejects anything else.
-        "action": "rotate",
+        "action": action,
     }
+    if action in ResourceApiKeyActions.CARRY_SETTINGS:
+        payload["limits"] = api_key.limits
+        payload["allowed_models"] = api_key.allowed_models
+    # The observable type predates the other commands; agents subscribe to it by
+    # name, so it keeps its rotation-era name.
     messages = prepare_messages(
         resource.offering,
         payload,
@@ -7594,7 +7995,50 @@ def _is_field_empty_q(user_field_name):
         return Q(**{f"{prefix}__isnull": True})
 
 
-def user_can_see_resource_order_workflow(user, resource) -> bool:
+class ResourceViewerScopes:
+    """The viewer's roles that decide how a page of resources is rendered.
+
+    ``user_can_see_resource_order_workflow`` and
+    ``is_resource_project_only_viewer`` otherwise re-read the viewer's roles
+    for every resource they are asked about; a list builds this once per page
+    and passes it in. ``resource_ids`` bounds the ResourceProject lookup to the
+    page.
+    """
+
+    def __init__(self, user, resource_ids):
+        self.project_ids = set(get_connected_projects(user))
+        self.customer_ids = set(get_connected_customers(user))
+        self.offering_ids = set(managers.get_connected_offerings(user))
+        self.service_provider_customer_ids = set(
+            models.ServiceProvider.objects.filter(
+                id__in=managers.get_connected_serviceproviders(user)
+            ).values_list("customer_id", flat=True)
+        )
+        self.direct_resource_ids = set(managers.get_user_direct_resource_ids(user))
+        self.resource_project_resource_ids = set(
+            models.ResourceProject.available_objects.filter(
+                id__in=managers.get_user_resource_project_ids(user),
+                resource_id__in=resource_ids,
+            ).values_list("resource_id", flat=True)
+        )
+
+    def is_consumer(self, resource) -> bool:
+        return (
+            resource.project_id in self.project_ids
+            or resource.project.customer_id in self.customer_ids
+        )
+
+    def is_provider(self, resource) -> bool:
+        """Mirrors ``ResourceQuerySet.filter_for_service_provider``."""
+        offering = resource.offering
+        return (
+            offering.customer_id in self.customer_ids
+            or offering.customer_id in self.service_provider_customer_ids
+            or offering.id in self.offering_ids
+        )
+
+
+def user_can_see_resource_order_workflow(user, resource, scopes=None) -> bool:
     """Return whether ``user`` may see ``order_in_progress`` / ``creation_order``.
 
     Visible to consumer project/customer members and to service providers with
@@ -7605,6 +8049,8 @@ def user_can_see_resource_order_workflow(user, resource) -> bool:
         return False
     if user.is_staff or user.is_support:
         return True
+    if scopes is not None:
+        return scopes.is_consumer(resource) or scopes.is_provider(resource)
     if resource.project_id in get_connected_projects(user):
         return True
     if resource.project.customer_id in get_connected_customers(user):
@@ -7616,7 +8062,7 @@ def user_can_see_resource_order_workflow(user, resource) -> bool:
     )
 
 
-def is_resource_project_only_viewer(user, resource) -> bool:
+def is_resource_project_only_viewer(user, resource, scopes=None) -> bool:
     """True when ``user`` can only see ``resource`` via a ResourceProject role.
 
     Returns False for staff/support, for users with project/customer roles on
@@ -7626,6 +8072,12 @@ def is_resource_project_only_viewer(user, resource) -> bool:
         return False
     if user.is_staff or user.is_support:
         return False
+    if scopes is not None:
+        return (
+            not scopes.is_consumer(resource)
+            and resource.id not in scopes.direct_resource_ids
+            and resource.id in scopes.resource_project_resource_ids
+        )
     project = resource.project
     if get_connected_projects(user).filter(id=project.id).exists():
         return False

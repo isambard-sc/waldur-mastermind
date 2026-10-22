@@ -424,11 +424,11 @@ Open-source ticketing system:
 
 #### 4. Basic Backend
 
-No-op implementation for:
+The built-in service desk, and the default backend. Tickets live only in Waldur:
 
-- Development and testing
-- Environments without external ticketing
-- Minimal support requirements
+- Status transitions, SLA deadlines and auto-assignment are handled in Waldur
+- No external system, URL or credentials to configure
+- Suits deployments without an external ticketing system, and development and testing
 
 ### Backend Interface
 
@@ -578,7 +578,7 @@ Dynamic configuration via admin:
 WALDUR_SUPPORT_ENABLED = True
 
 # Select active backend
-WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE = 'atlassian'  # or 'zammad', 'smax', 'basic'
+WALDUR_SUPPORT_ACTIVE_BACKEND_TYPE = 'atlassian'  # default 'basic'; or 'zammad', 'smax'
 
 # Enable custom field mapping for enhanced integration
 ATLASSIAN_CUSTOM_ISSUE_FIELD_MAPPING_ENABLED = True
@@ -652,6 +652,51 @@ sequenceDiagram
     API-->>User: 201 Created
 ```
 
+### Staff-Initiated Request Flow
+
+Staff and support users can open a request addressed to another user, to start
+a conversation rather than answer one. It is one call to the same endpoint:
+omit `is_reported_manually`, name the recipient as `caller`, and put the
+opening message in the write-only `first_comment` field.
+
+```json
+POST /api/support-issues/
+{
+  "type": "Informational",
+  "summary": "Your SSH key expires on Friday",
+  "caller": "https://waldur.example.com/api/users/<uuid>/",
+  "first_comment": "Please rotate your key before Friday."
+}
+```
+
+- The issue and its opening message are created in one transaction. The
+  message becomes the first **public** comment, authored by the sender, and is
+  pushed to the active backend like any other comment. On a remote desk a
+  failed push rolls back the Waldur issue, but the ticket already created in
+  the remote desk stays there.
+- Send no `customer`, `project` or `resource`: the caller can only see an
+  unscoped issue they did not create.
+- The recipient is notified through `support.notification_comment_added`, the
+  same notification as any other comment on their ticket; the mail carries the
+  message and a link to reply. Their reply reaches the desk through
+  `support.notification_comment_added_staff`. Notifications ship disabled, so
+  both keys must be enabled for the conversation to go by mail.
+- On the built-in desk the sender is recorded as `reporter` and, unless an
+  `assignee` is given, as `assignee`, so the recipient's reply is mailed to
+  them. Such an issue does not trigger the new-request notification to
+  helpdesk staff, gets no SLA deadlines at creation, and does not count as
+  answered until the recipient has replied. Their first reply starts the
+  first-response and resolution deadlines when SLA tracking is enabled, so a
+  message the recipient never answers is never an SLA breach. The average
+  first-response time in the helpdesk statistics counts from that reply too.
+  The issue's description is only what the sender wrote: the "Reported by"
+  mark and the `description.txt` template are for a desk's agents, and the
+  opening message already names its author.
+- On Atlassian, Zammad and SMAX neither field is set: there the reporter is
+  who the remote ticket is filed as, and it must stay the caller.
+- Without `first_comment`, an on-behalf request is the user's own request
+  logged by staff, and is handled exactly as before.
+
 ### Synchronization Flow
 
 ```mermaid
@@ -711,7 +756,7 @@ Scheduled background tasks:
 - Use JIRA for enterprise environments with existing Atlassian infrastructure
 - Use SMAX for ITIL-compliant service management
 - Use Zammad for open-source, multi-channel support
-- Use Basic for development or minimal requirements
+- Use Basic, the default, when tickets don't need to leave Waldur
 
 ### 2. Status Configuration
 

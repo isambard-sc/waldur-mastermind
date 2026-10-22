@@ -1,39 +1,72 @@
+import base64
 import hashlib
 import hmac
 import logging
+import os
+import re
 import secrets
+from datetime import timedelta
+from urllib.parse import quote
 
 import httpx
 import yaml
 from constance import config
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
-from django.http import FileResponse, Http404
+from django.http import FileResponse, Http404, StreamingHttpResponse
+from django.utils import timezone
+from django.utils.http import content_disposition_header
 from django_filters.rest_framework import DjangoFilterBackend
 from django_fsm import TransitionNotAllowed
-from drf_spectacular.utils import OpenApiParameter, extend_schema
+from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import permissions, status, views
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import (
+    APIException,
+    PermissionDenied,
+    Throttled,
+    ValidationError,
+)
 from rest_framework.response import Response
-from rest_framework.throttling import ScopedRateThrottle
+from rest_framework.throttling import ScopedRateThrottle, SimpleRateThrottle
 
 from waldur_core.core import permissions as core_permissions
+from waldur_core.core.auth_utils import (
+    AUTH_METHOD_SESSION,
+    AUTH_METHOD_TOKEN,
+    get_auth_method,
+)
+from waldur_core.core.models import User
+from waldur_core.core.utils import _strip_port
 from waldur_core.core.views import ActionsViewSet
+from waldur_core.logging import event_logger
+from waldur_core.logging.enums import EventType
+from waldur_core.server.middleware import add_public_cors_headers
 from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure.models import Project
 
 from . import (
     appservice_registration,
+    bot_state,
+    crypto_setup,
     filters,
+    history_backfill,
     livekit_client,
     matrix_client,
     models,
+    recovery_keys,
     room_provisioning,
     serializers,
     tasks,
+    webhook_errors,
 )
-from .managers import get_accessible_room_ids
+from .crypto import export_files
+from .managers import (
+    can_manage_room,
+    filter_exports_for_request,
+    get_accessible_room_ids,
+    get_unlinked_room_users,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +78,31 @@ MATRIX_APPSERVICE_WEBHOOK_PATH = "/_matrix/app/v1/transactions/{txnId}"
 # 5s/check so a single hung connection can't monopolize the staff's request.
 DIAGNOSTICS_TIMEOUT = httpx.Timeout(connect=3.0, read=2.0, write=2.0, pool=2.0)
 
+# Unlinked users named in diagnostics; the rest are only counted.
+UNLINKED_USERS_SHOWN = 10
+
+# Periodic exports run nightly, so a day covers the last scheduled run. A
+# failed export is never retried and stays until retention deletes it: without
+# a window, one failure would fail the check for months.
+FAILED_EXPORTS_WINDOW = timedelta(hours=24)
+
 
 def _token_fingerprint(token):
     """Return a short SHA-256 fingerprint of a secret token for display."""
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
     return f"sha256:{digest[:12]}"
+
+
+class TokensManagedByDeployment(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = (
+        "Appservice tokens are managed by the deployment and are re-seeded on "
+        "every sync, so rotating them here would be reverted at the next "
+        "deploy. Rotate the deployment's Matrix secret and redeploy instead. "
+        "If the deployment no longer manages Matrix, clear "
+        "MATRIX_TOKENS_MANAGED_BY under Administration → Configuration → "
+        "Matrix chat → Settings."
+    )
 
 
 class MatrixEnabledWriteGuardMixin:
@@ -189,28 +242,38 @@ class MatrixRoomViewSet(MatrixEnabledWriteGuardMixin, ActionsViewSet):
         )
         return Response(status=status.HTTP_202_ACCEPTED)
 
-    sync_members_permissions = [structure_permissions.is_owner]
+    sync_members_permissions = [can_manage_room]
 
     @extend_schema(
         summary="Trigger manual history export",
         request=None,
-        responses={202: serializers.MatrixHistoryExportSerializer},
+        responses={
+            202: serializers.MatrixHistoryExportSerializer,
+            200: serializers.MatrixHistoryExportSerializer,
+        },
     )
     @action(detail=True, methods=["post"])
     def export_history(self, request, uuid=None):
         room = self.get_object()
-        export = models.MatrixHistoryExport.objects.create(
-            room=room,
-            export_type=models.ExportTypes.MANUAL,
-        )
-        export_uuid = str(export.uuid)
-        transaction.on_commit(lambda: tasks.export_room_history.delay(export_uuid))
+        # A room's unfinished manual export is returned rather than queued
+        # again, and a room gets a bounded number a day.
+        try:
+            export, created = bot_state.request_export(room, models.ExportTypes.MANUAL)
+        except bot_state.ExportLimitReached as error:
+            raise Throttled(detail=str(error))
+        if created:
+            export_uuid = str(export.uuid)
+            transaction.on_commit(lambda: tasks.export_room_history.delay(export_uuid))
         output_serializer = serializers.MatrixHistoryExportSerializer(
             export, context=self.get_serializer_context()
         )
-        return Response(output_serializer.data, status=status.HTTP_202_ACCEPTED)
+        # 200 for the export already asked for: nothing new was accepted.
+        return Response(
+            output_serializer.data,
+            status=status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK,
+        )
 
-    export_history_permissions = [structure_permissions.is_owner]
+    export_history_permissions = [can_manage_room]
 
     @extend_schema(
         summary="Retry a stuck or failed room operation",
@@ -248,7 +311,7 @@ class MatrixRoomViewSet(MatrixEnabledWriteGuardMixin, ActionsViewSet):
                     raise ValidationError(
                         f"Cannot retry room in state {room.get_state_display()}."
                     )
-                room.save(update_fields=["state", "error_message"])
+                room.save(update_fields=["state", "error_message", "closing_export"])
             if room.state == models.RoomStates.DISABLING:
                 # The original delete_history choice isn't persisted on the row,
                 # so retry defaults to False (non-destructive).
@@ -265,7 +328,7 @@ class MatrixRoomViewSet(MatrixEnabledWriteGuardMixin, ActionsViewSet):
         )
         return Response(output_serializer.data, status=status.HTTP_202_ACCEPTED)
 
-    retry_permissions = [structure_permissions.is_owner]
+    retry_permissions = [structure_permissions.is_staff]
 
     @extend_schema(
         summary="Disable an active chat room",
@@ -287,7 +350,7 @@ class MatrixRoomViewSet(MatrixEnabledWriteGuardMixin, ActionsViewSet):
                 raise ValidationError(
                     f"Cannot disable room in state {room.get_state_display()}."
                 )
-            room.save(update_fields=["state"])
+            room.save(update_fields=["state", "closing_export"])
             transaction.on_commit(
                 lambda: tasks.disable_room.delay(
                     room_uuid,
@@ -299,7 +362,7 @@ class MatrixRoomViewSet(MatrixEnabledWriteGuardMixin, ActionsViewSet):
         )
         return Response(output_serializer.data, status=status.HTTP_202_ACCEPTED)
 
-    disable_permissions = [structure_permissions.is_staff_or_support]
+    disable_permissions = [structure_permissions.is_staff]
 
     @extend_schema(
         summary="Re-enable an archived chat room",
@@ -318,12 +381,12 @@ class MatrixRoomViewSet(MatrixEnabledWriteGuardMixin, ActionsViewSet):
                 raise ValidationError(
                     f"Cannot reactivate room in state {room.get_state_display()}."
                 )
-            room.save(update_fields=["state"])
+            room.save(update_fields=["state", "closing_export"])
             transaction.on_commit(
                 lambda: tasks.sync_project_members_to_room.delay(room_uuid)
             )
             # Mirror the "Chat room was deactivated" marker on the way back up.
-            # Posted by the bot without attribution: only staff/owners can reactivate.
+            # Posted by the bot without attribution: only staff can reactivate.
             transaction.on_commit(
                 lambda: tasks.send_room_notification.delay(
                     room_uuid, "Chat room was reactivated"
@@ -334,7 +397,62 @@ class MatrixRoomViewSet(MatrixEnabledWriteGuardMixin, ActionsViewSet):
         )
         return Response(output_serializer.data, status=status.HTTP_202_ACCEPTED)
 
-    reactivate_permissions = [structure_permissions.is_owner]
+    reactivate_permissions = [structure_permissions.is_staff]
+
+    @extend_schema(
+        summary="Open a chat room's conversation",
+        request=None,
+        responses={
+            200: serializers.MatrixRoomOpenSerializer,
+            403: OpenApiResponse(description="The caller is not a member of the room."),
+            409: OpenApiResponse(description="The room is not active."),
+        },
+        description="Returns the Matrix room ID to a current member of the room, "
+        "accepting their pending invite. Other callers get 403; a room that is "
+        "not active gets 409.",
+    )
+    @action(detail=True, methods=["post"])
+    def open(self, request, uuid=None):
+        room = self.get_object()
+        member = models.MatrixRoomMember.objects.filter(
+            room=room,
+            user=request.user,
+            membership_state__in=[
+                models.MembershipStates.INVITED,
+                models.MembershipStates.JOINED,
+            ],
+        ).first()
+        # Role-based access to the room (staff, a customer owner who is not a
+        # project member) grants managing it, not reading the conversation.
+        if member is None:
+            raise PermissionDenied("You are not a member of this room.")
+        if room.state != models.RoomStates.ACTIVE or not room.room_id:
+            return Response(
+                {"detail": "Only active rooms can be opened."},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        if member.membership_state == models.MembershipStates.INVITED:
+            try:
+                matrix_client.join_room_as_user(room.room_id, member.matrix_user_id)
+            except (matrix_client.MatrixClientError, httpx.HTTPError):
+                # The drawer joins on its own once synced, so a homeserver
+                # hiccup here should not block opening the room.
+                logger.warning(
+                    "Failed to accept invite of %s to %s",
+                    member.matrix_user_id,
+                    room.room_id,
+                )
+            else:
+                # Only an invite still pending: a sync or leave may have moved
+                # the row on while the join was in flight.
+                if models.MatrixRoomMember.objects.filter(
+                    pk=member.pk, membership_state=models.MembershipStates.INVITED
+                ).update(membership_state=models.MembershipStates.JOINED):
+                    history_backfill.request_member(member)
+
+        serializer = serializers.MatrixRoomOpenSerializer({"room_id": room.room_id})
+        return Response(serializer.data)
 
     @extend_schema(
         summary="Join a chat room as staff",
@@ -404,7 +522,7 @@ class MatrixRoomViewSet(MatrixEnabledWriteGuardMixin, ActionsViewSet):
         room.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
-    destroy_permissions = [structure_permissions.is_staff_or_support]
+    destroy_permissions = [structure_permissions.is_staff]
 
 
 class MatrixHistoryExportViewSet(ActionsViewSet):
@@ -416,27 +534,23 @@ class MatrixHistoryExportViewSet(ActionsViewSet):
     disabled_actions = ["create", "destroy", "update", "partial_update"]
 
     def get_queryset(self):
-        queryset = super().get_queryset()
-        user = self.request.user
-        if not user.is_authenticated:
-            return queryset.none()
-        if user.is_staff or user.is_support:
-            return queryset
-        return queryset.filter(room__id__in=get_accessible_room_ids(user))
+        return filter_exports_for_request(super().get_queryset(), self.request)
 
 
 class MatrixCredentialsView(views.APIView):
     permission_classes = [permissions.IsAuthenticated]
     # Per-user rate limit: a malicious authenticated user can otherwise flood
-    # the homeserver with auto-provisioning calls. 30/hour fits any legitimate
-    # workflow (drawer open, room switch) and bounds the abuse surface.
+    # the homeserver with auto-provisioning calls.
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "matrix_credentials"
 
     @extend_schema(
         summary="Get Matrix login credentials",
         responses={200: serializers.MatrixCredentialsSerializer},
-        description="Returns Matrix login credentials for the authenticated user based on the configured login method.",
+        description="Returns what an external Matrix client needs to sign the "
+        "authenticated user in, per MATRIX_EXTERNAL_LOGIN_METHOD. Never a "
+        "password or an access token: in password mode the user generates a "
+        "password with POST /api/matrix/credentials/password/.",
     )
     def get(self, request):
         # Don't auto-provision a Matrix account for callers when the integration
@@ -444,71 +558,560 @@ class MatrixCredentialsView(views.APIView):
         # see "Not Found" too, matching the homeport behavior on the flag.
         if not matrix_client.is_enabled():
             raise Http404
+        # Provisioning on demand fails on the homeserver's side, as in the
+        # session view, so it is answered the same way; the homeserver's own
+        # text stays in the log.
+        try:
+            matrix_client.ensure_user_exists(request.user)
+        except (matrix_client.MatrixClientError, httpx.HTTPError, ValueError) as e:
+            logger.warning("Could not provision %s on Matrix: %s", request.user, e)
+            return Response(
+                {"detail": "Chat is unavailable right now. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         try:
             credentials = matrix_client.get_user_matrix_credentials(request.user)
         except matrix_client.MatrixClientError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # If room_uuid is provided and the user is an active member of that
-        # room, include the internal room_id and an access_token for embedded
-        # chat (works regardless of configured login method). Role-based access
-        # alone — e.g. staff or customer owners who are not project members —
-        # grants room management but not the conversation itself.
-        room_uuid = request.query_params.get("room_uuid")
-        if room_uuid:
-            try:
-                room = models.MatrixRoom.objects.get(uuid=room_uuid)
-            except models.MatrixRoom.DoesNotExist:
-                room = None
-
-            is_member = (
-                room is not None
-                and models.MatrixRoomMember.objects.filter(
-                    room=room,
-                    user=request.user,
-                    membership_state__in=[
-                        models.MembershipStates.INVITED,
-                        models.MembershipStates.JOINED,
-                    ],
-                ).exists()
-            )
-
-            if is_member:
-                try:
-                    credentials["access_token"] = (
-                        matrix_client.get_access_token_for_user(request.user)
-                    )
-                except matrix_client.MatrixClientError as e:
-                    logger.warning(
-                        "Failed to get access token for embedded chat: %s", e
-                    )
-
-                credentials["room_id"] = room.room_id
-                # join_room_as_user both accepts a pending invite (INVITED → JOINED)
-                # and no-ops when already joined; the membership row is the source
-                # of truth, so no extra invite call is needed here. Drift recovery
-                # belongs in sync_project_members_to_room, not this endpoint.
-                try:
-                    matrix_client.join_room_as_user(
-                        room.room_id, credentials["matrix_user_id"]
-                    )
-                except (matrix_client.MatrixClientError, httpx.HTTPError) as e:
-                    # Best effort: the drawer joins on its own once synced.
-                    logger.info("Could not accept invite to %s: %s", room.room_id, e)
-                else:
-                    models.MatrixRoomMember.objects.filter(
-                        room=room,
-                        user=request.user,
-                        membership_state=models.MembershipStates.INVITED,
-                    ).update(membership_state=models.MembershipStates.JOINED)
-
         return Response(credentials)
 
 
-class MatrixAppserviceWebhookView(views.APIView):
+class MatrixPasswordView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "matrix_password"
+
+    @extend_schema(
+        summary="Generate a Matrix password",
+        request=None,
+        responses={
+            200: serializers.MatrixPasswordSerializer,
+            403: OpenApiResponse(
+                description="The user was deactivated while the request ran."
+            ),
+            404: OpenApiResponse(description="Matrix chat is not enabled."),
+            409: OpenApiResponse(description="Matrix passwords are not in use."),
+            503: OpenApiResponse(
+                description="The homeserver did not set it: either the Waldur bot "
+                "is not a homeserver admin yet, the homeserver's admin API is "
+                "not reachable or the account is a homeserver admin's, which "
+                "needs an operator, or the homeserver failed and a later try "
+                "may succeed. The detail says which."
+            ),
+        },
+        description="Sets a new random password on the authenticated user's "
+        "Matrix account and returns it. It is not stored, so it is shown only "
+        "in this response; generating again replaces it. Only in password mode.",
+    )
+    def post(self, request):
+        if not matrix_client.is_enabled():
+            raise Http404
+        if config.MATRIX_EXTERNAL_LOGIN_METHOD != "password":
+            return Response(
+                {"detail": "Matrix passwords are not in use on this site."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        password = matrix_client.new_password()
+        try:
+            matrix_user_id = matrix_client.ensure_user_exists(request.user)
+            matrix_client.set_password(matrix_user_id, password)
+        except (
+            matrix_client.MatrixAdminRequired,
+            matrix_client.MatrixAccountIsHomeserverAdmin,
+        ) as e:
+            # Stays so until an operator acts: makes the bot a homeserver
+            # admin, or takes the user off an admin's account.
+            logger.warning(
+                "Could not set the Matrix password of %s: %s", request.user, e
+            )
+            return Response(
+                {
+                    "detail": "Matrix passwords are not available yet; ask your "
+                    "administrator."
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except (matrix_client.MatrixClientError, httpx.HTTPError, ValueError) as e:
+            logger.warning(
+                "Could not set the Matrix password of %s: %s", request.user, e
+            )
+            return Response(
+                {"detail": "Chat is unavailable right now. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        # A deactivation committed meanwhile may have found no Matrix account
+        # to lock yet, and would never lock the one provisioned here.
+        if not User.all_objects.filter(pk=request.user.pk, is_active=True).exists():
+            tasks.end_matrix_access.delay(request.user.uuid.hex)
+            raise PermissionDenied("This account has been deactivated.")
+
+        event_logger.emit(
+            "User {affected_user_username} has generated a Matrix password.",
+            event_type=EventType.MATRIX_PASSWORD_GENERATED,
+            event_context={"affected_user": request.user},
+            scopes=[request.user],
+        )
+
+        serializer = serializers.MatrixPasswordSerializer(
+            {
+                "homeserver_url": matrix_client.get_public_homeserver_url(),
+                "matrix_user_id": matrix_user_id,
+                "password": password,
+            }
+        )
+        response = Response(serializer.data)
+        response["Cache-Control"] = "no-store"
+        return response
+
+
+class MatrixSessionView(views.APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    # Called when the chat drawer connects and when its Matrix refresh is
+    # rejected; each call is an appservice login and a new device.
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "matrix_session"
+
+    @extend_schema(
+        summary="Start a Matrix web chat session",
+        request=None,
+        responses={
+            200: serializers.MatrixSessionSerializer,
+            404: OpenApiResponse(description="Matrix chat is not enabled."),
+            503: OpenApiResponse(
+                description="The homeserver could not start a session: either it "
+                "failed and a later try may succeed, or the user's Matrix account "
+                "is locked, which needs an operator. The detail says which."
+            ),
+        },
+        description="Signs the caller in to Matrix on a new web device and returns "
+        "short-lived tokens for the chat drawer. The tokens are not stored.",
+    )
+    def post(self, request):
+        if not matrix_client.is_enabled():
+            raise Http404
+        try:
+            matrix_user_id = matrix_client.ensure_user_exists(request.user)
+            session = matrix_client.create_web_session(matrix_user_id)
+        except matrix_client.MatrixUserLocked as e:
+            # A deactivation committed meanwhile, whose task was faster.
+            if not User.all_objects.filter(pk=request.user.pk, is_active=True).exists():
+                raise PermissionDenied("This account has been deactivated.")
+            # Waldur locks an account at deactivation and unlocks it only at
+            # reactivation, so this stays so until an operator acts: the unlock
+            # failed, or the account was a deleted user's.
+            logger.warning(
+                "The Matrix account of %s is locked: %s. Deactivate and "
+                "reactivate the user, or unlock the account on the homeserver",
+                request.user,
+                e,
+            )
+            return Response(
+                {"detail": "Your chat account is locked; ask your administrator."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except (matrix_client.MatrixClientError, httpx.HTTPError, ValueError) as e:
+            # An upstream or configuration fault; 503 marks it as temporary and
+            # the homeserver's own text stays in the log. Provisioning parses
+            # success bodies itself, so a garbled one surfaces as a ValueError.
+            logger.warning(
+                "Could not start a Matrix web session for %s: %s", request.user, e
+            )
+            return Response(
+                {"detail": "Chat is unavailable right now. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+        # A deactivation committed meanwhile may have listed the user's devices
+        # before this one existed, and would never sign it out.
+        if not User.all_objects.filter(pk=request.user.pk, is_active=True).exists():
+            try:
+                matrix_client.logout_device(matrix_user_id, session["device_id"])
+            except matrix_client.MatrixClientError as e:
+                logger.warning(
+                    "Could not sign out session of deactivated %s: %s", request.user, e
+                )
+            # It may also have found no Matrix account to lock yet.
+            tasks.end_matrix_access.delay(request.user.uuid.hex)
+            raise PermissionDenied("This account has been deactivated.")
+
+        tasks.prune_web_devices.delay(matrix_user_id, session["device_id"])
+        recovery_key = (
+            None
+            if _is_delegated(request)
+            else recovery_keys.escrowed(
+                models.MatrixUserProfile.objects.filter(user=request.user)
+                .values_list("recovery_key", flat=True)
+                .first()
+            )
+        )
+        serializer = serializers.MatrixSessionSerializer(
+            {
+                "homeserver_url": matrix_client.get_public_homeserver_url(),
+                "matrix_user_id": matrix_user_id,
+                "recovery_key": recovery_key or None,
+                **session,
+            }
+        )
+        return _no_store(Response(serializer.data))
+
+
+# The ways the web UI authenticates: the user's Waldur API token, or a session.
+# Refused: a personal access token (scoped for a script) and an OIDC access
+# token (which may belong to another client of the identity provider). The API
+# token is not proof of an interactive sign-in, though: the user can copy it
+# into a script, and staff can fetch it. Binding key access to the sign-in
+# itself is a separate change.
+FIRST_PARTY_AUTH_METHODS = (AUTH_METHOD_TOKEN, AUTH_METHOD_SESSION)
+
+
+def _is_delegated(request):
+    """Whether the caller authenticated other than the way the web UI does.
+
+    An allowlist, so a new kind of authentication is refused until it is
+    considered. Staff impersonating a user come in with a token but act on the
+    user's behalf, so they are refused too.
+    """
+    return get_auth_method(request.auth) not in FIRST_PARTY_AUTH_METHODS or bool(
+        getattr(request.user, "impersonator", None)
+    )
+
+
+class IsOwnSignIn(permissions.BasePermission):
+    """Refuses delegated callers (see _is_delegated). A permission rather than a
+    check in the view, so a refused request is answered before the throttle
+    and does not use up the user's own rate limit."""
+
+    message = "Chat encryption keys are only available to the user's own sign-in."
+
+    def has_permission(self, request, view):
+        return not _is_delegated(request)
+
+
+CRYPTO_PERMISSIONS = [permissions.IsAuthenticated, IsOwnSignIn]
+
+
+def _no_store(response):
+    # The response carries a secret; keep it out of every cache on the way.
+    response["Cache-Control"] = "no-store"
+    return response
+
+
+def _crypto_conflict(e):
+    headers = {"Retry-After": str(e.retry_after)} if e.retry_after else None
+    return Response(
+        {"state": e.state, "detail": e.detail},
+        status=status.HTTP_409_CONFLICT,
+        headers=headers,
+    )
+
+
+def _caller_profile(request):
+    if not matrix_client.is_enabled():
+        raise Http404
+    matrix_client.ensure_user_exists(request.user)
+    return models.MatrixUserProfile.objects.get(user=request.user)
+
+
+# The lease-time scrub runs this long after the lease's end, so that it does
+# not find the lease still held and skip.
+SCRUB_MARGIN_SECONDS = 5
+
+_CRYPTO_UNAVAILABLE = OpenApiResponse(
+    description="The homeserver could not be asked, or the bot is not a "
+    "homeserver admin (needed for a reset)."
+)
+
+
+class MatrixCryptoLeaseView(views.APIView):
+    permission_classes = CRYPTO_PERMISSIONS
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "matrix_crypto"
+
+    @extend_schema(
+        summary="Take the lease to set up or reset chat encryption",
+        request=serializers.MatrixCryptoLeaseRequestSerializer,
+        responses={
+            200: serializers.MatrixCryptoLeaseSerializer,
+            404: OpenApiResponse(description="Matrix chat is not enabled."),
+            409: serializers.MatrixCryptoConflictSerializer,
+            503: _CRYPTO_UNAVAILABLE,
+        },
+        description="Admits one browser at a time to setting up the caller's "
+        "end-to-end encryption (`bootstrap`), or to replacing an identity Waldur "
+        "can't unlock (`reset`). A reset also returns a temporary password for "
+        "the homeserver's interactive auth; it is replaced once the new recovery "
+        "key is escrowed, or when the lease runs out. 409 says why the request "
+        "can't proceed: `set_up`, `locked` (set up without a key Waldur holds), "
+        "`not_locked`, or `in_progress` (with Retry-After).",
+    )
+    def post(self, request):
+        data = serializers.MatrixCryptoLeaseRequestSerializer(data=request.data)
+        data.is_valid(raise_exception=True)
+        kind = data.validated_data["kind"]
+        try:
+            profile = _caller_profile(request)
+            lease, expires_at, password = crypto_setup.acquire_lease(profile, kind)
+        except crypto_setup.CryptoConflict as e:
+            return _crypto_conflict(e)
+        except (matrix_client.MatrixClientError, httpx.HTTPError) as e:
+            logger.warning(
+                "Could not start the encryption %s of %s: %s", kind, request.user, e
+            )
+            return Response(
+                {"detail": "Chat is unavailable right now. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        if password:
+            # Due once the lease has run out; the task leaves a password
+            # whose lease is still held alone, so a run any earlier is a no-op.
+            tasks.scrub_temporary_matrix_password.apply_async(
+                (profile.matrix_user_id, lease),
+                countdown=int(crypto_setup.LEASE_TTL.total_seconds())
+                + SCRUB_MARGIN_SECONDS,
+            )
+            event_logger.emit(
+                "User {affected_user_username} has started resetting their chat "
+                "encryption.",
+                event_type=EventType.MATRIX_ENCRYPTION_RESET_STARTED,
+                event_context={"affected_user": request.user},
+                scopes=[request.user],
+            )
+        return _no_store(
+            Response(
+                serializers.MatrixCryptoLeaseSerializer(
+                    {
+                        "lease": lease,
+                        "expires_at": expires_at,
+                        "temporary_password": password,
+                    }
+                ).data
+            )
+        )
+
+
+class MatrixCryptoEscrowView(views.APIView):
+    permission_classes = CRYPTO_PERMISSIONS
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "matrix_crypto"
+
+    @extend_schema(
+        summary="Escrow the recovery key of chat encryption",
+        request=serializers.MatrixCryptoEscrowSerializer,
+        responses={
+            204: None,
+            404: OpenApiResponse(description="Matrix chat is not enabled."),
+            409: serializers.MatrixCryptoConflictSerializer,
+        },
+        description="Stores the caller's new secret-storage recovery key. Only "
+        "the holder of a current lease may; the drawer calls this before it "
+        "uploads any key, so Waldur never loses a key the homeserver depends on.",
+    )
+    def post(self, request):
+        data = serializers.MatrixCryptoEscrowSerializer(data=request.data)
+        data.is_valid(raise_exception=True)
+        try:
+            profile = _caller_profile(request)
+            kind = crypto_setup.escrow(
+                profile,
+                data.validated_data["lease"],
+                data.validated_data["recovery_key"],
+            )
+        except crypto_setup.CryptoConflict as e:
+            return _crypto_conflict(e)
+        except (matrix_client.MatrixClientError, httpx.HTTPError) as e:
+            logger.warning("Could not escrow the key of %s: %s", request.user, e)
+            return Response(
+                {"detail": "Chat is unavailable right now. Please try again later."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        if kind == models.CryptoLeaseKinds.RESET:
+            # The new key is escrowed: the reset needs its password no more.
+            tasks.scrub_temporary_matrix_password.delay(
+                profile.matrix_user_id, data.validated_data["lease"], escrowed=True
+            )
+        history_backfill.key_escrowed(profile)
+        event_logger.emit(
+            "User {affected_user_username} has stored the chat encryption "
+            "recovery key of another Matrix client."
+            if kind == models.CryptoLeaseKinds.IMPORT
+            else "User {affected_user_username} has stored a new chat encryption "
+            "recovery key.",
+            event_type=EventType.MATRIX_RECOVERY_KEY_ESCROWED,
+            event_context={"affected_user": request.user},
+            scopes=[request.user],
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class MatrixCryptoLeaseReleaseView(views.APIView):
+    permission_classes = CRYPTO_PERMISSIONS
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "matrix_crypto"
+
+    @extend_schema(
+        summary="Release the lease to set up or reset chat encryption",
+        request=serializers.MatrixCryptoLeaseReleaseSerializer,
+        responses={204: None, 404: OpenApiResponse(description="Chat disabled.")},
+        description="Ends the caller's lease once its setup or reset is done, "
+        "or has failed, so another window need not wait for it to run out. A "
+        "lease that is no longer held is ignored.",
+    )
+    def post(self, request):
+        data = serializers.MatrixCryptoLeaseReleaseSerializer(data=request.data)
+        data.is_valid(raise_exception=True)
+        if not matrix_client.is_enabled():
+            raise Http404
+        profile = models.MatrixUserProfile.objects.filter(user=request.user).first()
+        lease = data.validated_data["lease"]
+        kind = crypto_setup.release_lease(profile, lease) if profile else None
+        if kind == models.CryptoLeaseKinds.RESET:
+            # A reset that ended, done or failed, needs its password no more.
+            tasks.scrub_temporary_matrix_password.delay(profile.matrix_user_id, lease)
+        if kind:
+            # Setting up or resetting encryption makes a new key backup, which
+            # holds nothing yet, and a reset deletes the older ones. The pin is
+            # left alone: only an escrowed key clears it.
+            history_backfill.request_for_user(profile.user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class MatrixRecoveryKeyView(views.APIView):
+    permission_classes = CRYPTO_PERMISSIONS
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "matrix_recovery_key"
+
+    @extend_schema(
+        summary="Show the recovery key of chat encryption",
+        request=None,
+        responses={
+            200: serializers.MatrixRecoveryKeySerializer,
+            403: OpenApiResponse(
+                description="Not the user's own sign-in: a personal or OIDC "
+                "access token, or staff impersonating the user."
+            ),
+            404: OpenApiResponse(description="Matrix chat is not enabled."),
+            503: OpenApiResponse(description="The homeserver could not be asked."),
+        },
+        description="Returns the caller's escrowed recovery key, so that another "
+        "Matrix client, such as Element, can unlock their encrypted history. Only "
+        "a key that opens the user's secret storage on the homeserver is "
+        "returned; null otherwise. A POST, as each reveal is recorded in the "
+        "user's event log.",
+    )
+    def post(self, request):
+        if not matrix_client.is_enabled():
+            raise Http404
+        profile = models.MatrixUserProfile.objects.filter(user=request.user).first()
+        recovery_key = None
+        if profile and profile.recovery_key:
+            # A key Waldur holds but the homeserver no longer takes (the user
+            # reset encryption in another client) would only mislead.
+            try:
+                if crypto_setup.key_unlocks(
+                    profile.matrix_user_id, profile.recovery_key
+                ):
+                    recovery_key = profile.recovery_key
+            except (matrix_client.MatrixClientError, httpx.HTTPError) as e:
+                logger.warning(
+                    "Could not check the recovery key of %s: %s", request.user, e
+                )
+                return Response(
+                    {
+                        "detail": "Chat is unavailable right now. Please try again later."
+                    },
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+        if recovery_key:
+            event_logger.emit(
+                "User {affected_user_username} has viewed their chat encryption "
+                "recovery key.",
+                event_type=EventType.MATRIX_RECOVERY_KEY_VIEWED,
+                event_context={"affected_user": request.user},
+                scopes=[request.user],
+            )
+        return _no_store(
+            Response(
+                serializers.MatrixRecoveryKeySerializer(
+                    {"recovery_key": recovery_key}
+                ).data
+            )
+        )
+
+
+def _bearer_token(request):
+    auth_header = request.META.get("HTTP_AUTHORIZATION", "")
+    return auth_header[7:] if auth_header.startswith("Bearer ") else ""
+
+
+def _holds_homeserver_token(request):
+    """Whether the Authorization header carries the homeserver token.
+
+    A function of its own, so the token is not among the locals of the view or
+    throttle that Sentry records for an error raised later in the request.
+    """
+    hs_token = config.MATRIX_APPSERVICE_HS_TOKEN
+    # Constant-time, as a naive `!=` leaks the token byte by byte. Bytes,
+    # because compare_digest raises on non-ASCII text and anyone can send this
+    # header.
+    return bool(hs_token) and hmac.compare_digest(
+        _bearer_token(request).encode(), hs_token.encode()
+    )
+
+
+def _is_from_homeserver(request):
+    """Check the homeserver token, logging why a call is refused."""
+    if _holds_homeserver_token(request):
+        return True
+
+    # A homeserver holding another hs_token gets a 403 on every call, and bot
+    # commands and invites just stop; without this nothing on Waldur's side
+    # says why.
+    if not config.MATRIX_APPSERVICE_HS_TOKEN:
+        reason = "MATRIX_APPSERVICE_HS_TOKEN is not set"
+    elif not _bearer_token(request):
+        reason = "no token"
+    else:
+        reason = (
+            "the token is not MATRIX_APPSERVICE_HS_TOKEN; if this is the "
+            "homeserver, register the appservice there again"
+        )
+    logger.warning("Rejected a homeserver call to %s: %s", request.path, reason)
+    return False
+
+
+class AppserviceThrottle(ScopedRateThrottle):
+    """Per client address, for calls without the homeserver token only.
+
+    The homeserver sends every transaction from one address, about one per
+    chat message, so a busy chat would use up any per-address limit and the
+    homeserver would retry, while its pings failed.
+    """
+
+    def allow_request(self, request, view):
+        return _holds_homeserver_token(request) or super().allow_request(request, view)
+
+
+class AppserviceErrorCountMixin:
+    """Counts the view's 4xx and 5xx answers for the webhook_errors diagnostic."""
+
+    def dispatch(self, request, *args, **kwargs):
+        try:
+            response = super().dispatch(request, *args, **kwargs)
+        except Exception:
+            # DRF re-raises anything but its own exceptions, and Django answers
+            # it with a 500 that no view hook sees.
+            webhook_errors.record(status.HTTP_500_INTERNAL_SERVER_ERROR)
+            raise
+        webhook_errors.record(response.status_code)
+        return response
+
+
+class MatrixAppserviceWebhookView(AppserviceErrorCountMixin, views.APIView):
     authentication_classes = ()
     permission_classes = ()
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = [AppserviceThrottle]
     throttle_scope = "matrix_webhook"
 
     @extend_schema(
@@ -524,17 +1127,16 @@ class MatrixAppserviceWebhookView(views.APIView):
         if not matrix_client.is_enabled():
             return Response({}, status=status.HTTP_200_OK)
 
-        # Validate hs_token from Authorization header using a constant-time
-        # comparison: a naive `!=` leaks the token byte-by-byte to a network-
-        # adjacent attacker.
-        hs_token = config.MATRIX_APPSERVICE_HS_TOKEN
-        auth_header = request.META.get("HTTP_AUTHORIZATION", "")
-        provided = auth_header[7:] if auth_header.startswith("Bearer ") else ""
-        if not hs_token or not hmac.compare_digest(provided, hs_token):
+        if not _is_from_homeserver(request):
             return Response(status=status.HTTP_403_FORBIDDEN)
 
+        events = (
+            request.data.get("events", []) if isinstance(request.data, dict) else None
+        )
+        if not isinstance(events, list):
+            return Response(status=status.HTTP_400_BAD_REQUEST)
+
         # Idempotency check
-        events = request.data.get("events", [])
         _, created = models.MatrixAppserviceTransaction.objects.get_or_create(
             txn_id=txn_id,
             defaults={"event_count": len(events)},
@@ -542,10 +1144,29 @@ class MatrixAppserviceWebhookView(views.APIView):
         if not created:
             return Response({}, status=status.HTTP_200_OK)
 
-        # Dispatch Celery task
-        if events:
-            tasks.process_appservice_events.delay(txn_id, events)
+        # Nothing more to do: the bot reads the rooms' events, commands included,
+        # from its own sync, where it can decrypt them. The homeserver still
+        # needs each transaction acknowledged.
+        return Response({}, status=status.HTTP_200_OK)
 
+
+class MatrixAppservicePingView(AppserviceErrorCountMixin, views.APIView):
+    authentication_classes = ()
+    permission_classes = ()
+    throttle_classes = [AppserviceThrottle]
+    throttle_scope = "matrix_webhook"
+
+    @extend_schema(
+        summary="Matrix Application Service ping",
+        description="Called by the homeserver when Waldur asks it to ping the "
+        "appservice (MSC2659). Authenticated via hs_token in the Authorization "
+        "header.",
+        request=None,
+        responses={200: None},
+    )
+    def post(self, request):
+        if not _is_from_homeserver(request):
+            return Response(status=status.HTTP_403_FORBIDDEN)
         return Response({}, status=status.HTTP_200_OK)
 
 
@@ -555,11 +1176,31 @@ class MatrixAppserviceSetupView(views.APIView):
     @extend_schema(
         summary="Setup Matrix appservice registration",
         request=serializers.MatrixAppserviceSetupSerializer,
-        responses={200: serializers.MatrixAppserviceSetupResponseSerializer},
+        responses={
+            200: serializers.MatrixAppserviceSetupResponseSerializer,
+            409: OpenApiResponse(
+                description=(
+                    "The deployment owns the appservice tokens and re-seeds them "
+                    "on every sync. Rotate its Matrix secret and redeploy instead, "
+                    "or clear MATRIX_TOKENS_MANAGED_BY if the deployment no "
+                    "longer manages Matrix."
+                )
+            ),
+        },
         description="Generates fresh appservice tokens (rotating any existing ones), "
-        "enables the appservice, and returns registration YAML.",
+        "enables the appservice, and returns registration YAML. Returns 409 when the "
+        "deployment owns the tokens; see MATRIX_TOKENS_MANAGED_BY.",
     )
     def post(self, request):
+        # Both packagers re-seed Constance from their own copy of the tokens on
+        # every sync, so a rotation issued here would be reverted at the next
+        # deploy while the homeserver went on honouring the old registration —
+        # the silent half-failure this endpoint used to warn about in prose.
+        # Rotation for such a deployment means rotating its secret and
+        # redeploying.
+        if config.MATRIX_TOKENS_MANAGED_BY:
+            raise TokensManagedByDeployment()
+
         serializer = serializers.MatrixAppserviceSetupSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
@@ -600,6 +1241,31 @@ class MatrixAppserviceSetupView(views.APIView):
                         f"Matrix prerequisites missing: {', '.join(missing)}. "
                         "Set them in the Settings tab or include them in the "
                         "setup request."
+                    )
+                }
+            )
+
+        # Setup never overwrites a stored value, so one in the request that
+        # differs would pair the new tokens with the old homeserver unnoticed.
+        # Secrets are left out: a 400 for a wrong value and a 200 for the right
+        # one would let a caller guess the stored secret one request at a time.
+        # A supplied secret is never written over a stored one either way.
+        secret_request_keys = {"user_registration_secret"}
+        conflicting = [
+            constance_key
+            for request_key, constance_key in constance_keys.items()
+            if request_key not in secret_request_keys
+            and (supplied := serializer.validated_data.get(request_key))
+            and (stored := getattr(config, constance_key))
+            and str(supplied).rstrip("/") != str(stored).rstrip("/")
+        ]
+        if conflicting:
+            raise ValidationError(
+                {
+                    "detail": (
+                        "Already configured with a different value: "
+                        f"{', '.join(conflicting)}. Change it in the Settings tab "
+                        "first, then run Setup again."
                     )
                 }
             )
@@ -703,6 +1369,7 @@ class MatrixAppserviceStatusView(views.APIView):
             "as_token_configured": bool(config.MATRIX_APPSERVICE_AS_TOKEN),
             "hs_token_configured": bool(config.MATRIX_APPSERVICE_HS_TOKEN),
             "sender_localpart": sender_localpart,
+            "tokens_managed_by": config.MATRIX_TOKENS_MANAGED_BY,
             "bot_user_id": bot_user_id,
             "webhook_path": webhook_path,
             "homeserver_url": matrix_client.get_public_homeserver_url(),
@@ -712,8 +1379,164 @@ class MatrixAppserviceStatusView(views.APIView):
         return Response(response_data, status=status.HTTP_200_OK)
 
 
+def _latest_spec_version(versions):
+    """The newest numbered Matrix spec version in a /versions list, e.g. v1.19.
+    Homeservers list them in no guaranteed order, and v1.10 sorts before v1.9
+    as text."""
+    numbered = [v for v in versions if re.fullmatch(r"v\d+\.\d+", v)]
+    if not numbered:
+        return versions[-1] if versions else "unknown"
+    return max(numbered, key=lambda v: tuple(int(n) for n in v[1:].split(".")))
+
+
+def _get_json_object(url):
+    """GET a JSON object; {} on any failure, as the caller only adds detail."""
+    try:
+        resp = httpx.get(url, timeout=DIAGNOSTICS_TIMEOUT)
+        body = resp.json() if resp.status_code == 200 else {}
+    except (httpx.HTTPError, ValueError):
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _homeserver_software(homeserver_url):
+    """The homeserver's name and version, e.g. "Tuwunel 1.9.0", or "".
+
+    The standard endpoint belongs to the federation API, which a homeserver
+    with federation switched off refuses, so Tuwunel's own one is asked next.
+    """
+    standard = _get_json_object(f"{homeserver_url}/_matrix/federation/v1/version")
+    server = standard.get("server")
+    if not isinstance(server, dict) or not server.get("name"):
+        server = _get_json_object(f"{homeserver_url}/_tuwunel/server_version")
+    if not server.get("name"):
+        return ""
+    return f"{server['name']} {server.get('version', '')}".strip()
+
+
+def _bot_rooms(homeserver_url, auth_headers):
+    """How many rooms the bot is in, as an addition to the bot check's detail.
+    The listing uses the same token as the check, so it gets no row of its
+    own."""
+    try:
+        resp = httpx.get(
+            f"{homeserver_url}/_matrix/client/v3/joined_rooms",
+            headers=auth_headers,
+            timeout=DIAGNOSTICS_TIMEOUT,
+        )
+    except httpx.HTTPError as e:
+        return f"; could not list its rooms ({e})"
+    if resp.status_code != 200:
+        return f"; could not list its rooms (HTTP {resp.status_code})"
+    return f", in {len(resp.json().get('joined_rooms', []))} room(s)"
+
+
+def _matrix_errcode(response):
+    try:
+        body = response.json()
+    except ValueError:
+        # A proxy's error page.
+        return ""
+    return body.get("errcode", "") if isinstance(body, dict) else ""
+
+
+def _check_appservice_acts_for_users(user, homeserver_url, auth_headers):
+    """Diagnostics: can the appservice act as `user`? Returns (ok, detail).
+
+    Chat sessions, device pruning and room joins all act as the user with the
+    AS token, and the homeserver refuses each with M_EXCLUSIVE when the
+    appservice's user namespace does not cover them. The bot check cannot see
+    that, as the bot is always covered. The ID need not exist: the homeserver
+    answers on the namespace alone.
+    """
+    profile = models.MatrixUserProfile.objects.filter(
+        user=user, provisioned=True
+    ).first()
+    user_id = (
+        profile.matrix_user_id
+        if profile
+        else matrix_client.generate_matrix_user_id(user)
+    )
+
+    try:
+        resp = httpx.get(
+            f"{homeserver_url}/_matrix/client/v3/account/whoami",
+            params={"user_id": user_id},
+            headers=auth_headers,
+            timeout=DIAGNOSTICS_TIMEOUT,
+        )
+    except httpx.ConnectError:
+        return False, "Connection refused"
+    except httpx.TimeoutException:
+        return False, "Timed out"
+    except httpx.HTTPError as e:
+        return False, str(e)
+
+    if resp.status_code == 200:
+        return True, f"OK — can act as {user_id}"
+    if _matrix_errcode(resp) == "M_EXCLUSIVE":
+        detail = (
+            f"{user_id} is outside the user namespace of the homeserver's "
+            "appservice registration, so chat sessions and room joins fail; "
+            "register the appservice on the homeserver again with Waldur's "
+            "registration"
+        )
+    else:
+        detail = f"HTTP {resp.status_code}: {resp.text[:200]}"
+
+    invited = models.MatrixRoomMember.objects.filter(
+        room__state=models.RoomStates.ACTIVE,
+        membership_state=models.MembershipStates.INVITED,
+    ).count()
+    if invited:
+        detail += f" ({invited} room member(s) recorded as invited, not joined)"
+    return False, detail
+
+
+def _check_bot_is_homeserver_admin(homeserver_url, auth_headers, bot_user_id):
+    """Diagnostics: whether the bot may call the homeserver's admin API, which
+    locks accounts and sets passwords. Returns (ok, detail)."""
+    encoded_bot_user_id = quote(bot_user_id, safe="")
+    try:
+        resp = httpx.get(
+            f"{homeserver_url}/_synapse/admin/v2/users/{encoded_bot_user_id}",
+            headers=auth_headers,
+            timeout=DIAGNOSTICS_TIMEOUT,
+        )
+    except httpx.ConnectError:
+        return False, "Connection refused"
+    except httpx.TimeoutException:
+        return False, "Timed out"
+    except httpx.HTTPError as e:
+        return False, str(e)
+
+    if resp.status_code == 200:
+        return True, f"OK — {bot_user_id} is a homeserver admin"
+    if resp.status_code == 403:
+        return False, (
+            f"{bot_user_id} is not a homeserver admin, so Waldur cannot lock the "
+            "Matrix accounts of deactivated and deleted users or replace a "
+            "deleted user's password, and users cannot generate Matrix "
+            "passwords. On Tuwunel, run "
+            f"`!admin users make-user-admin {bot_user_id}` in the admin room."
+        )
+    if resp.status_code in (404, 405):
+        return False, (
+            "The homeserver's admin API is not reachable at "
+            "MATRIX_HOMESERVER_URL: blocked by a proxy, or not "
+            "supported by the homeserver."
+        )
+    return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+
+
+# How many Matrix IDs the sso_id_collisions diagnostic names.
+SSO_COLLISIONS_SHOWN = 10
+
+
 class MatrixDiagnosticsView(views.APIView):
-    permission_classes = [permissions.IsAuthenticated, core_permissions.IsStaff]
+    # Support too, so monitoring can poll it without a staff token. It shows no
+    # secret, and what it does on the homeserver acts for the caller alone.
+    permission_classes = [permissions.IsAuthenticated, core_permissions.IsSupport]
 
     @extend_schema(
         summary="Run Matrix connectivity diagnostics",
@@ -751,7 +1574,6 @@ class MatrixDiagnosticsView(views.APIView):
 
         # Check 3: Homeserver reachable (/_matrix/client/versions)
         server_reachable = False
-        server_name = ""
         if homeserver_url:
             try:
                 resp = httpx.get(
@@ -760,11 +1582,13 @@ class MatrixDiagnosticsView(views.APIView):
                 )
                 server_reachable = resp.status_code == 200
                 if server_reachable:
-                    versions = resp.json().get("versions", [])
-                    server_name = resp.json().get("server", {}).get("name", "")
-                    detail = f"OK — versions: {', '.join(versions[-3:])}"
-                    if server_name:
-                        detail += f" (server: {server_name})"
+                    spec = _latest_spec_version(resp.json().get("versions", []))
+                    software = _homeserver_software(homeserver_url)
+                    detail = (
+                        f"OK — {software}, Matrix up to {spec}"
+                        if software
+                        else f"OK — Matrix up to {spec}"
+                    )
                 else:
                     detail = f"HTTP {resp.status_code}"
             except httpx.ConnectError:
@@ -886,7 +1710,9 @@ class MatrixDiagnosticsView(views.APIView):
                 if resp.status_code == 200:
                     bot_user_id = resp.json().get("user_id", "")
                     bot_ok = True
-                    detail = f"OK — authenticated as {bot_user_id}"
+                    detail = f"OK — authenticated as {bot_user_id}" + _bot_rooms(
+                        homeserver_url, auth_headers
+                    )
                 elif resp.status_code == 403:
                     detail = "403 Forbidden — AS token not recognized by homeserver (check appservice registration)"
                 elif resp.status_code == 401:
@@ -911,38 +1737,113 @@ class MatrixDiagnosticsView(views.APIView):
             }
         )
 
-        # Check 8: Bot can operate (list joined rooms)
-        bot_functional = False
-        if bot_ok and bot_user_id:
+        # Check 7b: the appservice can act for users, not only for the bot.
+        if bot_ok:
+            users_ok, detail = _check_appservice_acts_for_users(
+                request.user, homeserver_url, auth_headers
+            )
+        else:
+            users_ok, detail = False, "Skipped — bot authentication failed"
+        checks.append(
+            {
+                "name": "appservice_user_namespace",
+                "label": "Appservice can act for users",
+                "ok": users_ok,
+                "detail": detail,
+            }
+        )
+
+        # Check 8a: chat drawer token lifetime. Without access_token_ttl the
+        # homeserver gives the drawer tokens that last a week (Tuwunel) or
+        # forever, and a leaked one stays valid that long. Measured with a login
+        # like the drawer's, as the user running diagnostics.
+        profile = models.MatrixUserProfile.objects.filter(
+            user=request.user, provisioned=True
+        ).first()
+        lifetime_ok = False
+        if not profile:
+            # Nothing was measured, so nothing failed.
+            lifetime_ok = True
+            detail = "Skipped — open the chat once as this user, then run again"
+        else:
             try:
-                resp = httpx.get(
-                    f"{homeserver_url}/_matrix/client/v3/joined_rooms",
-                    headers=auth_headers,
-                    timeout=DIAGNOSTICS_TIMEOUT,
+                lifetime_ms = matrix_client.probe_web_token_lifetime(
+                    profile.matrix_user_id
                 )
-                if resp.status_code == 200:
-                    bot_functional = True
-                    rooms = resp.json().get("joined_rooms", [])
-                    detail = f"OK — {bot_user_id} is in {len(rooms)} room(s)"
+            except (matrix_client.MatrixClientError, httpx.HTTPError) as e:
+                detail = f"Could not measure: {e}"
+            else:
+                if lifetime_ms is None:
+                    detail = (
+                        "Chat drawer tokens never expire; set access_token_ttl "
+                        "(e.g. 300) on the homeserver"
+                    )
+                elif lifetime_ms > 3600 * 1000:
+                    detail = (
+                        f"Chat drawer tokens live {lifetime_ms // 1000} s; set "
+                        "access_token_ttl to a few minutes (e.g. 300)"
+                    )
                 else:
-                    detail = f"HTTP {resp.status_code}: {resp.text[:200]}"
-            except httpx.ConnectError:
-                detail = "Connection refused"
-            except httpx.TimeoutException:
-                detail = "Timed out"
+                    lifetime_ok = True
+                    detail = f"Chat drawer tokens live {lifetime_ms // 1000} s"
+        checks.append(
+            {
+                "name": "web_token_lifetime",
+                "label": "Chat drawer tokens expire",
+                "ok": lifetime_ok,
+                "detail": detail,
+            }
+        )
+
+        # Bot admin check: the bot locks the accounts of deactivated users and
+        # sets passwords through the homeserver's admin API, which only answers
+        # server admins.
+        if bot_ok and bot_user_id:
+            bot_admin, detail = _check_bot_is_homeserver_admin(
+                homeserver_url, auth_headers, bot_user_id
+            )
+        else:
+            bot_admin, detail = False, "Skipped — bot authentication failed"
+        checks.append(
+            {
+                "name": "bot_homeserver_admin",
+                "label": "Bot is a homeserver admin",
+                "ok": bot_admin,
+                "detail": detail,
+            }
+        )
+
+        # Check 9: the homeserver can call Waldur. Every check above talks from
+        # Waldur to the homeserver; this one has the homeserver call back with
+        # the hs_token, so it catches a wrong hs_token or an appservice URL the
+        # homeserver cannot reach, which otherwise only show as missing events.
+        ping_ok = False
+        ping_metrics = None
+        if bot_ok:
+            try:
+                duration = appservice_registration.ping_appservice(
+                    homeserver_url, as_token, timeout=DIAGNOSTICS_TIMEOUT
+                )
+                ping_ok = True
+                detail = f"OK — round trip {duration} ms"
+                if isinstance(duration, int):
+                    ping_metrics = {"round_trip_ms": duration}
             except Exception as e:
+                # A timeout's message names its likely cause: the homeserver
+                # holds the ping open while it retries Waldur.
                 detail = str(e)
         else:
             detail = "Skipped — bot authentication failed"
 
-        checks.append(
-            {
-                "name": "bot_functional",
-                "label": "Bot can operate",
-                "ok": bot_functional,
-                "detail": detail,
-            }
-        )
+        ping_check = {
+            "name": "appservice_ping",
+            "label": "Homeserver can reach Waldur (ping)",
+            "ok": ping_ok,
+            "detail": detail,
+        }
+        if ping_metrics:
+            ping_check["metrics"] = ping_metrics
+        checks.append(ping_check)
 
         # Check 8b: LiveKit (RTC) configured. The video-call SFU is advertised
         # by the homeserver's .well-known under org.matrix.msc4143.rtc_foci —
@@ -993,7 +1894,7 @@ class MatrixDiagnosticsView(views.APIView):
             }
         )
 
-        # Check 9: Room stats
+        # Check 10: Room stats
         total_rooms = models.MatrixRoom.objects.count()
         active_rooms = models.MatrixRoom.objects.filter(
             state=models.RoomStates.ACTIVE
@@ -1015,16 +1916,132 @@ class MatrixDiagnosticsView(views.APIView):
             }
         )
 
-        # Check 10: User profiles
+        # Check 11: User profiles, and the room members provisioning left
+        # without one, e.g. refused because their generated ID already has an
+        # account. Those have no chat, so the check fails; users outside every
+        # room have only never opened it.
         total_profiles = models.MatrixUserProfile.objects.count()
         provisioned = models.MatrixUserProfile.objects.filter(provisioned=True).count()
+        detail = f"{provisioned} provisioned out of {total_profiles} total"
+        unlinked = get_unlinked_room_users()
+        unlinked_count = unlinked.count()
+        if unlinked_count:
+            names = list(
+                unlinked.values_list("username", flat=True)[:UNLINKED_USERS_SHOWN]
+            )
+            more = unlinked_count - len(names)
+            detail += (
+                f"; {unlinked_count} room member(s) without a Matrix account: "
+                + ", ".join(names)
+                + (f" and {more} more" if more else "")
+                + ". The worker log says why; link an existing account with "
+                "`waldur link_matrix_account <user> <matrix id>`"
+            )
 
         checks.append(
             {
                 "name": "user_stats",
                 "label": "User profiles",
-                "ok": True,
-                "detail": f"{provisioned} provisioned out of {total_profiles} total",
+                "ok": not unlinked_count,
+                "detail": detail,
+            }
+        )
+
+        # With single sign-on, a provisioned ID is the account of any subject
+        # of the homeserver's identity provider whose claim reads like it.
+        # Provisioning refuses IDs another subject could reach, but profiles
+        # from before oidc keep them.
+        collisions = matrix_client.sso_exposed_ids()
+        sso_ok = not collisions
+        if config.MATRIX_EXTERNAL_LOGIN_METHOD != "oidc":
+            detail = "Not using single sign-on"
+        elif not config.MATRIX_SSO_REGISTRATION_METHOD.strip():
+            # Every account counts as exposed then; naming them adds nothing.
+            sso_ok = False
+            detail = (
+                "MATRIX_SSO_REGISTRATION_METHOD is not set, so no user is given "
+                "a Matrix account, and no existing one can be checked"
+            )
+        elif collisions:
+            more = len(collisions) - SSO_COLLISIONS_SHOWN
+            detail = (
+                f"{len(collisions)} Matrix account(s) that another identity "
+                "provider subject could sign in to: "
+                + ", ".join(collisions[:SSO_COLLISIONS_SHOWN])
+                + (f" and {more} more" if more > 0 else "")
+                + ". An ID is listed when it is not its user's username "
+                "unchanged, when its user signs in to Waldur other than through "
+                "MATRIX_SSO_REGISTRATION_METHOD, or when another user's "
+                "username differs from its user's only in case."
+            )
+        else:
+            detail = "Every Matrix ID is its user's own claim"
+        checks.append(
+            {
+                "name": "sso_id_collisions",
+                "label": "Single sign-on reaches only its own accounts",
+                "ok": sso_ok,
+                "detail": detail,
+            }
+        )
+
+        # Everything Waldur posts in a room waits for the bot process, the only
+        # holder of the keys to post into an encrypted room.
+        bot_running = bot_state.is_bot_running(matrix_client.get_bot_user_id())
+        pending = models.MatrixOutboxMessage.objects.filter(
+            state=models.OutboxStates.PENDING
+        ).count()
+        checks.append(
+            {
+                "name": "bot_running",
+                "label": "Matrix bot running",
+                "ok": bot_running,
+                "detail": (
+                    f"{'Running' if bot_running else 'Not running: start the matrix_bot process'}"
+                    f"; {pending} message(s) waiting to be posted"
+                ),
+            }
+        )
+
+        failed_exports = models.MatrixHistoryExport.objects.filter(
+            state=models.ExportStates.FAILED,
+            modified__gte=timezone.now() - FAILED_EXPORTS_WINDOW,
+        ).count()
+        checks.append(
+            {
+                "name": "history_exports",
+                "label": "History exports",
+                "ok": not failed_exports,
+                "detail": (
+                    f"{failed_exports} export(s) failed in the last 24 hours, "
+                    "which cover the last nightly run. Their error_message is in "
+                    "GET /api/matrix/exports/?state=failed"
+                    if failed_exports
+                    else "No export failed in the last 24 hours"
+                ),
+                "metrics": {"failed": failed_exports},
+            }
+        )
+
+        # Only 5xx fails the check. Anyone can call these endpoints, so a 4xx
+        # may be a stranger's request, and a homeserver holding the wrong
+        # hs_token already fails appservice_ping.
+        errors = webhook_errors.counts()
+        if errors["4xx"] or errors["5xx"]:
+            detail = (
+                "Calls to the appservice endpoints in the last hour: "
+                f"{errors['4xx']} answered with 4xx, {errors['5xx']} answered "
+                "with 5xx; see the API log"
+            )
+        else:
+            detail = "No call to the appservice endpoints answered with an error in the last hour"
+        checks.append(
+            {
+                "name": "webhook_errors",
+                "label": "Appservice endpoint errors",
+                "ok": not errors["5xx"],
+                "detail": detail,
+                "metrics": errors,
             }
         )
 
@@ -1043,7 +2060,9 @@ class MatrixReprovisionView(views.APIView):
         request=None,
         responses={202: serializers.MatrixReprovisionResponseSerializer},
         description="Resets all active rooms to 'creating' state and re-queues them "
-        "for provisioning. Also resets all user profiles. Staff only.",
+        "for provisioning. Also resets all user profiles. Only for moving to a new "
+        "homeserver: on the same homeserver, every old room stays behind with its "
+        "history next to a new, empty one. Staff only.",
     )
     def post(self, request):
         # Reprovisioning resets every active room to 'creating' and re-queues
@@ -1063,16 +2082,58 @@ class MatrixReprovisionView(views.APIView):
         )
 
 
+def _no_store(response):
+    """An export download is a room's history in clear: kept by no cache."""
+    response["Cache-Control"] = "no-store"
+    return response
+
+
+class _DecryptedStream:
+    """A stored export file, decrypted chunk by chunk as it is sent.
+
+    The response closes it when it is done with it, sent or not, which closes
+    the stored file even if no chunk was ever asked for.
+    """
+
+    def __init__(self, stored, data_key, file_kind, export, kind):
+        self._stored = stored
+        self._chunks = export_files.decrypt_chunks(data_key, file_kind, stored)
+        self._export = export
+        self._kind = kind
+
+    def __iter__(self):
+        try:
+            yield from self._chunks
+        except (export_files.ExportFileError, OSError):
+            # Checked in full before the first chunk was sent, so the file
+            # changed in storage since. Raised on, so the server drops the
+            # connection: the client gets a broken download, not one that
+            # looks complete.
+            logger.warning(
+                "History export %s (%s) changed while it was being sent; "
+                "the download was aborted",
+                self._export.uuid,
+                self._kind,
+            )
+            raise
+
+    def close(self):
+        self._chunks.close()
+        self._stored.close()
+
+
 class MatrixHistoryExportDownloadView(views.APIView):
     """Stream a Matrix history export file or its media zip.
 
     Direct FileField URLs from the serializer would be served by the storage
     backend without any auth check — anyone with the URL could download. This
-    view enforces the same room-access policy as MatrixHistoryExportViewSet
+    view enforces the same policy as MatrixHistoryExportViewSet
     and 404s on miss/denied so the route does not leak export existence.
     """
 
     permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "matrix_export_download"
 
     @extend_schema(
         summary="Download a Matrix history export file",
@@ -1090,28 +2151,91 @@ class MatrixHistoryExportDownloadView(views.APIView):
     def get(self, request, uuid, kind):
         if kind not in ("export", "media"):
             raise Http404
+        exports = filter_exports_for_request(
+            models.MatrixHistoryExport.objects.all(), request
+        )
         try:
-            export = models.MatrixHistoryExport.objects.get(uuid=uuid)
+            export = exports.get(uuid=uuid)
         except (models.MatrixHistoryExport.DoesNotExist, ValueError):
             raise Http404
-
-        user = request.user
-        if not (user.is_staff or user.is_support):
-            if export.room.id not in get_accessible_room_ids(user):
-                raise Http404
 
         file_field = export.export_file if kind == "export" else export.media_file
         if not file_field:
             raise Http404
+        if export.data_key:
+            return _no_store(self._decrypted(export, file_field, kind))
+        # Written before export files were encrypted: served as stored.
         # Force octet-stream: the export is a .json file, and Django would
         # otherwise label it application/json. The SPA downloads via a generic
         # get<Blob>() helper that JSON-parses any application/json response
         # instead of returning a Blob, breaking the download. An as_attachment
         # stream is opaque bytes to the client, so octet-stream is correct.
-        return FileResponse(
-            file_field.open("rb"),
-            as_attachment=True,
+        return _no_store(
+            FileResponse(
+                self._open(export, file_field, kind),
+                as_attachment=True,
+                content_type="application/octet-stream",
+            )
+        )
+
+    def _decrypted(self, export, file_field, kind):
+        """Stream the file decrypted, one chunk at a time.
+
+        Every chunk is checked before the first is sent, and the stream is then
+        read from the same open file, so a file altered at rest is refused
+        rather than sent in part. Only a file changed in storage while it is
+        being sent can still abort the download: the chunk that no longer
+        checks out is not sent, nor anything after it, and the connection is
+        dropped.
+        """
+        file_kind = (
+            export_files.KIND_MESSAGES if kind == "export" else export_files.KIND_MEDIA
+        )
+        try:
+            data_key = base64.b64decode(export.data_key, validate=True)
+        except ValueError:
+            return self._undecryptable(export, kind)
+        stored = self._open(export, file_field, kind)
+        try:
+            export_files.verify(data_key, file_kind, stored)
+            stored.seek(0)
+        except (export_files.ExportFileError, OSError):
+            stored.close()
+            return self._undecryptable(export, kind)
+
+        response = StreamingHttpResponse(
+            _DecryptedStream(stored, data_key, file_kind, export, kind),
             content_type="application/octet-stream",
+        )
+        response["Content-Disposition"] = content_disposition_header(
+            True, os.path.basename(file_field.name)
+        )
+        return response
+
+    @staticmethod
+    def _open(export, file_field, kind):
+        try:
+            # Asked first: the database storage opens a file it has no row for
+            # as an empty one rather than failing.
+            if not file_field.storage.exists(file_field.name):
+                raise FileNotFoundError(file_field.name)
+            return file_field.open("rb")
+        except OSError:
+            # Recorded, but gone from storage.
+            logger.warning(
+                "History export %s (%s) is missing its file", export.uuid, kind
+            )
+            raise Http404
+
+    @staticmethod
+    def _undecryptable(export, kind):
+        logger.warning("History export %s (%s) cannot be decrypted", export.uuid, kind)
+        return Response(
+            {
+                "detail": "The export cannot be decrypted: its file was "
+                "altered, or the key that encrypted it is no longer configured."
+            },
+            status=status.HTTP_409_CONFLICT,
         )
 
 
@@ -1211,3 +2335,330 @@ class LiveKitRoomParticipantsView(views.APIView):
 
         serializer = serializers.LiveKitParticipantSerializer(participants, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class _MatrixError(Exception):
+    """A refusal in the Matrix error format lk-jwt-service answers with."""
+
+    def __init__(self, status_code, errcode, error):
+        super().__init__(error)
+        self.status_code = status_code
+        self.errcode = errcode
+        self.error = error
+
+
+def _bad_json(error):
+    return _MatrixError(status.HTTP_400_BAD_REQUEST, "M_BAD_JSON", error)
+
+
+# One answer for every reason a caller may not join, so the response does not
+# tell whether a room exists, who is in it, or which devices a user has.
+def _forbidden():
+    return _MatrixError(
+        status.HTTP_403_FORBIDDEN, "M_FORBIDDEN", "You may not join this call."
+    )
+
+
+def _unauthorized():
+    return _MatrixError(
+        status.HTTP_401_UNAUTHORIZED,
+        "M_UNAUTHORIZED",
+        "The request could not be authorised.",
+    )
+
+
+def _unavailable():
+    return _MatrixError(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        "M_UNKNOWN",
+        "Calls are unavailable right now. Please try again later.",
+    )
+
+
+def _string(data, key):
+    value = data.get(key) if isinstance(data, dict) else None
+    return value if isinstance(value, str) else ""
+
+
+def _edge_client_address(request):
+    """The client address as the edge proxy saw it.
+
+    DRF's default identity is the whole X-Forwarded-For header, which a client
+    can vary to get a fresh bucket wherever a proxy appends to the header it
+    sent. The proxy in front of Waldur writes the address it saw last, so the
+    rightmost entry is the one a client cannot choose. Without a proxy only a
+    request with no X-Forwarded-For falls back to the socket's address, and the
+    per-user limit is what bounds a client that sends its own header.
+    """
+    forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
+    hops = [hop.strip() for hop in forwarded.split(",") if hop.strip()]
+    # Azure Application Gateway writes "address:port", the port being the
+    # client's ephemeral one, which would make every connection a new bucket.
+    return _strip_port(hops[-1]) if hops else request.META.get("REMOTE_ADDR", "")
+
+
+class LiveKitClientThrottle(ScopedRateThrottle):
+    """Per client address, keyed so that a forged X-Forwarded-For does not
+    reset it."""
+
+    def get_ident(self, request):
+        return _edge_client_address(request)
+
+
+class LiveKitUserThrottle(SimpleRateThrottle):
+    """Per Matrix user, once their OpenID token checks out, so one user cannot
+    create call rooms from many addresses."""
+
+    scope = "matrix_livekit_token_user"
+
+    def __init__(self, matrix_user_id):
+        self.matrix_user_id = matrix_user_id
+        super().__init__()
+
+    def get_cache_key(self, request, view):
+        return self.cache_format % {"scope": self.scope, "ident": self.matrix_user_id}
+
+
+def _keeps_waldur_room_access(matrix_user_id, room_id):
+    """Whether the Matrix user may be in the room as far as Waldur decides:
+    always for a room Waldur does not manage, and for one it manages only while
+    the room is active and its Waldur user keeps access to it."""
+    room = models.MatrixRoom.objects.filter(room_id=room_id).first()
+    if room is None:
+        return True
+    if room.state != models.RoomStates.ACTIVE:
+        return False
+    profile = (
+        models.MatrixUserProfile.objects.filter(matrix_user_id=matrix_user_id)
+        .select_related("user")
+        .first()
+    )
+    return profile is not None and models.keeps_room_access(profile.user, room)
+
+
+class LiveKitTokenView(views.APIView):
+    """Base of the call token API that Matrix clients use: lk-jwt-service's
+    API, served by Waldur so that it can check room membership.
+
+    Matrix clients find it through the homeserver's ``.well-known`` RTC focus
+    (``livekit_service_url``). The caller's OpenID token authenticates them;
+    Waldur's own authentication is not used, and cross-origin calls are
+    allowed from anywhere, without credentials.
+    """
+
+    authentication_classes = ()
+    permission_classes = (permissions.AllowAny,)
+    throttle_classes = [LiveKitClientThrottle]
+    throttle_scope = "matrix_livekit_token"
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        response = super().finalize_response(request, response, *args, **kwargs)
+        return add_public_cors_headers(_no_store(response))
+
+    def options(self, request, *args, **kwargs):
+        return Response(status=status.HTTP_200_OK)
+
+    def post(self, request):
+        if not matrix_client.is_enabled():
+            raise Http404
+        try:
+            return Response(self.issue(request))
+        except _MatrixError as e:
+            return Response(
+                {"errcode": e.errcode, "error": e.error}, status=e.status_code
+            )
+
+    def parse(self, data):
+        """Return (room_id, slot_id, openid_token, claimed_user_id, device_id,
+        identity function)."""
+        raise NotImplementedError
+
+    def issue(self, request):
+        data = request.data
+        if not isinstance(data, dict):
+            raise _MatrixError(
+                status.HTTP_400_BAD_REQUEST, "M_NOT_JSON", "Error reading request"
+            )
+        if data.get("delay_id") or data.get("delay_timeout"):
+            # Element Call retries without them, and keeps its own delayed
+            # leave event alive, which it would not if this were accepted.
+            raise _bad_json("Delegation of delayed events is not supported")
+        room_id, slot_id, openid_token, claimed_user_id, device_id, identity = (
+            self.parse(data)
+        )
+        access_token = _string(openid_token, "access_token")
+        server_name = _string(openid_token, "matrix_server_name")
+        if not access_token or not server_name:
+            raise _bad_json("Missing OpenID token parameters")
+        if slot_id not in livekit_client.CALL_SLOT_IDS:
+            raise _bad_json("Unsupported slot_id")
+
+        if not (
+            livekit_client.is_configured()
+            and livekit_client.get_public_url()
+            and matrix_client.is_homeserver_configured()
+        ):
+            raise _unavailable() from None
+        domain = config.MATRIX_HOMESERVER_DOMAIN
+        # Only this homeserver's users: rooms are not federated, and only
+        # their membership and devices can be checked here.
+        if server_name != domain:
+            raise _forbidden()
+
+        try:
+            matrix_user_id = matrix_client.get_openid_user(access_token)
+        except matrix_client.MatrixClientError as e:
+            logger.warning("Could not verify a call OpenID token: %s", e)
+            raise _unavailable() from None
+        if not matrix_user_id:
+            raise _unauthorized()
+        if claimed_user_id and claimed_user_id != matrix_user_id:
+            raise _unauthorized()
+        user_throttle = LiveKitUserThrottle(matrix_user_id)
+        if not user_throttle.allow_request(request, self):
+            raise Throttled(user_throttle.wait())
+        if (
+            not matrix_user_id.endswith(f":{domain}")
+            or matrix_user_id == matrix_client.get_bot_user_id()
+        ):
+            raise _forbidden()
+        # A Waldur user deactivated meanwhile is locked out of Matrix; this
+        # covers the window before the lock lands.
+        if models.MatrixUserProfile.objects.filter(
+            matrix_user_id=matrix_user_id, user__is_active=False
+        ).exists():
+            raise _forbidden()
+
+        try:
+            # Every local user is in the appservice's user namespace, so the
+            # appservice can ask as any of them; no other path is needed.
+            joined = matrix_client.is_joined(matrix_user_id, room_id)
+            own_device = joined and any(
+                device.get("device_id") == device_id
+                for device in matrix_client.list_devices(matrix_user_id)
+            )
+        except (matrix_client.MatrixClientError, httpx.HTTPError) as e:
+            logger.warning("Could not check call access of %s: %s", matrix_user_id, e)
+            raise _unavailable() from None
+        # A room Waldur manages also needs the user's standing in Waldur: it
+        # must be active, and its Matrix member a Waldur user whom a role (or a
+        # staff join) still keeps in it. This holds the call shut in the window
+        # before a revoked user is removed from the room on the homeserver, or
+        # when that removal failed. Rooms Waldur does not manage (direct
+        # messages, rooms made in Element) have no Waldur roles to check, so
+        # the homeserver's membership decides. Checked after membership, so a
+        # non-member is refused the same way whether or not Waldur knows the
+        # room.
+        if not (
+            joined and own_device and _keeps_waldur_room_access(matrix_user_id, room_id)
+        ):
+            logger.info(
+                "Refused a call token to %s for room %s", matrix_user_id, room_id
+            )
+            raise _forbidden()
+
+        room_name = livekit_client.call_room_name(room_id, slot_id)
+        try:
+            livekit_client.create_call_room(room_name)
+        except livekit_client.LiveKitClientError as e:
+            logger.warning("Could not create the LiveKit room for %s: %s", room_id, e)
+            raise _unavailable() from None
+        token = livekit_client.mint_call_token(
+            room_name, identity(matrix_user_id), matrix_user_id
+        )
+        logger.info("Issued a call token to %s for room %s", matrix_user_id, room_id)
+        return {"url": livekit_client.get_public_url(), "jwt": token}
+
+
+@extend_schema(exclude=True)
+class LiveKitGetTokenView(LiveKitTokenView):
+    """POST <base>/get_token: the MatrixRTC (MSC4195) request.
+
+    ``{room_id, slot_id, openid_token, member: {id, claimed_user_id,
+    claimed_device_id}}`` -> ``{url, jwt}``
+    """
+
+    def parse(self, data):
+        room_id = _string(data, "room_id")
+        slot_id = _string(data, "slot_id")
+        if not room_id or not slot_id:
+            raise _bad_json("The request body is missing `room_id` or `slot_id`")
+        member = data.get("member")
+        member_id = _string(member, "id")
+        claimed_user_id = _string(member, "claimed_user_id")
+        device_id = _string(member, "claimed_device_id")
+        if not member_id or not claimed_user_id or not device_id:
+            raise _bad_json(
+                "The request body `member` is missing a `id`, "
+                "`claimed_user_id` or `claimed_device_id`"
+            )
+        # The member ID is part of the LiveKit identity, so a free one would
+        # let a device take any number of identities, none of them in the
+        # room's call membership. Element Call's state-event membership uses
+        # "<user>:<device>" (matrix-js-sdk, MembershipManager.makeMyMembership),
+        # and the web chat its device ID, so those two are the ones allowed.
+        # Matrix 2.0's sticky-event membership uses a random member ID; Element
+        # Call falls back to /sfu/get when it is refused.
+        if member_id not in (device_id, f"{claimed_user_id}:{device_id}"):
+            raise _bad_json("The member `id` must name the claimed device")
+        return (
+            room_id,
+            slot_id,
+            data.get("openid_token"),
+            claimed_user_id,
+            device_id,
+            lambda user_id: livekit_client.call_identity(user_id, device_id, member_id),
+        )
+
+
+@extend_schema(exclude=True)
+class LiveKitLegacySfuView(LiveKitTokenView):
+    """POST <base>/sfu/get: the legacy request older Element Call versions,
+    and newer ones as a fallback, send.
+
+    ``{room, openid_token, device_id}`` -> ``{url, jwt}``
+    """
+
+    def parse(self, data):
+        room_id = _string(data, "room")
+        if not room_id:
+            raise _bad_json("Missing room parameter")
+        device_id = _string(data, "device_id")
+        if not device_id:
+            raise _bad_json("Missing device_id parameter")
+        return (
+            room_id,
+            livekit_client.ELEMENT_CALL_SLOT_ID,
+            data.get("openid_token"),
+            "",
+            device_id,
+            lambda user_id: livekit_client.legacy_call_identity(user_id, device_id),
+        )
+
+
+@extend_schema(exclude=True)
+class LiveKitDelegateDelayedLeaveView(LiveKitTokenView):
+    """POST <base>/delegate_delayed_leave: handing a delayed leave event
+    (MSC4140) over to the service, which restarts it while the member is on
+    the SFU and sends it once they leave.
+
+    Waldur does not take delayed leave events over, and answers every request
+    with 404 M_NOT_FOUND, the answer by which Matrix clients tell that the
+    service does not support it. Element Call probes this endpoint before
+    joining and takes any other status as support, after which it schedules
+    its leave event an hour ahead and stops restarting it every few seconds
+    itself. So the answer is the same whatever the request, and is not
+    throttled: a refusal of any other kind would leave a member who drops
+    off the call in it for an hour.
+    """
+
+    throttle_classes = ()
+
+    def post(self, request):
+        return Response(
+            {
+                "errcode": "M_NOT_FOUND",
+                "error": "Delegation of delayed events is not supported",
+            },
+            status=status.HTTP_404_NOT_FOUND,
+        )

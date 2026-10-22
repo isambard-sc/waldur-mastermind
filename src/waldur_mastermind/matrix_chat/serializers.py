@@ -1,6 +1,8 @@
 import re
 
+from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
+from django.core.validators import RegexValidator
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 from rest_framework.exceptions import PermissionDenied
@@ -8,7 +10,8 @@ from rest_framework.exceptions import PermissionDenied
 from waldur_core.core.serializers import GenericRelatedField
 from waldur_core.structure.models import Project
 
-from . import models, room_provisioning
+from . import models, recovery_keys, room_provisioning
+from .models import CryptoLeaseKinds
 
 # Matrix appservice registration regexes are built by string interpolation into
 # YAML the homeserver compiles as Python re. Validate inputs up front so a
@@ -35,14 +38,96 @@ def validate_homeserver_domain(value):
 
 
 class MatrixCredentialsSerializer(serializers.Serializer):
-    method = serializers.CharField()
+    method = serializers.ChoiceField(
+        choices=settings.CONSTANCE_CONFIG_CHOICES["MATRIX_EXTERNAL_LOGIN_METHOD"]
+    )
     homeserver_url = serializers.CharField()
     matrix_user_id = serializers.CharField()
-    password = serializers.CharField(required=False)
-    login_token = serializers.CharField(required=False)
-    oidc_provider_url = serializers.CharField(required=False)
-    room_id = serializers.CharField(required=False)
-    access_token = serializers.CharField(required=False)
+
+
+class MatrixPasswordSerializer(serializers.Serializer):
+    homeserver_url = serializers.CharField()
+    matrix_user_id = serializers.CharField()
+    password = serializers.CharField()
+
+
+class MatrixSessionSerializer(serializers.Serializer):
+    homeserver_url = serializers.CharField()
+    matrix_user_id = serializers.CharField()
+    device_id = serializers.CharField()
+    access_token = serializers.CharField()
+    refresh_token = serializers.CharField(allow_null=True)
+    expires_in_ms = serializers.IntegerField(allow_null=True)
+    recovery_key = serializers.CharField(
+        allow_null=True,
+        help_text="The user's secret-storage recovery key, or null before "
+        "encryption is set up. Only ever returned to its owner.",
+    )
+
+
+class MatrixRecoveryKeySerializer(serializers.Serializer):
+    recovery_key = serializers.CharField(
+        allow_null=True,
+        help_text="The user's secret-storage recovery key, for unlocking chat "
+        "history in another Matrix client. Null while Waldur holds no key that "
+        "opens the user's secret storage.",
+    )
+
+
+class MatrixCryptoLeaseRequestSerializer(serializers.Serializer):
+    kind = serializers.ChoiceField(choices=CryptoLeaseKinds.CHOICES)
+
+
+class MatrixCryptoLeaseSerializer(serializers.Serializer):
+    lease = serializers.CharField()
+    expires_at = serializers.DateTimeField()
+    temporary_password = serializers.CharField(
+        allow_null=True,
+        help_text="For a reset only: the password to answer the homeserver's "
+        "interactive auth with. Replaced once the new key is escrowed.",
+    )
+
+
+LEASE_FIELD = dict(
+    max_length=64,
+    validators=[RegexValidator(r"^[A-Za-z0-9_-]+$", "Not a lease.")],
+)
+
+
+class MatrixCryptoEscrowSerializer(serializers.Serializer):
+    lease = serializers.CharField(**LEASE_FIELD)
+    recovery_key = serializers.CharField(
+        max_length=recovery_keys.MAX_RECOVERY_KEY_LENGTH
+    )
+
+    def validate_recovery_key(self, value):
+        try:
+            recovery_keys.decode_recovery_key(value)
+        except recovery_keys.InvalidRecoveryKey as e:
+            raise serializers.ValidationError(str(e))
+        return value
+
+
+class MatrixCryptoLeaseReleaseSerializer(serializers.Serializer):
+    lease = serializers.CharField(**LEASE_FIELD)
+
+
+class MatrixCryptoConflictSerializer(serializers.Serializer):
+    state = serializers.ChoiceField(
+        choices=[
+            "set_up",
+            "locked",
+            "not_locked",
+            "in_progress",
+            "no_lease",
+            "wrong_key",
+        ]
+    )
+    detail = serializers.CharField()
+
+
+class MatrixRoomOpenSerializer(serializers.Serializer):
+    room_id = serializers.CharField()
 
 
 class MatrixRoomMemberSummarySerializer(serializers.Serializer):
@@ -286,7 +371,7 @@ class MatrixAppserviceSetupSerializer(serializers.Serializer):
         allow_blank=True,
         help_text=(
             "Matrix homeserver base URL. Only persisted if MATRIX_HOMESERVER_URL "
-            "is not already configured."
+            "is not already configured; a different value is refused."
         ),
     )
     homeserver_public_url = serializers.URLField(
@@ -297,7 +382,8 @@ class MatrixAppserviceSetupSerializer(serializers.Serializer):
             "blank when the homeserver URL above is reachable from both "
             "servers and browsers. Set this for deployments where the two "
             "differ (e.g. Docker-internal vs. Caddy-proxied). Only persisted "
-            "if MATRIX_HOMESERVER_PUBLIC_URL is not already configured."
+            "if MATRIX_HOMESERVER_PUBLIC_URL is not already configured; a "
+            "different value is refused."
         ),
     )
     homeserver_domain = serializers.CharField(
@@ -305,7 +391,8 @@ class MatrixAppserviceSetupSerializer(serializers.Serializer):
         allow_blank=True,
         help_text=(
             "Matrix homeserver server_name domain. Only persisted if "
-            "MATRIX_HOMESERVER_DOMAIN is not already configured."
+            "MATRIX_HOMESERVER_DOMAIN is not already configured; a different "
+            "value is refused."
         ),
     )
     user_registration_secret = serializers.CharField(
@@ -313,9 +400,10 @@ class MatrixAppserviceSetupSerializer(serializers.Serializer):
         allow_blank=True,
         write_only=True,
         help_text=(
-            "Shared secret configured in the homeserver for user registration. "
+            "Registration token the homeserver requires for sign-up (its "
+            "registration_token). "
             "Only persisted if MATRIX_USER_REGISTRATION_SECRET is not already "
-            "configured."
+            "configured; a different value is refused."
         ),
     )
 
@@ -344,6 +432,7 @@ class MatrixAppserviceStatusSerializer(serializers.Serializer):
     as_token_configured = serializers.BooleanField()
     hs_token_configured = serializers.BooleanField()
     sender_localpart = serializers.CharField()
+    tokens_managed_by = serializers.CharField(allow_blank=True)
     bot_user_id = serializers.CharField()
     webhook_path = serializers.CharField()
     homeserver_url = serializers.CharField()
@@ -356,6 +445,14 @@ class MatrixDiagnosticCheckSerializer(serializers.Serializer):
     label = serializers.CharField()
     ok = serializers.BooleanField()
     detail = serializers.CharField()
+    metrics = serializers.DictField(
+        child=serializers.IntegerField(),
+        required=False,
+        help_text="The check's numbers, for monitoring: "
+        '{"round_trip_ms": 12} for appservice_ping, {"failed": 2} for '
+        'history_exports and {"4xx": 3, "5xx": 0} for webhook_errors. '
+        "Absent on other checks, and on appservice_ping when the ping failed.",
+    )
 
 
 class MatrixDiagnosticsResponseSerializer(serializers.Serializer):
@@ -375,6 +472,16 @@ class LiveKitTrackSerializer(serializers.Serializer):
     muted = serializers.BooleanField()
     width = serializers.IntegerField()
     height = serializers.IntegerField()
+    source = serializers.CharField(
+        help_text="What the track carries, as LiveKit names it: CAMERA, "
+        "MICROPHONE, SCREEN_SHARE, SCREEN_SHARE_AUDIO or UNKNOWN."
+    )
+    encryption = serializers.CharField(
+        help_text="How the publisher encrypts the track's media end to end, "
+        "as LiveKit names it: GCM (LiveKit's end-to-end encryption, which "
+        "Matrix calls in encrypted rooms use), CUSTOM (another scheme) or "
+        "NONE (only encrypted between the browser and LiveKit)."
+    )
 
 
 class LiveKitParticipantSerializer(serializers.Serializer):

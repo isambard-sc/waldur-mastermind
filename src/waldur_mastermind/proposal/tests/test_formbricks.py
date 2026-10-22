@@ -262,7 +262,9 @@ class WebhookMappingTest(FormbricksTestCase):
         # "False" as their choice labels rather than "Yes"/"No" - this once
         # broke project_details end-to-end in production before _YES_NO was
         # extended to accept both spellings.
-        self.assertTrue(formbricks_mapper._coerce_bool("True", "q_x", "project_details"))
+        self.assertTrue(
+            formbricks_mapper._coerce_bool("True", "q_x", "project_details")
+        )
         self.assertFalse(
             formbricks_mapper._coerce_bool("False", "q_x", "project_details")
         )
@@ -576,9 +578,7 @@ class FormbricksRedirectTokenAuthTest(FormbricksTestCase):
         other_proposal = factories.ProposalFactory(
             round=self.fixture.round, state=ProposalStates.DRAFT
         )
-        other_proposal.add_user(
-            self.lead, ProposalRole.MANAGER, created_by=self.lead
-        )
+        other_proposal.add_user(self.lead, ProposalRole.MANAGER, created_by=self.lead)
         token = formbricks_client.build_redirect_token(self.lead, other_proposal)
         response = self.client.get(
             self.url, {"current_step": "project_details", "redirect_token": token}
@@ -708,7 +708,8 @@ class FormbricksProgressTest(FormbricksTestCase):
         self.assertEqual(response.data["completed_steps"], [])
         self.assertEqual(response.data["next_step"]["key"], "project_details")
         self.assertIn(
-            PROJECT_DETAILS_STEP["survey_id"], response.data["next_step"]["redirect_url"]
+            PROJECT_DETAILS_STEP["survey_id"],
+            response.data["next_step"]["redirect_url"],
         )
         params = query_params(response.data["next_step"]["redirect_url"])
         self.assertEqual(params["lead_name"], self.lead.full_name)

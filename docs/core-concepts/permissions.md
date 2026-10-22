@@ -100,8 +100,37 @@ The platform includes several predefined system roles:
 
 - `CALL.REVIEWER` - Review proposals in calls
 - `CALL.MANAGER` - Manage calls for proposals
-- `PROPOSAL.MEMBER` - Proposal team member
-- `PROPOSAL.MANAGER` - Proposal management
+- `PROPOSAL.MANAGER` - Proposal manager: the principal investigator. Edits,
+  submits and deletes the proposal and adds, re-roles and removes its team
+  members (`PROPOSAL.MANAGE`, `PROPOSAL.UPDATE`, `PROPOSAL.UPDATE_PERMISSION`,
+  `PROPOSAL.DELETE_PERMISSION`)
+- `PROPOSAL.ADMIN` - Proposal administrator: a co-investigator who edits the
+  proposal (details, requested resources, documents, checklist answers) but
+  neither submits it nor changes its team (`PROPOSAL.UPDATE`)
+- `PROPOSAL.MEMBER` - Proposal team member, read-only
+
+The proposal team follows a few rules:
+
+- A proposal needs at least one active `PROPOSAL.MANAGER` to be submitted, and
+  the last one cannot be revoked. Nor does it expire: the expiry sweep keeps
+  the grant and logs a warning.
+- Those who may update the proposal's call (`CALL.MANAGER` on the call,
+  `CUSTOMER.CALL_ORGANIZER` on its managing organisation) manage the proposal
+  team without a role on it, as an organisation owner manages a project team.
+  This includes inviting people to the proposal by email.
+- `PROPOSAL.MANAGER` and `PROPOSAL.ADMIN` are granted and revoked (directly,
+  by invitation or through a permission request) only by the proposal's
+  managers, by call managers and organisers, and by staff. A custom role
+  carrying the team permissions may manage the other roles only.
+- Nobody changes their own proposal role, staff included (on other scopes staff
+  and organisation owners may). Creating a proposal still makes its author a
+  `PROPOSAL.MANAGER`.
+- Once the proposal leaves draft, its team is frozen: the applicant can no
+  longer change it. Staff, call managers and call organisers may still change
+  any role. Every team change is recorded once, as the generic `role_granted`,
+  `role_updated` or `role_revoked` event, whose context on a proposal also
+  carries `proposal_state` and `after_submission`; a change made after
+  submission says so in the message.
 
 ### Role Features
 
@@ -176,22 +205,18 @@ class PaymentProfileViewSet(core_views.ActionsViewSet):
 Although this approach works fine for trivial use cases, often enough permission filtering logic is more involved and we implement `get_queryset` method instead.
 
 ```python
-class OfferingUserGroupViewSet(core_views.ActionsViewSet):
+class PosixIdentityViewSet(core_views.ReadOnlyActionsViewSet):
   def get_queryset(self):
       queryset = super().get_queryset()
       current_user = self.request.user
       if current_user.is_staff or current_user.is_support:
         return queryset
 
-      projects = get_connected_projects(current_user)
       customers = get_connected_customers(current_user)
-
-      subquery = (
-        Q(projects__customer__in=customers)
-        | Q(offering__customer__in=customers)
-        | Q(projects__in=projects)
+      return queryset.filter(
+        Q(pool__service_provider__customer__in=customers)
+        | Q(pool__offering__customer__in=customers)
       )
-      return queryset.filter(subquery)
 ```
 
 ## Permissions for object creation and update

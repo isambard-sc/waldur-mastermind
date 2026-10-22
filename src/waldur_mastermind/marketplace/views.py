@@ -4,6 +4,7 @@ import datetime
 import logging
 import textwrap
 import traceback
+from collections.abc import Mapping
 from typing import cast
 from urllib.parse import urlparse
 
@@ -72,6 +73,7 @@ from rest_framework import (
 from rest_framework import viewsets as rf_viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.fields import empty
 from rest_framework.filters import OrderingFilter
 from rest_framework.generics import ListAPIView
 from rest_framework.permissions import SAFE_METHODS
@@ -195,6 +197,7 @@ from waldur_mastermind.marketplace.managers import (
     filter_offering_permissions,
     filter_orders_for_user,
     get_connected_offerings,
+    get_connected_serviceproviders,
     get_user_resource_project_ids,
 )
 from waldur_mastermind.marketplace.utils import (
@@ -202,6 +205,7 @@ from waldur_mastermind.marketplace.utils import (
     get_model_serializer,
     get_offering_usage_by_project,
     get_offering_usage_timeseries,
+    narrow_terminated_to_usage_window,
     validate_attributes,
 )
 from waldur_mastermind.policy.models import SlurmPeriodicUsagePolicy
@@ -224,6 +228,7 @@ from . import (
     posix_ids,
     posix_maintenance,
     project_groups,
+    resource_api_keys,
     serializers,
     tasks,
     utils,
@@ -249,6 +254,26 @@ SERVICE_PROVIDER_SOURCES = ["*", "customer"]
 # and the ServiceProvider record behind it.
 OFFERING_PROVIDER_SOURCES = ["customer", "customer.serviceprovider"]
 
+# Who may report usage for an offering's resources: an offering manager on the
+# offering, an owner on its organization, a service provider manager on the
+# ServiceProvider record.
+USAGE_REPORTER_SOURCES = ["*", *OFFERING_PROVIDER_SOURCES]
+# The same, reached from a component usage.
+USER_USAGE_REPORTER_SOURCES = [
+    "resource.offering",
+    *(f"resource.offering.{source}" for source in OFFERING_PROVIDER_SOURCES),
+]
+
+# Provider side of an order: a role on the offering, on the provider
+# organization, or on its ServiceProvider (a service provider manager). The
+# consumer side (project, project.customer) is deliberately absent, so a
+# provider-scoped grant never reaches orders the organization places itself.
+ORDER_PROVIDER_SOURCES = [
+    "offering",
+    "offering.customer",
+    "offering.customer.serviceprovider",
+]
+
 
 def readable_by_support(permission_function):
     """Let global support through a read gate otherwise held by scoped roles.
@@ -268,6 +293,32 @@ def readable_by_support(permission_function):
         if hasattr(permission_function, attribute):
             setattr(check, attribute, getattr(permission_function, attribute))
 
+    return check
+
+
+def any_permission(*permission_functions):
+    """Pass if any of the given object-scoped permission checks passes.
+
+    `sources` must stay set: ActionsPermission hands the object only to checks
+    that carry it, and a permission_factory check called without one lets
+    everybody through. `permission` is left unset, because x-permissions lists
+    checks that must all pass and has no way to say "either".
+    """
+
+    def check(request, view, scope=None):
+        for permission_function in permission_functions[:-1]:
+            try:
+                permission_function(request, view, scope)
+                return
+            except PermissionDenied:
+                pass
+        permission_functions[-1](request, view, scope)
+
+    check.sources = [
+        source
+        for permission_function in permission_functions
+        for source in permission_function.sources
+    ]
     return check
 
 
@@ -310,6 +361,12 @@ def get_allowed_offering_users_for_user(
 
     # Build base visibility conditions
     managed_offerings = get_connected_offerings(request_user)
+    # A service provider manager holds their role on the ServiceProvider, not
+    # on its customer, so managed_customers misses them. Resolved to customer
+    # ids so the outer query needs no join through the reverse one-to-one.
+    managed_provider_customers = models.ServiceProvider.objects.filter(
+        id__in=get_connected_serviceproviders(request_user)
+    ).values("customer_id")
 
     base_visibility_q = (
         Q(user=request_user)
@@ -329,6 +386,7 @@ def get_allowed_offering_users_for_user(
             # offering managers can see all offering users on offerings they manage
             Q(offering__id__in=managed_offerings)
         )
+        | Q(offering__customer_id__in=managed_provider_customers)
     )
 
     # Identity managers can see OfferingUsers whose linked user's active_isds
@@ -3894,7 +3952,12 @@ class ProviderOfferingViewSet(
         ],
         responses=serializers.OfferingComponentStatSerializer(many=True),
         summary="Get statistics for offering components",
-        description="Returns monthly usage statistics for the components of an offering within a specified date range.",
+        description=(
+            "Returns monthly usage statistics for the components of an offering "
+            "within a specified date range. Requires SERVICE_PROVIDER.GET_STATISTICS "
+            "on the offering's customer or its service provider, or ORDER.LIST on "
+            "the offering, its customer, or that customer's service provider."
+        ),
     )
     @action(detail=True)
     def component_stats(self, *args, **kwargs):
@@ -3929,15 +3992,6 @@ class ProviderOfferingViewSet(
             serializers.OfferingComponentStatSerializer,
             serializer_context,
         )
-
-    component_stats_permissions = [
-        readable_by_support(
-            permission_factory(
-                PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS,
-                OFFERING_PROVIDER_SOURCES,
-            )
-        )
-    ]
 
     @extend_schema(
         summary="Get offering statistics",
@@ -3986,7 +4040,12 @@ class ProviderOfferingViewSet(
 
     @extend_schema(
         summary="Get offering resource and user state counters",
-        description="Returns resource and offering-user counts grouped by state for the given offering.",
+        description=(
+            "Returns resource and offering-user counts grouped by state for the "
+            "given offering. Requires SERVICE_PROVIDER.GET_STATISTICS on the "
+            "offering's customer or its service provider, or ORDER.LIST on the "
+            "offering, its customer, or that customer's service provider."
+        ),
         responses=serializers.OfferingStateCountersSerializer,
     )
     @action(detail=True)
@@ -4029,11 +4088,23 @@ class ProviderOfferingViewSet(
         serializer = serializers.OfferingStateCountersSerializer(instance=data)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
-    state_counters_permissions = [
+    # Provider statistics, as for `stats`, or the right to list this
+    # offering's orders: held on the offering (OFFERING.MANAGER and custom
+    # offering roles), its customer, or that customer's service provider.
+    # Either one is enough, so offering managers get in and no role or token
+    # that could read these before loses them. Staff pass through the
+    # permission checks themselves.
+    component_stats_permissions = state_counters_permissions = [
         readable_by_support(
-            permission_factory(
-                PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS,
-                OFFERING_PROVIDER_SOURCES,
+            any_permission(
+                permission_factory(
+                    PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS,
+                    OFFERING_PROVIDER_SOURCES,
+                ),
+                permission_factory(
+                    PermissionEnum.LIST_ORDERS,
+                    marketplace_permissions.OFFERING_ADMIN_SOURCES,
+                ),
             )
         )
     ]
@@ -5268,11 +5339,11 @@ class ProviderOfferingViewSet(
         methods=["post"],
     )
     def remove_software_catalog(self, request, uuid=None):
-        self.get_object()
+        offering = self.get_object()
         offering_catalog_uuid = request.data.get("offering_catalog_uuid")
         try:
             offering_catalog = models.OfferingSoftwareCatalog.objects.get(
-                uuid=offering_catalog_uuid
+                uuid=offering_catalog_uuid, offering=offering
             )
         except models.OfferingSoftwareCatalog.DoesNotExist:
             return Response(
@@ -5374,10 +5445,12 @@ class ProviderOfferingViewSet(
         methods=["post"],
     )
     def remove_partition(self, request, uuid=None):
-        self.get_object()
+        offering = self.get_object()
         partition_uuid = request.data.get("partition_uuid")
         try:
-            partition = models.OfferingPartition.objects.get(uuid=partition_uuid)
+            partition = models.OfferingPartition.objects.get(
+                uuid=partition_uuid, offering=offering
+            )
         except models.OfferingPartition.DoesNotExist:
             return Response(
                 {"error": "Partition not found"},
@@ -6912,6 +6985,11 @@ class ConsumerResourceProjectViewSet(UserRoleMixin, core_views.ActionsViewSet):
     ]
 
 
+@extend_schema_view(
+    list_users=extend_schema(
+        responses=serializers.ProviderUserRoleDetailsSerializer(many=True)
+    )
+)
 class ProviderResourceProjectViewSet(UserRoleMixin, core_views.ActionsViewSet):
     """
     Manage sub-projects within a resource (provider perspective).
@@ -6951,6 +7029,13 @@ class ProviderResourceProjectViewSet(UserRoleMixin, core_views.ActionsViewSet):
         # including users who have not accepted the offering's terms.
         return utils.user_roles_for_provider_caller(
             self.request.user, scope, scope.resource.offering, user
+        )
+
+    def get_list_users_serializer(self, queryset, scope):
+        return serializers.ProviderUserRoleDetailsSerializer(
+            queryset,
+            many=True,
+            context={"request": self.request, "offering": scope.resource.offering},
         )
 
     @extend_schema(responses={status.HTTP_200_OK: StatusSerializer})
@@ -7743,26 +7828,7 @@ def _emit_resource_failure_event(order, resource):
 class OrderViewSet(
     ConnectedResourceDetailsMixin, ConnectedOfferingDetailsMixin, BaseMarketplaceView
 ):
-    queryset = models.Order.objects.select_related(
-        "resource",
-        "project",
-        "project__customer",
-        "offering",
-        "offering__customer",
-        "offering__category",
-        "plan",
-        "plan__offering",
-        "old_plan",
-        "old_plan__offering",
-        "created_by",
-        "consumer_reviewed_by",
-        "provider_reviewed_by",
-    ).prefetch_related(
-        # old_plan_billing_mode / new_plan_billing_mode resolve each plan
-        # against its offering's components.
-        "plan__offering__components",
-        "old_plan__offering__components",
-    )
+    queryset = serializers.OrderDetailsSerializer.eager_load(models.Order.objects.all())
     filter_backends = (DjangoFilterBackend,)
     serializer_class = serializers.OrderDetailsSerializer
     create_serializer_class = serializers.OrderCreateSerializer
@@ -7960,15 +8026,16 @@ class OrderViewSet(
 
     # A site agent runs as OFFERING.MANAGER (offering-scoped role), and every
     # order of a site-agent offering waits for provider approval, so accept the
-    # offering scope alongside the owning customer. This applies to every
-    # offering type: OFFERING.MANAGER already carried ORDER.APPROVE, so any
-    # offering manager may review provider orders through the API. Homeport
-    # does not surface this to people yet: filter_can_approve_as_provider and
-    # the provider action buttons still match customer-scoped roles only.
+    # offering scope alongside the owning customer and its ServiceProvider.
+    # This applies to every offering type: OFFERING.MANAGER already carried
+    # ORDER.APPROVE, so any offering manager may review provider orders through
+    # the API. Homeport does not surface this to offering managers yet:
+    # filter_can_approve_as_provider matches organization and ServiceProvider
+    # roles only.
     approve_by_provider_permissions = [
         permission_factory(
             PermissionEnum.APPROVE_ORDER,
-            OFFERING_SCOPED_SOURCES,
+            ORDER_PROVIDER_SOURCES,
         )
     ]
     approve_by_provider_serializer_class = serializers.OrderApproveByProviderSerializer
@@ -8109,7 +8176,7 @@ class OrderViewSet(
     set_provider_info_permissions = [
         permission_factory(
             PermissionEnum.APPROVE_ORDER,
-            OFFERING_SCOPED_SOURCES,
+            ORDER_PROVIDER_SOURCES,
         )
     ]
     set_provider_info_serializer_class = serializers.OrderProviderInfoSerializer
@@ -8254,7 +8321,7 @@ class OrderViewSet(
     reject_by_provider_permissions = [
         permission_factory(
             PermissionEnum.REJECT_ORDER,
-            OFFERING_SCOPED_SOURCES,
+            ORDER_PROVIDER_SOURCES,
         )
     ]
 
@@ -8329,7 +8396,7 @@ class OrderViewSet(
     set_state_executing_permissions = [
         permission_factory(
             PermissionEnum.APPROVE_ORDER,
-            ["offering.customer", "offering"],
+            ORDER_PROVIDER_SOURCES,
         )
     ]
 
@@ -8357,7 +8424,7 @@ class OrderViewSet(
     set_state_done_permissions = [
         permission_factory(
             PermissionEnum.APPROVE_ORDER,
-            ["offering.customer", "offering"],
+            ORDER_PROVIDER_SOURCES,
         )
     ]
 
@@ -8380,7 +8447,7 @@ class OrderViewSet(
     set_state_erred_permissions = [
         permission_factory(
             PermissionEnum.APPROVE_ORDER,
-            ["offering.customer", "offering.customer.serviceprovider", "offering"],
+            ORDER_PROVIDER_SOURCES,
         )
     ]
 
@@ -8448,7 +8515,7 @@ class OrderViewSet(
     retry_permissions = [
         permission_factory(
             PermissionEnum.APPROVE_ORDER,
-            ["offering.customer", "offering"],
+            ORDER_PROVIDER_SOURCES,
         )
     ]
 
@@ -8665,7 +8732,7 @@ class OrderViewSet(
     set_backend_id_permissions = [
         permission_factory(
             PermissionEnum.SET_RESOURCE_BACKEND_ID,
-            ["offering", "offering.customer"],
+            ORDER_PROVIDER_SOURCES,
         )
     ]
 
@@ -9036,7 +9103,11 @@ class BaseResourceViewSet(
 
     @extend_schema(
         summary="Set resource slug",
-        description="Updates the slug for a resource. Requires staff permissions.",
+        description="Updates the slug of a resource. Requires staff or the "
+        "RESOURCE.SET_SLUG permission, which no role holds unless the deployment "
+        "grants it. Other than staff, a holder cannot change the slug once the "
+        "resource's creation order is executing or the resource exists in the "
+        "backend.",
         request=serializers.ResourceSlugSerializer,
         responses={
             status.HTTP_200_OK: StatusSerializer,
@@ -9045,34 +9116,63 @@ class BaseResourceViewSet(
     @action(detail=True, methods=["post"])
     def set_slug(self, request, uuid=None):
         resource: models.Resource = self.get_object()
-        serializer = self.get_serializer(data=request.data)
+        serializer = self.get_serializer(resource, data=request.data)
         serializer.is_valid(raise_exception=True)
         new_slug = serializer.validated_data["slug"]
-        old_slug = resource.slug
-        if new_slug != old_slug:
-            resource.slug = serializer.validated_data["slug"]
+
+        with transaction.atomic():
+            # Lock the resource and its creation order, so an agent cannot set a
+            # backend_id or the order start executing before the save.
+            resource = models.Resource.objects.select_for_update().get(pk=resource.pk)
+            list(
+                models.Order.objects.select_for_update()
+                .filter(resource=resource, type=OrderTypes.CREATE)
+                .values_list("pk", flat=True)
+            )
+            old_slug = resource.slug
+            if new_slug == old_slug:
+                return Response(
+                    {"status": _("Resource slug is not changed.")},
+                    status=status.HTTP_200_OK,
+                )
+
+            if (
+                not request.user.is_staff
+                and models.Resource.objects.filter(pk=resource.pk)
+                .filter(models.slug_locked_q())
+                .exists()
+            ):
+                raise rf_exceptions.ValidationError(
+                    {
+                        "slug": _(
+                            "The slug cannot be changed: the resource is being or "
+                            "has been provisioned with a backend account named "
+                            "after it."
+                        )
+                    }
+                )
+            resource.slug = new_slug
             with reversion.create_revision():
                 resource.save()
                 reversion.set_user(request.user)
                 reversion.set_comment(f"Slug changed from '{old_slug}' to '{new_slug}'")
-            logger.info(
-                "%s has changed slug from %s to %s",
-                request.user.full_name,
-                old_slug,
-                new_slug,
-            )
+        logger.info(
+            "%s has changed slug from %s to %s",
+            request.user.full_name,
+            old_slug,
+            new_slug,
+        )
+        return Response(
+            {"status": _("Resource slug has been changed.")},
+            status=status.HTTP_200_OK,
+        )
 
-            return Response(
-                {"status": _("Resource slug has been changed.")},
-                status=status.HTTP_200_OK,
-            )
-        else:
-            return Response(
-                {"status": _("Resource slug is not changed.")},
-                status=status.HTTP_200_OK,
-            )
-
-    set_slug_permissions = [structure_permissions.is_staff]
+    set_slug_permissions = [
+        permission_factory(
+            PermissionEnum.SET_RESOURCE_SLUG,
+            marketplace_permissions.RESOURCE_SLUG_PERMISSION_SOURCES,
+        )
+    ]
 
     set_slug_serializer_class = serializers.ResourceSlugSerializer
 
@@ -9135,30 +9235,41 @@ class BaseResourceViewSet(
         serializer.is_valid(raise_exception=True)
         new_paused = serializer.validated_data["paused"]
         old_paused = resource.paused
-        if new_paused != old_paused:
-            resource.paused = new_paused
-            with reversion.create_revision():
-                resource.save()
-                reversion.set_user(request.user)
-                reversion.set_comment(
-                    f"Paused changed from {old_paused} to {new_paused}"
-                )
-            logger.info(
-                "%s has changed paused from %s to %s for resource %s",
-                request.user.full_name,
-                old_paused,
-                new_paused,
-                resource.uuid,
-            )
-            return Response(
-                {"status": _("Resource paused flag has been changed.")},
-                status=status.HTTP_200_OK,
-            )
-        else:
+        # Staff take the pause over from the project grace period either way: a
+        # staff pause is not lifted when the end date is extended, and unpausing
+        # during the grace period lasts until the next grace-period run.
+        took_over = resource.paused_by_grace_period
+        if new_paused == old_paused and not took_over:
             return Response(
                 {"status": _("Resource paused flag is not changed.")},
                 status=status.HTTP_200_OK,
             )
+        resource.paused = new_paused
+        resource.paused_by_grace_period = False
+        with reversion.create_revision():
+            resource.save()
+            reversion.set_user(request.user)
+            reversion.set_comment(
+                f"Paused changed from {old_paused} to {new_paused}"
+                if new_paused != old_paused
+                else "Pause taken over from the project grace period"
+            )
+        logger.info(
+            "%s has set paused from %s to %s for resource %s",
+            request.user.full_name,
+            old_paused,
+            new_paused,
+            resource.uuid,
+        )
+        if new_paused == old_paused:
+            return Response(
+                {"status": _("Resource paused flag is not changed.")},
+                status=status.HTTP_200_OK,
+            )
+        return Response(
+            {"status": _("Resource paused flag has been changed.")},
+            status=status.HTTP_200_OK,
+        )
 
     set_paused_permissions = [structure_permissions.is_staff]
 
@@ -9639,24 +9750,7 @@ class ConsumerResourceViewSet(UserRoleMixin, BaseResourceViewSet):
     def get_queryset(self):
         queryset = self.queryset.filter_for_service_consumer(self.request.user)
         queryset = filter_queryset_by_user_ip(queryset, self.request)
-        # Avoid N+1 queries when serializing offering fields (image, thumbnail, etc.)
-        queryset = queryset.select_related(
-            "offering",
-            "offering__category",
-            "offering__customer__serviceprovider",
-            "offering__parent",
-            "project",
-            "project__customer",
-            "plan",
-        )
-        # Lets the portal offer key management without knowing the backend, at the
-        # cost of one subquery rather than a query per row.
-        queryset = queryset.annotate(
-            has_api_keys_annotation=Exists(
-                models.ResourceApiKey.objects.filter(resource=OuterRef("pk"))
-            )
-        )
-        return queryset
+        return serializers.ResourceSerializer.eager_load(queryset)
 
     @extend_schema(
         summary="Get resource team",
@@ -10250,32 +10344,27 @@ class ConsumerResourceViewSet(UserRoleMixin, BaseResourceViewSet):
         description="Partially updates the name or description of a resource. Requires provider permissions.",
     ),
 )
+@extend_schema_view(
+    list_users=extend_schema(
+        responses=serializers.ProviderUserRoleDetailsSerializer(many=True)
+    )
+)
 class ProviderResourceViewSet(UserRoleMixin, BaseResourceViewSet):
     def get_queryset(self):
         # Avoid N+1 queries when serializing offering fields (image, thumbnail, etc.)
-        queryset = self.queryset.filter_for_service_provider(
-            self.request.user
-        ).select_related(
-            "offering",
-            "offering__category",
-            "offering__customer__serviceprovider",
-            "offering__parent",
-            "project",
-            "project__customer",
-            "plan",
-        )
-        # Same annotation as the consumer viewset: this list shares
-        # ResourceSerializer, so without it every row falls back to a per-instance
-        # api_keys.exists() query.
-        return queryset.annotate(
-            has_api_keys_annotation=Exists(
-                models.ResourceApiKey.objects.filter(resource=OuterRef("pk"))
-            )
-        )
+        queryset = self.queryset.filter_for_service_provider(self.request.user)
+        return serializers.ResourceSerializer.eager_load(queryset)
 
     def get_user_roles_queryset(self, scope, user=None):
         return utils.user_roles_for_provider_caller(
             self.request.user, scope, scope.offering, user
+        )
+
+    def get_list_users_serializer(self, queryset, scope):
+        return serializers.ProviderUserRoleDetailsSerializer(
+            queryset,
+            many=True,
+            context={"request": self.request, "offering": scope.offering},
         )
 
     @extend_schema(
@@ -11497,10 +11586,11 @@ class ComponentUsageViewSet(core_views.ReadOnlyActionsViewSet):
             and serializer.validated_data["plan_period"].resource
             or serializer.validated_data["resource"]
         )
-        if not has_permission(
-            request, PermissionEnum.SET_RESOURCE_USAGE, resource.offering.customer
-        ) and not has_permission(
-            request, PermissionEnum.SET_RESOURCE_USAGE, resource.offering
+        if not has_permission_on_any_source(
+            request,
+            PermissionEnum.SET_RESOURCE_USAGE,
+            resource.offering,
+            USAGE_REPORTER_SOURCES,
         ):
             raise PermissionDenied()
         serializer.save()
@@ -11591,7 +11681,7 @@ class ComponentUsageViewSet(core_views.ReadOnlyActionsViewSet):
     set_user_usage_permissions = [
         permission_factory(
             PermissionEnum.SET_RESOURCE_USAGE,
-            ["resource.offering", "resource.offering.customer"],
+            USER_USAGE_REPORTER_SOURCES,
         )
     ]
 
@@ -11689,7 +11779,7 @@ class ComponentUsageViewSet(core_views.ReadOnlyActionsViewSet):
     set_user_usages_permissions = [
         permission_factory(
             PermissionEnum.SET_RESOURCE_USAGE,
-            ["resource.offering", "resource.offering.customer"],
+            USER_USAGE_REPORTER_SOURCES,
         )
     ]
 
@@ -12244,6 +12334,7 @@ class OfferingUsersViewSet(
                 "offering__user_attribute_config",
                 "user",
                 "offering__customer",
+                "service_provider_account",
             )
             .prefetch_related(
                 "offering__user_consents", "offering__terms_of_service_configs"
@@ -12280,7 +12371,9 @@ class OfferingUsersViewSet(
 
     set_pending_additional_validation_permissions = (
         set_validation_complete_permissions
-    ) = set_pending_account_linking_permissions = begin_creating_permissions = [
+    ) = set_pending_account_linking_permissions = begin_creating_permissions = (
+        set_ok_permissions
+    ) = set_error_creating_permissions = set_error_deleting_permissions = [
         permission_factory(
             PermissionEnum.UPDATE_OFFERING_USER,
             ["offering.customer", "offering"],
@@ -13358,51 +13451,6 @@ class ServiceProviderProjectGroupViewSet(core_views.ActionsViewSet):
         return self.get_paginated_response(
             serializers.AdoptableProjectSerializer(page, many=True).data
         )
-
-
-class OfferingUserGroupViewSet(core_views.ActionsViewSet):
-    queryset = models.OfferingUserGroup.objects.all()
-    serializer_class = serializers.OfferingUserGroupDetailsSerializer
-    lookup_field = "uuid"
-    filter_backends = (DjangoFilterBackend,)
-    filterset_class = filters.OfferingUserGroupFilter
-    create_serializer_class = update_serializer_class = (
-        partial_update_serializer_class
-    ) = serializers.OfferingUserGroupSerializer
-
-    unsafe_methods_permissions = [permissions.user_can_manage_offering_user_group]
-
-    def get_queryset(self):
-        queryset = super().get_queryset()
-        current_user = self.request.user
-        if current_user.is_staff or current_user.is_support:
-            return queryset
-
-        projects = get_connected_projects(current_user)
-        customers = get_connected_customers(current_user)
-
-        subquery = (
-            Q(projects__customer__in=customers)
-            | Q(offering__customer__in=customers)
-            | Q(projects__in=projects)
-        )
-        return queryset.filter(subquery)
-
-    def perform_create(self, serializer):
-        offering_group: models.OfferingUserGroup = serializer.save()
-        offering = offering_group.offering
-
-        gid = posix_ids.allocate(offering, posix_ids.GID, offering_group)
-        if gid is not None:
-            offering_group.backend_metadata["gid"] = gid
-            offering_group.save(update_fields=["backend_metadata"])
-        else:
-            logger.warning(
-                "No POSIX ID pool configured for offering %s; offering user "
-                "group %s created without a gid.",
-                offering,
-                offering_group.pk,
-            )
 
 
 class ProjectPosixGroupsViewSet(rf_viewsets.ViewSet):
@@ -16431,6 +16479,10 @@ PROVIDER_API_KEY_SOURCES = [
     "offering.customer.serviceprovider",
 ]
 
+# Scopes, relative to the resource, at which RESOURCE.MANAGE_USERS lets a
+# consumer request and govern the resource's API keys.
+CONSUMER_API_KEY_SOURCES = ["project", "project.customer"]
+
 
 def check_provider_api_key_permissions(request, view, obj=None):
     serializer = view.get_serializer(data=request.data)
@@ -16452,25 +16504,31 @@ class ResourceApiKeyViewSet(core_views.ActionsViewSet):
 
     A resource owns many keys. The site agent generates each key, applies it to
     the backend, then reports it here (encrypted). Members reveal keys; managers
-    rotate them. Portal actions are commands — the agent does the backend change
-    and reports back through the provider actions.
+    rotate them and, where the offering supports it, request, edit, pause,
+    resume and delete them. Portal actions are commands — the agent does the
+    backend change and reports back through the provider actions.
     """
 
     queryset = models.ResourceApiKey.objects.select_related(
         "resource__project__customer",
         "resource__offering__customer",
+        "user",
     ).order_by("created")
     lookup_field = "uuid"
     serializer_class = serializers.ResourceApiKeyStatusSerializer
     filter_backends = (DjangoFilterBackend,)
     filterset_class = filters.ResourceApiKeyFilter
-    # No destroy: the key count is fixed at provisioning, so nothing needs one, and
-    # an ungated delete could drop a row whose key still serves at the backend.
-    # Termination cleanup deletes the rows directly (callbacks.py).
-    disabled_actions = ["create", "update", "partial_update", "destroy"]
+    # PUT is not offered: every setting is optional, so an edit is a PATCH.
+    disabled_actions = ["update"]
 
     def get_queryset(self):
         qs = super().get_queryset()
+        # A deleted key is kept for the usage it reported, but a listing shows
+        # it only when asked for by state.
+        if self.action == "list" and models.ResourceApiKey.States.DELETED not in (
+            self.request.query_params.getlist("state")
+        ):
+            qs = qs.exclude(state=models.ResourceApiKey.States.DELETED)
         user = self.request.user
         if user.is_staff or user.is_support:
             return qs
@@ -16492,9 +16550,78 @@ class ResourceApiKeyViewSet(core_views.ActionsViewSet):
     # --- consumer actions ------------------------------------------------------
 
     @extend_schema(
+        summary="Request an API key",
+        description="Asks the site agent to create a key for the resource. Waldur "
+        "generates nothing: the key appears as Creating and turns OK once the "
+        "agent reports it. Only on offerings with enable_api_key_provisioning.",
+        request=serializers.ResourceApiKeyCreateSerializer,
+        responses={status.HTTP_201_CREATED: serializers.ResourceApiKeyStatusSerializer},
+    )
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        # The permission is checked on the resource alone before the rest is
+        # validated: those errors would otherwise tell anyone whether a user
+        # belongs to a resource's project, or which components it has.
+        if not isinstance(request.data, Mapping):
+            raise ValidationError(_("Expected an object."))
+        try:
+            resource = serializer.fields["resource"].run_validation(
+                request.data.get("resource", empty)
+            )
+        except ValidationError as error:
+            raise ValidationError({"resource": error.detail})
+        if not has_permission_on_any_source(
+            request,
+            PermissionEnum.MANAGE_RESOURCE_USERS,
+            resource,
+            CONSUMER_API_KEY_SOURCES,
+        ):
+            raise PermissionDenied()
+        resource_api_keys.require_managed(resource)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        data.pop("resource")
+        api_key = resource_api_keys.request_key(resource, request.user, **data)
+        return Response(
+            serializers.ResourceApiKeyStatusSerializer(api_key).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    create_serializer_class = serializers.ResourceApiKeyCreateSerializer
+
+    @extend_schema(
+        summary="Edit an API key",
+        description="Changes the key's assignee, limits or model allowlist. A change "
+        "to limits or models is sent to the site agent as an update command, "
+        "unless the key is paused: resuming it applies them. Only on offerings "
+        "with enable_api_key_provisioning, except for unassigning the key "
+        '({"user": null}).',
+        request=serializers.ResourceApiKeyUpdateSerializer,
+        responses={status.HTTP_200_OK: serializers.ResourceApiKeyStatusSerializer},
+    )
+    def partial_update(self, request, *args, **kwargs):
+        obj = self.get_object()
+        # Unassigning needs no governance: reveal still honours an assignee set
+        # while it was on, and only this lets anyone but staff lift it.
+        unassign = isinstance(request.data, Mapping) and dict(request.data) == {
+            "user": None
+        }
+        if not unassign:
+            resource_api_keys.require_managed(obj.resource)
+        serializer = self.get_serializer(obj, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        api_key = resource_api_keys.update_settings(
+            obj, request.user, serializer.validated_data
+        )
+        return Response(serializers.ResourceApiKeyStatusSerializer(api_key).data)
+
+    partial_update_serializer_class = serializers.ResourceApiKeyUpdateSerializer
+
+    @extend_schema(
         summary="Reveal an API key",
         description="Returns the decrypted key value. Available to users with "
-        "resource access (except minimal-visibility viewers). Audit-logged.",
+        "resource access (except minimal-visibility viewers); a key with an "
+        "assignee only to the assignee. Staff and support always. Audit-logged.",
         responses={status.HTTP_200_OK: serializers.ResourceApiKeySerializer},
     )
     @action(detail=True, methods=["get"])
@@ -16520,6 +16647,13 @@ class ResourceApiKeyViewSet(core_views.ActionsViewSet):
             raise PermissionDenied(
                 "Minimal-visibility viewers cannot reveal the resource API key."
             )
+        # An assigned key is personal: its usage is attributed to the assignee.
+        if (
+            api_key.user_id
+            and api_key.user_id != user.id
+            and not (user.is_staff or user.is_support)
+        ):
+            raise PermissionDenied("Only the assignee can reveal this API key.")
         # Only an OK key is guaranteed live at the backend; a transitional key's
         # stored value may not match the gateway.
         if api_key.state != models.ResourceApiKey.States.OK:
@@ -16540,36 +16674,12 @@ class ResourceApiKeyViewSet(core_views.ActionsViewSet):
         response["Cache-Control"] = "no-store"
         return response
 
-    @staticmethod
-    def _require_resource_live(resource):
-        """Reject key commands on a resource that is not live.
-
-        Rotating a key makes no sense once the resource is on its way out; a
-        command emitted for a terminating resource races the termination cleanup
-        (which deletes the key rows) at the agent.
-        """
-        dead = (
-            models.Resource.States.TERMINATING,
-            models.Resource.States.TERMINATED,
-        )
-        if resource.state in dead:
-            raise IncorrectStateException(
-                f"The resource is {resource.get_state_display()}; its API keys "
-                f"can no longer be managed."
-            )
-
-    @staticmethod
-    def _locked_transition(obj, transition: str, **updates):
-        """Lock the row, apply an FSM transition plus field updates, save —
-        atomic against a concurrent duplicate command that would otherwise both
-        read the same source state."""
-        with transaction.atomic():
-            api_key = models.ResourceApiKey.objects.select_for_update().get(pk=obj.pk)
-            getattr(api_key, transition)()
-            for field, value in updates.items():
-                setattr(api_key, field, value)
-            api_key.save()
-        return api_key
+    def _command(self, request, action_name, message):
+        # Whether the command needs governance is decided with the key locked:
+        # a retry only knows its command then.
+        obj = self.get_object()
+        resource_api_keys.issue_command(obj, action_name, request.user)
+        return Response({"status": message}, status=status.HTTP_202_ACCEPTED)
 
     @extend_schema(
         summary="Rotate an API key",
@@ -16580,38 +16690,121 @@ class ResourceApiKeyViewSet(core_views.ActionsViewSet):
     )
     @action(detail=True, methods=["post"])
     def rotate(self, request, uuid=None):
-        obj = self.get_object()
-        self._require_resource_live(obj.resource)
-        try:
-            api_key = self._locked_transition(obj, "set_updating")
-        except TransitionNotAllowed:
-            raise IncorrectStateException(
-                "An API key can only be rotated from the OK state."
-            )
-        utils.publish_api_key_event(api_key)
-        log.log_resource_api_key_rotated(api_key, request.user)
-        return Response(
-            {"status": _("API key rotation has been requested.")},
-            status=status.HTTP_202_ACCEPTED,
+        # Rotation predates per-key governance; every key-carrying backend has it.
+        return self._command(
+            request,
+            models.ResourceApiKey.Actions.ROTATE,
+            _("API key rotation has been requested."),
         )
 
-    rotate_permissions = [
+    @extend_schema(
+        summary="Pause an API key",
+        description="Asks the site agent to stop the backend accepting this key. "
+        "The key keeps its value; the resource and its other keys keep serving.",
+        request=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
+    )
+    @action(detail=True, methods=["post"])
+    def pause(self, request, uuid=None):
+        return self._command(
+            request,
+            models.ResourceApiKey.Actions.PAUSE,
+            _("API key pause has been requested."),
+        )
+
+    @extend_schema(
+        summary="Resume an API key",
+        description="Asks the site agent to accept a paused key again, with the "
+        "limits and models it has now. Available without governance too, so a key "
+        "paused before the provider switched it off can come back.",
+        request=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
+    )
+    @action(detail=True, methods=["post"])
+    def resume(self, request, uuid=None):
+        return self._command(
+            request,
+            models.ResourceApiKey.Actions.RESUME,
+            _("API key resume has been requested."),
+        )
+
+    @extend_schema(
+        summary="Delete an API key",
+        description="Asks the site agent to revoke the key at the backend. Once "
+        "it has, the key is Deleted: it no longer lists by default, but its row "
+        "and reported usage are kept. A requested key the agent has not created "
+        "yet, or failed to create, is Deleted at once.",
+        request=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
+    )
+    def destroy(self, request, *args, **kwargs):
+        return self._command(
+            request,
+            models.ResourceApiKey.Actions.DELETE,
+            _("API key deletion has been requested."),
+        )
+
+    @extend_schema(
+        summary="Retry a failed API key command",
+        description="Sends the command that left the key Erred to the site agent "
+        "again, with the key's current limits and models. An Erred key accepts only "
+        "this, the same command, or a delete.",
+        request=None,
+        responses={status.HTTP_202_ACCEPTED: StatusSerializer},
+    )
+    @action(detail=True, methods=["post"])
+    def retry(self, request, uuid=None):
+        return self._command(request, None, _("API key retry has been requested."))
+
+    consumer_command_permissions = [
         permission_factory(
             PermissionEnum.MANAGE_RESOURCE_USERS,
-            ["resource.project", "resource.project.customer"],
+            [f"resource.{source}" for source in CONSUMER_API_KEY_SOURCES],
         )
     ]
+    rotate_permissions = consumer_command_permissions
+    retry_permissions = consumer_command_permissions
+    pause_permissions = consumer_command_permissions
+    resume_permissions = consumer_command_permissions
+    destroy_permissions = consumer_command_permissions
+    partial_update_permissions = consumer_command_permissions
 
-    # There is deliberately no revoke: the key count is fixed at provisioning and
-    # rotation replaces a value in place, so a resource can never be left without
-    # a way to authenticate. See docs/resource-api-keys.md.
+    @extend_schema(
+        summary="Total API key usage of a resource",
+        description="Sums the usage the site agent reported for the resource's "
+        "keys in the current month, per component type. Deleted keys are "
+        "included, so deleting a key leaves the total unchanged.",
+        parameters=[
+            OpenApiParameter(
+                "resource_uuid",
+                OpenApiTypes.UUID,
+                OpenApiParameter.QUERY,
+                required=True,
+            )
+        ],
+        responses={status.HTTP_200_OK: serializers.ResourceApiKeyUsageTotalsSerializer},
+        filters=False,
+    )
+    @action(detail=False, methods=["get"])
+    def usage_totals(self, request):
+        if not request.query_params.get("resource_uuid"):
+            raise ValidationError({"resource_uuid": _("This parameter is required.")})
+        queryset = self.filter_queryset(self.get_queryset()).filter(
+            usage_period=models.ResourceApiKey.current_period()
+        )
+        return Response(
+            serializers.ResourceApiKeyUsageTotalsSerializer(
+                {"usages": queryset.usage_totals()}
+            ).data
+        )
 
     # --- provider (site-agent) actions -----------------------------------------
 
     @extend_schema(
         summary="Report a freshly-applied API key",
         description="Used by the site agent after it generated and applied a key "
-        "to the backend. Stores the value encrypted and marks the key OK.",
+        "to the backend at provisioning. Stores the value encrypted and marks the "
+        "key OK. A requested key is reported through set_key instead.",
         request=serializers.ResourceApiKeyReportCreatedSerializer,
         responses={status.HTTP_201_CREATED: serializers.ResourceApiKeyStatusSerializer},
     )
@@ -16620,28 +16813,11 @@ class ResourceApiKeyViewSet(core_views.ActionsViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        resource = data["resource"]
-        # A late report against a terminating/terminated resource must not
-        # recreate rows the termination cleanup deletes.
-        self._require_resource_live(resource)
-        plaintext = data["api_key"]
-        # Idempotent upsert on (resource, client_id): a retried or duplicated
-        # report must not 500 on the unique constraint, and a re-applied key just
-        # overwrites the stored value. New rows land OK (the agent already applied
-        # the key to the backend before reporting). No row lock is needed: there is
-        # no transitional state a stale duplicate could resurrect, and
-        # update_or_create already handles a concurrent insert through the unique
-        # constraint.
-        with transaction.atomic():
-            api_key, _ = models.ResourceApiKey.objects.update_or_create(
-                resource=resource,
-                client_id=data["client_id"],
-                defaults={
-                    "key_ciphertext": encryption.encrypt_value(plaintext),
-                    "state": models.ResourceApiKey.States.OK,
-                    "error_message": "",
-                },
-            )
+        api_key = resource_api_keys.record_created_key(
+            data["resource"],
+            data["client_id"],
+            encryption.encrypt_value(data["api_key"]),
+        )
         return Response(
             serializers.ResourceApiKeyStatusSerializer(api_key).data,
             status=status.HTTP_201_CREATED,
@@ -16651,9 +16827,10 @@ class ResourceApiKeyViewSet(core_views.ActionsViewSet):
     report_created_serializer_class = serializers.ResourceApiKeyReportCreatedSerializer
 
     @extend_schema(
-        summary="Report a rotated API key value",
-        description="Used by the site agent after it applied a rotated key. "
-        "Replaces the stored value and marks the key OK.",
+        summary="Report a created or rotated API key value",
+        description="Used by the site agent after it applied a requested or "
+        "rotated key. Replaces the stored value and marks the key OK. A requested "
+        "key carries the client_id the agent gave it.",
         request=serializers.ResourceApiKeySetKeySerializer,
         responses={status.HTTP_200_OK: serializers.ResourceApiKeyStatusSerializer},
     )
@@ -16665,12 +16842,14 @@ class ResourceApiKeyViewSet(core_views.ActionsViewSet):
         plaintext = serializer.validated_data["api_key"]
         updates = {
             "key_ciphertext": encryption.encrypt_value(plaintext),
+            "issued_at": timezone.now(),
             "error_message": "",
         }
         # A backend whose public identifier rotates together with the secret (an S3
-        # access key) reports the new one; one with a stable client_id omits it. The
-        # collision check runs before the transition so a rejected rename leaves the
-        # key exactly as it was.
+        # access key) reports the new one; one with a stable client_id omits it,
+        # except on a requested key, which gets its first one here. The collision
+        # check runs before the transition so a rejected rename leaves the key
+        # exactly as it was.
         client_id = serializer.validated_data.get("client_id")
         if client_id and client_id != obj.client_id:
             if (
@@ -16684,14 +16863,23 @@ class ResourceApiKeyViewSet(core_views.ActionsViewSet):
                     f"Another API key of this resource already uses client_id {client_id}."
                 )
             updates["client_id"] = client_id
+        elif not obj.client_id:
+            raise ValidationError(
+                {"client_id": _("A requested key must be reported with its client_id.")}
+            )
         # Transition under lock, persist only if it is legal: a late or duplicated
-        # report must never overwrite an already applied OK key.
+        # report must never overwrite an already applied OK key, nor settle a
+        # command other than the creation or rotation it answers.
         try:
-            api_key = self._locked_transition(obj, "set_ok", **updates)
-        except TransitionNotAllowed:
-            raise IncorrectStateException(
-                f"A key value can only be applied to a Creating or Updating key, "
-                f"not {obj.state}."
+            api_key = resource_api_keys.acknowledge(
+                obj,
+                "set_ok",
+                (
+                    "",
+                    models.ResourceApiKey.Actions.CREATE,
+                    models.ResourceApiKey.Actions.ROTATE,
+                ),
+                **updates,
             )
         except IntegrityError:
             # The collision check above runs outside the row lock, so a concurrent
@@ -16722,19 +16910,98 @@ class ResourceApiKeyViewSet(core_views.ActionsViewSet):
         obj = self.get_object()
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        try:
-            api_key = self._locked_transition(
-                obj,
-                "set_erred",
-                error_message=serializer.validated_data["error_message"],
-            )
-        except TransitionNotAllowed:
-            # A newer set_key already landed the key OK; ignore the stale erred.
-            raise IncorrectStateException(f"Cannot mark a {obj.state} key erred.")
+        # Any pending command may fail. A newer acknowledgement that already
+        # settled the key makes this report stale, and it is refused.
+        api_key = resource_api_keys.acknowledge(
+            obj,
+            "set_erred",
+            None,
+            error_message=serializer.validated_data["error_message"],
+        )
+        log.log_resource_api_key_command_failed(api_key)
         return Response(serializers.ResourceApiKeyStatusSerializer(api_key).data)
 
     set_erred_permissions = set_key_permissions
     set_erred_serializer_class = serializers.ResourceApiKeySetErredSerializer
+
+    def _acknowledge(self, transition, awaited):
+        # Not gated on the capability: a command already in flight must still be
+        # able to settle if the provider switches governance off meanwhile.
+        obj = self.get_object()
+        api_key = resource_api_keys.acknowledge(
+            obj, transition, awaited, error_message=""
+        )
+        return Response(serializers.ResourceApiKeyStatusSerializer(api_key).data)
+
+    @extend_schema(
+        summary="Report an API key paused",
+        description="Used by the site agent once the backend refuses the key.",
+        request=None,
+        responses={status.HTTP_200_OK: serializers.ResourceApiKeyStatusSerializer},
+    )
+    @action(detail=True, methods=["post"])
+    def set_paused(self, request, uuid=None):
+        return self._acknowledge("set_paused", (models.ResourceApiKey.Actions.PAUSE,))
+
+    @extend_schema(
+        summary="Report an API key resumed or updated",
+        description="Used by the site agent once the backend accepts a resumed "
+        "key again, or has applied a key's new limits and models.",
+        request=None,
+        responses={status.HTTP_200_OK: serializers.ResourceApiKeyStatusSerializer},
+    )
+    @action(detail=True, methods=["post"])
+    def set_ok(self, request, uuid=None):
+        return self._acknowledge(
+            "set_ok",
+            (
+                models.ResourceApiKey.Actions.RESUME,
+                models.ResourceApiKey.Actions.UPDATE,
+            ),
+        )
+
+    @extend_schema(
+        summary="Report an API key deleted",
+        description="Used by the site agent once the backend has revoked the key. "
+        "The stored value is dropped; the row and its usage are kept.",
+        request=None,
+        responses={status.HTTP_200_OK: serializers.ResourceApiKeyStatusSerializer},
+    )
+    @action(detail=True, methods=["post"])
+    def set_deleted(self, request, uuid=None):
+        return self._acknowledge("set_deleted", (models.ResourceApiKey.Actions.DELETE,))
+
+    @extend_schema(
+        summary="Report API key usage",
+        description="Used by the site agent to report a key's usage so far in a "
+        "month, per component type. Merged into the key's usage for that month; "
+        "a later month replaces it, and an earlier one is refused. A key whose "
+        "usage reaches its limit is paused, and a key paused for its limit is resumed "
+        "once under it again. Accepted for a deleted key too.",
+        request=serializers.ResourceApiKeyUsageSerializer,
+        responses={status.HTTP_200_OK: serializers.ResourceApiKeyStatusSerializer},
+    )
+    @action(detail=True, methods=["post"])
+    def report_usage(self, request, uuid=None):
+        obj = self.get_object()
+        resource_api_keys.require_managed(obj.resource)
+        serializer = self.get_serializer(
+            data=request.data, context={"api_key": obj, "request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        api_key = resource_api_keys.record_usage(
+            obj,
+            serializer.validated_data["usages"],
+            serializer.validated_data.get("billing_period")
+            or models.ResourceApiKey.current_period(),
+        )
+        return Response(serializers.ResourceApiKeyStatusSerializer(api_key).data)
+
+    set_paused_permissions = set_key_permissions
+    set_ok_permissions = set_key_permissions
+    set_deleted_permissions = set_key_permissions
+    report_usage_permissions = set_key_permissions
+    report_usage_serializer_class = serializers.ResourceApiKeyUsageSerializer
 
 
 @extend_schema_view(
@@ -18834,20 +19101,22 @@ class SoftwareCatalogViewSet(
                 logger.warning(f"Could not detect version for {source['name']}: {e}")
                 entry["latest_version"] = None
 
-            existing = (
+            existing_versions = list(
                 models.SoftwareCatalog.objects.filter(
                     name=source["name"],
                     catalog_type=source["catalog_type"],
                 )
                 .order_by("-modified")
-                .first()
+                .values_list("version", flat=True)
             )
-            if existing:
+            if existing_versions:
                 entry["existing"] = True
-                entry["existing_version"] = existing.version
+                # Newest-modified row for backward-compatible single field;
+                # update_available when upstream is not among any stored versions.
+                entry["existing_version"] = existing_versions[0]
                 entry["update_available"] = (
                     entry["latest_version"] is not None
-                    and entry["latest_version"] != existing.version
+                    and entry["latest_version"] not in existing_versions
                 )
 
             results.append(entry)
@@ -18899,16 +19168,29 @@ class SoftwareCatalogViewSet(
         name = serializer.validated_data["name"]
         catalog_type = tasks.NAME_TO_CATALOG_TYPE[name]
 
+        # Multiple versions of the same catalog name/type are allowed (e.g. EESSI
+        # 2023.06 and 2026.06). Only block when this exact version already exists.
+        try:
+            if name == "EESSI":
+                version = detect_eessi_version(config.SOFTWARE_CATALOG_EESSI_API_URL)
+            else:
+                version = detect_spack_version(config.SOFTWARE_CATALOG_SPACK_DATA_URL)
+        except Exception as e:
+            raise rf_exceptions.ValidationError(
+                f"Could not detect upstream version for {name}: {e}"
+            ) from e
+
         if models.SoftwareCatalog.objects.filter(
-            name=name, catalog_type=catalog_type
+            name=name, catalog_type=catalog_type, version=version
         ).exists():
             raise rf_exceptions.ValidationError(
-                f"A catalog with name={name} and type={catalog_type} already exists."
+                f"A catalog with name={name}, version={version}, "
+                f"and type={catalog_type} already exists."
             )
 
         tasks.import_software_catalog.delay(name, catalog_type)
         return Response(
-            {"status": "importing", "name": name},
+            {"status": "importing", "name": name, "version": version},
             status=status.HTTP_202_ACCEPTED,
         )
 
@@ -19305,6 +19587,18 @@ _PERIOD_OFFSET_PARAM = OpenApiParameter(
     location=OpenApiParameter.QUERY,
     required=False,
 )
+_INCLUDE_TERMINATED_PARAM = OpenApiParameter(
+    "include_terminated",
+    OpenApiTypes.BOOL,
+    location=OpenApiParameter.QUERY,
+    required=False,
+    description=(
+        "If true, also counts terminated resources. Their share of usage is "
+        "returned as usage_terminated (and limit_usage_terminated); limit "
+        "never includes them. Ignored unless the "
+        "dashboard.usage_include_terminated feature is enabled."
+    ),
+)
 
 
 def _resolve_offering(request):
@@ -19331,8 +19625,9 @@ class OfferingUsageMixin:
 
     Subclasses provide:
     - `queryset` — Customer or Project queryset (the route lookup target)
-    - `_scope_resources(scope, offering=None)` — returns the non-terminated
-      resources visible at this scope, optionally filtered to one offering
+    - `_scope_resources(scope, offering=None)` — returns the resources at this
+      scope (non-terminated unless `include_terminated` is set), optionally
+      filtered to one offering
     """
 
     lookup_field = "uuid"
@@ -19342,14 +19637,23 @@ class OfferingUsageMixin:
     def _scope_resources(self, scope, offering=None):
         raise NotImplementedError
 
+    def _exclude_terminated(self, qs):
+        if structure_utils.include_terminated_requested(self.request):
+            return narrow_terminated_to_usage_window(
+                qs, _resolve_period_offset(self.request)
+            )
+        return qs.exclude(state=ResourceStates.TERMINATED)
+
     @extend_schema(
         summary="Get resource usage statistics broken down per offering",
         description=(
             "Returns one row per (offering, component type, billing type) for "
-            "all non-terminated resources within the scope. Each row's "
+            "all non-terminated resources within the scope (or all resources "
+            "when `include_terminated` is true). Each row's "
             "`usage` and `limit_usage` are aggregated using the offering's "
             "own `limit_period`."
         ),
+        parameters=[_INCLUDE_TERMINATED_PARAM],
         responses=serializers.ComponentsUsageStatsPerOfferingSerializer,
     )
     @action(detail=True, url_path="components-usage")
@@ -19367,7 +19671,12 @@ class OfferingUsageMixin:
             "Buckets are keyed by `billing_period` (always month-start). "
             "`period_offset` shifts the window backward by N periods."
         ),
-        parameters=[_OFFERING_UUID_PARAM, _COMPONENT_TYPE_PARAM, _PERIOD_OFFSET_PARAM],
+        parameters=[
+            _OFFERING_UUID_PARAM,
+            _COMPONENT_TYPE_PARAM,
+            _PERIOD_OFFSET_PARAM,
+            _INCLUDE_TERMINATED_PARAM,
+        ],
         responses=serializers.OfferingUsageTimeseriesSerializer,
     )
     @action(detail=True, url_path="components-usage-timeseries")
@@ -19395,8 +19704,8 @@ class MarketplaceCustomerUsageViewSet(OfferingUsageMixin, rf_viewsets.GenericVie
     queryset = structure_models.Customer.objects.all()
 
     def _scope_resources(self, customer, offering=None):
-        qs = models.Resource.objects.filter(project__customer=customer).exclude(
-            state=ResourceStates.TERMINATED
+        qs = self._exclude_terminated(
+            models.Resource.objects.filter(project__customer=customer)
         )
         if offering is not None:
             qs = qs.filter(offering=offering)
@@ -19410,7 +19719,12 @@ class MarketplaceCustomerUsageViewSet(OfferingUsageMixin, rf_viewsets.GenericVie
             "and a monthly `buckets` array. Projects are sorted by usage "
             "descending."
         ),
-        parameters=[_OFFERING_UUID_PARAM, _COMPONENT_TYPE_PARAM, _PERIOD_OFFSET_PARAM],
+        parameters=[
+            _OFFERING_UUID_PARAM,
+            _COMPONENT_TYPE_PARAM,
+            _PERIOD_OFFSET_PARAM,
+            _INCLUDE_TERMINATED_PARAM,
+        ],
         responses=serializers.OfferingUsageByProjectSerializer,
     )
     @action(detail=True, url_path="components-usage-by-project")
@@ -19441,9 +19755,7 @@ class MarketplaceProjectUsageViewSet(OfferingUsageMixin, rf_viewsets.GenericView
     queryset = structure_models.Project.objects.all()
 
     def _scope_resources(self, project, offering=None):
-        qs = models.Resource.objects.filter(project=project).exclude(
-            state=ResourceStates.TERMINATED
-        )
+        qs = self._exclude_terminated(models.Resource.objects.filter(project=project))
         if offering is not None:
             qs = qs.filter(offering=offering)
         return qs

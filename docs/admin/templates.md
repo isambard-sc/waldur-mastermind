@@ -1345,128 +1345,10 @@ Waldur accounting report for {{ month }}/{{ year }}
 
 ```txt
 
-Hello,
+Hi,
 
-Please follow the link below to see {{ customer }}'s accounting information for {{ month }}/{{ year }}:
+Here is the {{ month }}/{{ year }} invoice for {{ customer }}.{% if attached %} It is attached as a PDF, and you can also view it online:{% else %} You can view it online:{% endif %}
 {{ link }}
-
-```
-
-### invoice.html (waldur_mastermind.invoices)
-
-```html
-
-{% load i18n %}
-{% load humanize %}
-
-<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8">
-    <title>Invoice</title>
-    <style type="text/css">
-      {% include "waldur_core/font.css" %}
-      {% include "./style.css" %}
-    </style>
-  </head>
-  <body>
-      <h1>{% trans "Invoice No." %} {{ invoice.number|upper }}</h1>
-      <br>
-      <div class="text-right">
-          <strong>{% trans "Invoice date" %}:</strong> {% if invoice.invoice_date %}
-        {{ invoice.invoice_date|date:"Y-m-d" }} {% else %} {% trans "Pending" %} {% endif %}<br/>
-          {% if invoice.due_date %}<strong>{% trans "Due date" %}:</strong> {{ invoice.due_date|date:"Y-m-d" }}<br/>{% endif %}
-          <strong>{% trans "Invoice period" %}:</strong> {{ invoice.year }}-{{ invoice.month }}<br/>
-      </div>
-
-      <div>
-        <h3 class="name">From</h3>
-        <div><strong>{{ issuer_details.company }}</strong></div>
-        <div>{{ issuer_details.address }}</div>
-        <div>{{ issuer_details.country }}, {{ issuer_details.postal }}</div>
-        <div><abbr>P:</abbr> ({{ issuer_details.phone.country_code }}) {{ issuer_details.phone.national_number }}</div>
-        <div>{{ issuer_details.bank }}, {{ issuer_details.account }}</div>
-        <div><abbr>{% trans "VAT" %}:</abbr>{{ issuer_details.vat_code }}</div>
-        <div>{{ issuer_details.email }}</div>
-      </div>
-      <div>
-        <h3 class="name">To</h3>
-        <div><strong>{{ invoice.customer.name }}</strong></div>
-
-        {% if invoice.customer.address %}
-          <div>{{ invoice.customer.address }}</div>
-        {% endif %}
-
-        {% if invoice.customer.country and invoice.customer.postal %}
-          <div>{{ invoice.customer.country }}, {{ invoice.customer.postal }}</div>
-        {% endif %}
-
-        {% if invoice.customer.phone_number %}
-          <div><abbr>P:</abbr> {{ invoice.customer.phone_number }}</div>
-        {% endif %}
-
-        {% if invoice.customer.bank_name and invoice.customer.bank_account %}
-          <div>{{ invoice.customer.bank_name }}, {{ invoice.customer.bank_account }}</div>
-        {% endif %}
-
-        {% if customer.vat_code %}
-          <div><abbr>{% trans "VAT" %}:</abbr> {{ customer.vat_code }}</div>
-        {% endif %}
-
-        <div>{{ invoice.customer.email }}</div>
-
-      </div>
-      <div class="m-t">
-        <table class="invoice-table">
-          <tr>
-            <th>Item</th>
-            <th>Quantity</th>
-            <th>Unit price</th>
-            <th>Total price</th>
-          </tr>
-
-          {% regroup items|dictsort:"project_name" by project_name as project_list %}
-          {% for project in project_list %}
-          <tr>
-              <td colspan="4"><h3>{{ project.grouper }}</h3></td>
-          </tr>
-            {% for item in project.list %}
-              <tr>
-                <td>
-                  <strong>{{ item.name }}</strong>
-                  <div>
-                    <small>
-                      {% trans "Start time" %}: {{ item.start | date:"Y-m-d H:i" }}.
-                      {% trans "End time" %}: {{ item.end | date:"Y-m-d H:i" }}.
-                    </small>
-                  </div>
-                </td>
-                <td>{{ item.quantity }}</td>
-                <td>{{ currency }} {{ item.unit_price | floatformat:2 | intcomma }}</td>
-                <td>{{ currency }} {{ item.total | floatformat:2 | intcomma }}</td>
-              </tr>
-            {% endfor %}
-          {% endfor %}
-        </table>
-      </div>
-      <table class="m-t invoice-total">
-        <tr>
-          <td><strong>{% trans "Subtotal" %}</strong></td>
-          <td>{{ currency }} {{ invoice.price | floatformat:2 | intcomma}}</td>
-        </tr>
-        {% if invoice.tax %}
-          <tr>
-            <td><strong>{% trans "VAT" %}</strong></td>
-            <td>{{ currency }} {{ invoice.tax | floatformat:2 | intcomma}}</td>
-          </tr>
-        {% endif %}
-        <tr>
-          <td><strong>{% trans "TOTAL" %}</strong></td>
-          <td>{{ currency }} {{ invoice.total | floatformat:2 | intcomma}}</td>
-      </tr>
-      </table>
-  </body>
-</html>
 
 ```
 
@@ -1474,7 +1356,7 @@ Please follow the link below to see {{ customer }}'s accounting information for 
 
 ```txt
 
-{{ customer }}'s invoice for {{ month }}/{{ year }}
+Invoice for {{ customer }}, {{ month }}/{{ year }}
 
 ```
 
@@ -1575,14 +1457,15 @@ Please follow the link below to see {{ customer }}'s accounting information for 
 <html xmlns="http://www.w3.org/1999/html">
 <head lang="en">
     <meta charset="UTF-8">
-    <title>{{ customer }}'s invoice for {{ month }}/{{ year }}</title>
+    <title>Invoice for {{ customer }}, {{ month }}/{{ year }}</title>
 </head>
 <body>
 <p>
-    Dear Sir or Madam,
+    Hi,
 </p>
 <p>
-    Attached is invoice for services consumed by {{ customer }}'s during {{ month }}/{{ year }}.
+    Here is the {{ month }}/{{ year }} invoice for {{ customer }}.
+    {% if attached %}It is attached as a PDF, and you can also <a href="{{ link }}">view it online</a>.{% else %}You can <a href="{{ link }}">view it online</a>.{% endif %}
 </p>
 </body>
 </html>
@@ -3454,6 +3337,25 @@ You have {{ items_count }} proposal{{ items_count|pluralize }} to review for "{{
 
 ```
 
+### proposal_draft_carried_over_message.txt (waldur_mastermind.proposal)
+
+```txt
+
+Dear {{ proposal_creator_name }},
+
+Your draft proposal "{{ proposal_name }}" in call "{{ call_name }}" was not submitted before the cut-off of {{ previous_round_name }}.
+
+It has not been cancelled. It has moved on to the call's next round, with its content, team, documents and requested resources unchanged:
+- Round: {{ round_name }}
+- Opens for submissions: {{ round_start_date }}
+- Submission deadline: {{ deadline_date }}
+
+Your proposal is still in DRAFT state. Submit it before the new deadline to have it considered: {{ proposal_url }}
+
+This is an automated message from the {{ site_name }}. Please do not reply to this email.
+
+```
+
 ### proposal_submission_deadline_approaching_message.txt (waldur_mastermind.proposal)
 
 ```txt
@@ -3473,7 +3375,7 @@ Please ensure you have completed all required sections and finalized your resour
 
 Complete and submit proposal: {{ proposal_url }}
 
-Any proposals left in draft state after the deadline will be automatically canceled and will not be considered for resource allocation.
+{% if draft_carries_over %}A proposal left in draft state after the deadline moves on to the call's next round and is considered only once it has been submitted there.{% else %}Any proposals left in draft state after the deadline will be automatically canceled and will not be considered for resource allocation.{% endif %}
 
 This is an automated message from the {{ site_name }}. Please do not reply to this email.
 
@@ -4043,7 +3945,7 @@ New review round opening: {{ call_name }}
 
     <p>Complete and submit proposal: <a href="{{ proposal_url }}">{{ proposal_url }}</a></p>
 
-    <p>Any proposals left in draft state after the deadline will be automatically canceled and will not be considered for resource allocation.</p>
+    <p>{% if draft_carries_over %}A proposal left in draft state after the deadline moves on to the call's next round and is considered only once it has been submitted there.{% else %}Any proposals left in draft state after the deadline will be automatically canceled and will not be considered for resource allocation.{% endif %}</p>
 
     <p>This is an automated message from the {{ site_name }}. Please do not reply to this email.</p>
 </body>
@@ -4262,6 +4164,14 @@ This is an automated message from the {{ site_name }}. Please do not reply to th
 ```txt
 
 Reminder: Review due in {{ time_remaining_days }} days for {{ proposal_name }}
+
+```
+
+### proposal_draft_carried_over_subject.txt (waldur_mastermind.proposal)
+
+```txt
+
+Your draft proposal {{ proposal_name }} now targets the next cut-off of {{ call_name }}
 
 ```
 
@@ -4803,6 +4713,34 @@ This is an automated message from {{ site_name }}. Please do not reply to this e
 
 ```
 
+### proposal_draft_carried_over_message.html (waldur_mastermind.proposal)
+
+```html
+
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Draft proposal moved to the next round</title>
+</head>
+<body>
+    <p>Dear {{ proposal_creator_name }},</p>
+
+    <p>Your draft proposal "{{ proposal_name }}" in call "{{ call_name }}" was not submitted before the cut-off of {{ previous_round_name }}.</p>
+
+    <p>It has not been cancelled. It has moved on to the call's next round, with its content, team, documents and requested resources unchanged:<br>
+        - Round: {{ round_name }}<br>
+        - Opens for submissions: {{ round_start_date }}<br>
+        - Submission deadline: {{ deadline_date }}
+    </p>
+
+    <p>Your proposal is still in <strong>DRAFT</strong> state. Submit it before the new deadline to have it considered: <a href="{{ proposal_url }}">{{ proposal_url }}</a></p>
+
+    <p>This is an automated message from the {{ site_name }}. Please do not reply to this email.</p>
+</body>
+</html>
+
+```
+
 ### proposal_state_changed_subject.txt (waldur_mastermind.proposal)
 
 ```txt
@@ -5187,7 +5125,11 @@ Comment:
 
 Hello!
 
-The issue you have created has a new comment. Please go to {{issue_url}} to see it.
+{% if is_system_comment %}A new comment was added{% else %}{{ comment.author.name }} commented{% endif %} on your support request "{{ issue.summary }}":
+
+{{ description }}
+
+To reply, go to {{ issue_url }}.
 
 ```
 
@@ -5236,7 +5178,7 @@ Open the request: {{ issue_url }}
 <html>
 <head lang="en">
     <meta charset="UTF-8">
-    <title>The issue you have created ({{ issue.key }}) has a new comment</title>
+    <title>Your support request ({{ issue.key }}) has a new comment</title>
 </head>
 <body>
 <p>
@@ -5390,7 +5332,7 @@ Please take action to avoid an SLA breach.
 
 ```txt
 
-The issue you have created has a new comment
+Your support request has a new comment
 
 ```
 

@@ -309,9 +309,17 @@
 ## Proposal
 
 - proposal_canceled
+- proposal_decision_reopened
 - proposal_document_added
 - proposal_document_removed
+- proposal_draft_carried_over
+- proposal_rejected_at_round_completion
 - proposal_workflow_advanced
+- round_closed
+- round_decision_started
+- round_evaluation_started
+- round_results_published
+- round_undecided_proposals_rejected
 
 ## Providers
 
@@ -359,8 +367,14 @@
 - marketplace_order_rejected
 - marketplace_order_terminated
 - marketplace_order_unlinked
+- marketplace_resource_api_key_deleted
+- marketplace_resource_api_key_failed
+- marketplace_resource_api_key_paused
+- marketplace_resource_api_key_requested
+- marketplace_resource_api_key_resumed
 - marketplace_resource_api_key_revealed
 - marketplace_resource_api_key_rotated
+- marketplace_resource_api_key_updated
 - marketplace_resource_create_canceled
 - marketplace_resource_create_failed
 - marketplace_resource_create_requested
@@ -508,6 +522,10 @@
 - marketplace_offering_user_created
 - marketplace_offering_user_deleted
 - marketplace_offering_user_restriction_updated
+- matrix_encryption_reset_started
+- matrix_password_generated
+- matrix_recovery_key_escrowed
+- matrix_recovery_key_viewed
 - passkey_authentication_failed
 - passkey_authentication_succeeded
 - passkey_registered

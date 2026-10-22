@@ -428,25 +428,38 @@ class PlanManager(MixinManager):
         return PlanQuerySet(self.model, using=self._db)
 
 
+class ResourceApiKeyQuerySet(django_models.QuerySet):
+    def usage_totals(self) -> dict[str, float]:
+        """Sum the agent-reported usage of these keys per component type.
+
+        Deleted keys are counted: a key is soft-deleted precisely so that the
+        usage it reported stays part of its resource's total. Summed in Python
+        because current_usages is a JSON map whose keys differ per offering.
+        """
+        totals: dict[str, float] = {}
+        for usages in self.exclude(current_usages__isnull=True).values_list(
+            "current_usages", flat=True
+        ):
+            for component_type, value in usages.items():
+                totals[component_type] = totals.get(component_type, 0) + value
+        return totals
+
+
 def get_connected_offerings(user, role=None):
     content_type = ContentType.objects.get_for_model(models.Offering)
     return get_scope_ids(user, content_type, role)
 
 
-def get_connected_offerings_by_permission(user, permission):
-    from waldur_core.permissions.models import Role
+def get_connected_offerings_by_permission(
+    user, permission
+) -> django_models.QuerySet[int]:
+    """Offering ids on which the user holds ``permission``.
 
+    Matched on each grant's own role permissions, as ``has_permission`` does,
+    rather than on the names of roles that hold the permission.
+    """
     content_type = ContentType.objects.get_for_model(models.Offering)
-    roles = list(
-        Role.objects.filter(
-            content_type=content_type,
-            is_active=True,
-            permissions__permission=permission,
-        ).values_list("name", flat=True)
-    )
-    if not roles:
-        return models.Offering.objects.none().values_list("id", flat=True)
-    return get_connected_offerings(user, roles)
+    return get_scope_ids(user, content_type, permission=permission)
 
 
 def filter_orders_for_user(queryset, user):
@@ -468,13 +481,18 @@ def filter_orders_for_user(queryset, user):
     connected_customers = get_connected_customers_by_permission(
         user, PermissionEnum.LIST_ORDERS
     )
+    # A ServiceProvider-scoped grant counts for the provider side only, never
+    # for orders the provider organization places as a consumer.
+    provider_customers = get_connected_provider_customers_by_permission(
+        user, PermissionEnum.LIST_ORDERS
+    )
     connected_offerings = get_connected_offerings_by_permission(
         user, PermissionEnum.LIST_ORDERS
     )
     return queryset.filter(
         Q(project__in=connected_projects)
         | Q(project__customer__in=connected_customers)
-        | Q(offering__customer__in=connected_customers)
+        | Q(offering__customer__in=provider_customers)
         | Q(offering__in=connected_offerings)
     )
 

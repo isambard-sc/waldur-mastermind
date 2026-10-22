@@ -61,9 +61,6 @@ from waldur_mastermind.marketplace.enums import (
     CourseAccountState,
     DiscountAggregations,
     ImpactLevel,
-    KpiAggregations,
-    KpiCadences,
-    KpiDirections,
     LimitPeriods,
     MaintenanceState,
     MaintenanceTimingBucket,
@@ -74,6 +71,7 @@ from waldur_mastermind.marketplace.enums import (
     OfferingUserStates,
     OrderStates,
     OrderTypes,
+    ResourceApiKeyActions,
     ResourceApiKeyStates,
     ResourceStates,
     RobotAccountStates,
@@ -210,7 +208,10 @@ class ServiceProvider(
         ).count()
 
     def generate_api_secret_code(self):
-        self.api_secret_code = core_utils.pwgen()
+        # The code is the HS256 key for signed public API calls. RFC 7518
+        # wants at least 256 bits of key; 48 chars of pwgen's 54-symbol
+        # alphabet give ~276 bits, and PyJWT warns on keys under 32 bytes.
+        self.api_secret_code = core_utils.pwgen(48)
 
     def save(self, *args, **kwargs):
         if not self.pk:
@@ -280,6 +281,16 @@ class OfferingGroup(
 
     class Permissions:
         customer_path = "customer"
+
+        @staticmethod
+        def build_query(user):
+            # A service provider manager holds their role on the
+            # ServiceProvider, which customer_path does not reach.
+            return Q(
+                customer__serviceprovider__in=managers.get_connected_serviceproviders(
+                    user
+                )
+            )
 
     class Meta:
         verbose_name = _("Offering group")
@@ -2067,6 +2078,18 @@ RESOURCE_SLUG_MAX_LENGTH = 40
 # beyond it we fall back to suffix-based uniqueness.
 MAX_SLUG_COUNTER_ATTEMPTS = 10000
 
+# Once its creation order is executing, a site agent may already be naming a
+# backend account after the resource slug; ERRED counts too, since the account
+# may exist in part. Pending, canceled and rejected orders leave it free.
+SLUG_LOCKING_ORDER_STATES = (OrderStates.EXECUTING, OrderStates.DONE, OrderStates.ERRED)
+
+
+def slug_locked_q():
+    """Resources whose slug only staff may still change."""
+    return ~Q(backend_id="") | Q(
+        order__type=OrderTypes.CREATE, order__state__in=SLUG_LOCKING_ORDER_STATES
+    )
+
 
 class Resource(
     PermissionMixin,
@@ -2171,6 +2194,14 @@ class Resource(
             "restriction that was set for another reason."
         ),
     )
+    paused_by_grace_period = models.BooleanField(
+        default=False,
+        help_text=(
+            "Waldur paused the resource because its project entered the grace "
+            "period after its end date. Lets the pause be lifted when the end "
+            "date is extended, without lifting a pause set for another reason."
+        ),
+    )
 
     NON_LOGGABLE_FIELDS = (
         "modified",
@@ -2184,6 +2215,7 @@ class Resource(
         "error_message",
         "error_traceback",
         "current_usages",
+        "paused_by_grace_period",
     )
 
     def save(self, *args, **kwargs):
@@ -2417,7 +2449,7 @@ class Resource(
     def is_expired(self) -> bool:
         if not self.end_date:
             return False
-        return self.end_date <= timezone.datetime.today().date()
+        return self.end_date <= timezone.localdate()
 
     @property
     def effective_end_date(self) -> datetime.date | None:
@@ -2449,12 +2481,23 @@ class Resource(
 
         return f"{self.uuid} ({self.offering.name})"
 
+    # List views load these orders for a whole page at once, as
+    # ``prefetched_create_orders`` and ``prefetched_pending_orders`` (see
+    # ``ResourceSerializer.eager_load``); both keep the default Order ordering,
+    # so their first element is what ``.first()`` would return.
+
     @property
     def creation_order(self) -> "Order | None":
+        prefetched = getattr(self, "prefetched_create_orders", None)
+        if prefetched is not None:
+            return prefetched[0] if prefetched else None
         return self.order_set.filter(type=OrderTypes.CREATE).first()
 
     @property
     def order_in_progress(self) -> "Order | None":
+        prefetched = getattr(self, "prefetched_pending_orders", None)
+        if prefetched is not None:
+            return prefetched[0] if prefetched else None
         return self.order_set.filter(state__in=OrderStates.PENDING_STATES).first()
 
     def get_prepaid_balance(
@@ -3339,6 +3382,29 @@ class ComponentQuota(TimeStampedModel):
         return f"resource: {self.resource.name}, component: {self.component.name}"
 
 
+def filter_by_usage_reporter_permission(user, prefix):
+    """Usage rows of offerings the user may report usage for.
+
+    Organization roles already see these through customer_path. This adds the
+    provider-side roles held elsewhere: an offering manager on the offering, a
+    service provider manager on the ServiceProvider. Either can write usage
+    for the offering, so either may read it back. Matched on the permission
+    itself, as has_permission does; staff and global support never reach this.
+    """
+    permission = PermissionEnum.SET_RESOURCE_USAGE
+    provider_ids = get_scope_ids(
+        user,
+        ContentType.objects.get_for_model(ServiceProvider),
+        permission=permission,
+    )
+    offering_ids = get_scope_ids(
+        user, ContentType.objects.get_for_model(Offering), permission=permission
+    )
+    return Q(**{f"{prefix}offering__customer__serviceprovider__in": provider_ids}) | Q(
+        **{f"{prefix}offering__in": offering_ids}
+    )
+
+
 class ComponentUsage(
     TimeStampedModel,
     core_models.DescribableMixin,
@@ -3385,6 +3451,10 @@ class ComponentUsage(
     class Permissions:
         customer_path = ["resource__project__customer", "resource__offering__customer"]
         project_path = "resource__project"
+
+        @staticmethod
+        def build_query(user):
+            return filter_by_usage_reporter_permission(user, "resource__")
 
     class Meta:
         constraints = [
@@ -3456,134 +3526,6 @@ class ComponentUsagePollRecord(models.Model):
         )
 
 
-class OfferingKpi(
-    core_models.UuidMixin,
-    BaseComponent,
-):
-    """A business KPI an offering reports for the projects consuming it.
-
-    Separate from OfferingComponent on purpose: a component is money-bearing
-    and feeds invoices, whereas a KPI must never reach billing.
-    """
-
-    class Meta:
-        unique_together = ("type", "offering")
-        ordering = ["name", "id"]
-
-    offering = models.ForeignKey(
-        on_delete=models.CASCADE, to=Offering, related_name="kpis"
-    )
-    aggregation = models.CharField(
-        max_length=10,
-        choices=KpiAggregations.CHOICES,
-        default=KpiAggregations.SUM,
-        help_text=_("How datapoints roll up into one project-level figure."),
-    )
-    direction = models.CharField(
-        max_length=10,
-        choices=KpiDirections.CHOICES,
-        default=KpiDirections.NEUTRAL,
-        help_text=_("Which way this KPI has to move to count as an improvement."),
-    )
-    target = models.DecimalField(
-        max_digits=20,
-        decimal_places=2,
-        blank=True,
-        null=True,
-        help_text=_("Optional value the project is aiming for."),
-    )
-    cadence = models.CharField(
-        max_length=10,
-        choices=KpiCadences.CHOICES,
-        default=KpiCadences.MONTHLY,
-        help_text=_("How often the service is expected to report this KPI."),
-    )
-    attribute = models.CharField(
-        max_length=50,
-        blank=True,
-        validators=[InternalNameValidator],
-        help_text=_(
-            "Datapoint attribute this KPI is broken down by, for example "
-            "course. Empty when the KPI has no breakdown."
-        ),
-    )
-
-    class Permissions:
-        customer_path = "offering__customer"
-
-    def __str__(self):
-        return f"{self.offering.name} / {self.type}"
-
-
-class ResourceKpiValue(
-    TimeStampedModel,
-    core_models.UuidMixin,
-    LoggableMixin,
-):
-    """One KPI datapoint reported by a service for one of its resources.
-
-    Values hang off the resource, so a project figure is the aggregate over
-    its resources. No billing_period: a KPI is never tied to an invoice.
-    """
-
-    resource = models.ForeignKey(
-        on_delete=models.CASCADE, to=Resource, related_name="kpi_values"
-    )
-    kpi = models.ForeignKey(
-        on_delete=models.CASCADE, to=OfferingKpi, related_name="values"
-    )
-    value = models.DecimalField(max_digits=20, decimal_places=2)
-    timestamp = models.DateTimeField(help_text=_("When the measurement was taken."))
-    attributes = models.JSONField(
-        blank=True,
-        default=dict,
-        help_text=_(
-            "OpenTelemetry-style attributes qualifying this datapoint, "
-            "for example the course or the support queue."
-        ),
-    )
-
-    class Permissions:
-        customer_path = ["resource__project__customer", "resource__offering__customer"]
-        project_path = "resource__project"
-
-    class Meta:
-        # "id" is the tiebreaker: timestamps tie by design when a service
-        # reports several attribute sets for the same moment, and an ordering
-        # that is not total lets paging repeat one row and skip another.
-        ordering = ["-timestamp", "id"]
-        constraints = [
-            UniqueConstraint(
-                fields=["resource", "kpi", "timestamp", "attributes"],
-                name="unique_resource_kpi_datapoint",
-            ),
-        ]
-        indexes = [
-            Index(fields=["resource", "kpi", "timestamp"]),
-        ]
-
-    def __str__(self):
-        return f"{self.resource.name} / {self.kpi.type}: {self.value}"
-
-    def clean(self):
-        super().clean()
-        # A KPI can only be reported against the offering that declares it;
-        # without this a service could write into another provider's KPI.
-        if not self.kpi_id or not self.resource_id:
-            return
-        if self.kpi.offering_id != self.resource.offering_id:
-            raise ValidationError(
-                _("KPI %(kpi)s is not declared by the resource's offering.")
-                % {"kpi": self.kpi.type}
-            )
-
-    def save(self, *args, **kwargs):
-        # Django does not run clean() on save and DRF does not call it either,
-        # so the cross-offering guard above would never fire without this.
-        self.clean()
-        return super().save(*args, **kwargs)
-
-
 class ComponentUserUsage(
     TimeStampedModel,
     core_models.DescribableMixin,
@@ -3616,6 +3558,12 @@ class ComponentUserUsage(
             "component_usage__resource__offering__customer",
         ]
         project_path = "component_usage__resource__project"
+
+        @staticmethod
+        def build_query(user):
+            return filter_by_usage_reporter_permission(
+                user, "component_usage__resource__"
+            )
 
     class Meta:
         unique_together = ("username", "component_usage")
@@ -4579,6 +4527,7 @@ class ServiceProviderProjectGroup(
     )
     name = models.CharField(max_length=NAME_MAX_LENGTH)
     gid = models.BigIntegerField(null=True, blank=True)
+    tracker = cast(FieldInstanceTracker, FieldTracker(fields=["name", "gid"]))
 
     class Meta:
         verbose_name = _("Service provider project group")
@@ -5918,22 +5867,123 @@ class ResourceApiKey(
     then pushes the value here Fernet-encrypted — so a stored key is always one
     the backend already accepts. The state reuses the resource state vocabulary
     so the portal renders it with the standard StateIndicator.
+
+    On an offering with ``enable_api_key_provisioning`` a key is also governed
+    individually: it can be requested, assigned to a person, given per-component
+    limits, restricted to some models, paused, resumed and deleted. Each of those
+    is a command the agent carries out and acknowledges; ``pending_action`` names
+    the one in flight.
     """
 
     States = ResourceApiKeyStates
+    Actions = ResourceApiKeyActions
 
     resource = models.ForeignKey(
         to=Resource, on_delete=models.CASCADE, related_name="api_keys"
     )
     # The backend identity for this key (one gateway Secret entry). Assigned by
-    # the agent, e.g. "<resource_backend_id>-1".
+    # the agent, e.g. "<resource_backend_id>-1"; blank on a requested key until
+    # the agent has created it.
     client_id = models.CharField(max_length=255, blank=True, db_index=True)
-    key_ciphertext = models.TextField(blank=True)
+    key_ciphertext = core_fields.CiphertextField(blank=True)
+    issued_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=_(
+            "When the agent last stored a value for this key: its creation or "
+            "its latest rotation. Unlike modified, a pause or an edit leaves it "
+            "alone."
+        ),
+    )
     state = FSMField(choices=States.CHOICES, default=States.CREATING)
+    pending_action = models.CharField(
+        max_length=16,
+        choices=ResourceApiKeyActions.CHOICES,
+        blank=True,
+        default="",
+        help_text=_(
+            "The command the site agent is carrying out on this key. Kept when "
+            "the key goes Erred, to show which command failed."
+        ),
+    )
+    # SET_NULL rather than CASCADE: deleting the key row would take its usage
+    # with it.
+    user = models.ForeignKey(
+        on_delete=models.SET_NULL,
+        to=User,
+        null=True,
+        blank=True,
+        related_name="resource_api_keys",
+        help_text=_("Assignee. When set, only this user can reveal the key."),
+    )
+    limits = models.JSONField(
+        null=True,
+        blank=True,
+        help_text=_(
+            "Per-component limits, keyed by component type. Waldur pauses the key "
+            "once its reported usage reaches one; zero means no limit."
+        ),
+    )
+    allowed_models = models.JSONField(
+        null=True,
+        blank=True,
+        help_text=_("Models this key may call; null allows every model."),
+    )
+    current_usages = models.JSONField(
+        null=True,
+        blank=True,
+        help_text=_(
+            "Usage per component type in usage_period, as last reported by the "
+            "site agent."
+        ),
+    )
+    usage_period = models.DateField(
+        null=True,
+        blank=True,
+        help_text=_(
+            "The month current_usages covers (its first day). Limits are monthly: "
+            "usage of an earlier month counts against none."
+        ),
+    )
+    paused_by_limit = models.BooleanField(
+        default=False,
+        help_text=_(
+            "Waldur paused the key because its usage reached a limit. Such a key "
+            "is resumed automatically once its usage is under its limits again: "
+            "in a new month, or when a limit is raised."
+        ),
+    )
+
+    objects = managers.ResourceApiKeyQuerySet.as_manager()
 
     class Meta:
         verbose_name = _("Resource API key")
-        unique_together = (("resource", "client_id"),)
+        constraints = [
+            # A requested key has no client_id until the agent creates it, so
+            # several can wait at once. A deleted key keeps its client_id, which
+            # the agent must not hand out again: usage is attributed by it.
+            UniqueConstraint(
+                fields=["resource", "client_id"],
+                condition=~Q(client_id=""),
+                name="marketplace_resource_api_key_unique_client_id",
+            ),
+        ]
+
+    @staticmethod
+    def is_managed_for(resource: Resource) -> bool:
+        """Whether the offering's backend supports per-key governance."""
+        return bool(resource.offering.plugin_options.get("enable_api_key_provisioning"))
+
+    @property
+    def is_managed(self) -> bool:
+        return self.is_managed_for(self.resource)
+
+    @staticmethod
+    def current_period() -> datetime.date:
+        """The month limits are counted in: its first day."""
+        return core_utils.month_start(timezone.now()).date()
+
+    # Every acknowledgement clears pending_action: the command has settled.
 
     @transition(
         field=state,
@@ -5941,23 +5991,92 @@ class ResourceApiKey(
         target=States.OK,
     )
     def set_ok(self):
-        pass
+        self.pending_action = ""
 
-    # Rotation is also allowed from Erred so a failed apply can be retried from
-    # the portal instead of leaving the key stuck.
+    # Only a retry of a failed request: a new key is created, not transitioned.
+    @transition(field=state, source=[States.ERRED], target=States.CREATING)
+    def set_creating(self):
+        self.pending_action = ResourceApiKeyActions.CREATE
+
+    # Every command is also allowed from Erred so a failed one can be retried
+    # from the portal instead of leaving the key stuck; issue_command decides
+    # which of them an Erred key accepts.
     @transition(field=state, source=[States.OK, States.ERRED], target=States.UPDATING)
-    def set_updating(self):
-        pass
+    def set_updating(self, action=ResourceApiKeyActions.ROTATE):
+        self.pending_action = action
 
-    # Only from the transitional states (not OK): a late/duplicate erred report
-    # must not flip a key that has since been applied successfully back to red.
+    @transition(field=state, source=[States.OK, States.ERRED], target=States.UPDATING)
+    def set_pausing(self):
+        self.pending_action = ResourceApiKeyActions.PAUSE
+
+    # A resume, whoever issues it, ends a pause for the limit: if the key is still
+    # over it, the next usage report pauses it again.
+    @transition(
+        field=state, source=[States.PAUSED, States.ERRED], target=States.UPDATING
+    )
+    def set_resuming(self):
+        self.pending_action = ResourceApiKeyActions.RESUME
+        self.paused_by_limit = False
+
     @transition(
         field=state,
-        source=[States.CREATING, States.UPDATING, States.ERRED],
+        source=[States.OK, States.PAUSED, States.ERRED],
+        target=States.DELETING,
+    )
+    def set_deleting(self):
+        self.pending_action = ResourceApiKeyActions.DELETE
+        self.paused_by_limit = False
+
+    # A requested key the agent has not created yet, or failed to create, has no
+    # client_id: nothing at the backend to revoke, so it is dropped without a
+    # command. A creation the agent reports later is refused, and the agent then
+    # withdraws what it minted.
+    @transition(
+        field=state, source=[States.CREATING, States.ERRED], target=States.DELETED
+    )
+    def cancel_request(self):
+        self.pending_action = ""
+        self.key_ciphertext = ""
+
+    @transition(
+        field=state, source=[States.UPDATING, States.ERRED], target=States.PAUSED
+    )
+    def set_paused(self):
+        self.pending_action = ""
+
+    # The value is dropped: the backend has revoked it, so it can never be
+    # revealed again. The row stays for the usage it carries.
+    @transition(
+        field=state, source=[States.DELETING, States.ERRED], target=States.DELETED
+    )
+    def set_deleted(self):
+        self.pending_action = ""
+        self.key_ciphertext = ""
+
+    # Only from the transitional states (not OK, Paused or Deleted): a
+    # late/duplicate erred report must not flip a key that has since settled.
+    @transition(
+        field=state,
+        source=[States.CREATING, States.UPDATING, States.DELETING, States.ERRED],
         target=States.ERRED,
     )
     def set_erred(self):
         pass
+
+    def exceeded_limits(self) -> list[str]:
+        """Component types whose usage this month has reached this key's limit.
+
+        Limits are monthly, so usage reported for an earlier month counts as none.
+        """
+        if self.usage_period != self.current_period():
+            return []
+        limits = self.limits or {}
+        usages = self.current_usages or {}
+        return sorted(
+            component_type
+            for component_type, limit in limits.items()
+            if limit and usages.get(component_type, 0) >= limit
+        )
 
     def __str__(self) -> str:
         return f"API key {self.client_id or self.uuid.hex} of {self.resource}"

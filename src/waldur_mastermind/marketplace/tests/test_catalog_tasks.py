@@ -334,36 +334,32 @@ class CatalogTasksTest(TestCase):
         self.assertIn("Test failure", catalog.update_errors)
         self.assertIsNone(catalog.last_successful_update)
 
-    def test_catalog_update_reuses_existing_catalog(self):
-        """Test that catalog updates reuse existing catalog instead of creating new one."""
-        # Create an existing catalog
+    def test_catalog_update_reuses_existing_catalog_without_rewriting_version(self):
+        """Updates refresh package data in place; version identity is preserved."""
         existing_catalog = SoftwareCatalog.objects.create(
             name="Spack",
-            version="2025.01.01",  # Old version
+            version="2025.01.01",
             catalog_type="source_package",
         )
         original_pk = existing_catalog.pk
 
-        # Mock loader with new version
         mock_loader = Mock()
-        mock_loader.catalog_version = "2026.01.25"  # New version
+        # Loader may advertise a newer upstream stamp; the row version must stay.
+        mock_loader.catalog_version = "2026.01.25"
         mock_loader.load_catalog.return_value = {
             "packages_created": 10,
             "versions_created": 50,
             "targets_created": 100,
         }
 
-        # Call the update function
         with override_config(SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES=True):
             result_catalog = _update_catalog_with_error_handling(
                 loader=mock_loader, catalog_name="Spack", catalog_type="source_package"
             )
 
-        # Verify the same catalog record was updated
         self.assertEqual(result_catalog.pk, original_pk)
-        self.assertEqual(result_catalog.version, "2026.01.25")
-
-        # Verify no new catalog was created
+        self.assertEqual(result_catalog.version, "2025.01.01")
+        self.assertEqual(mock_loader.catalog_version, "2025.01.01")
         self.assertEqual(
             SoftwareCatalog.objects.filter(
                 name="Spack", catalog_type="source_package"
@@ -530,18 +526,19 @@ class CatalogTaskPerformanceTest(TestCase):
         self, mock_spack_loader, mock_eessi_loader
     ):
         """Test that second catalog failure is handled after first success."""
-        # Pre-create EESSI catalog — daily task only updates existing ones
         SoftwareCatalog.objects.create(
             name="EESSI", version="old", catalog_type="binary_runtime"
         )
+        SoftwareCatalog.objects.create(
+            name="Spack", version="old", catalog_type="source_package"
+        )
 
-        # Setup EESSI to succeed
         mock_eessi_instance = Mock()
-        mock_eessi_instance.catalog_version = "2023.06"
+        mock_eessi_instance.catalog_version = "old"
         mock_eessi_instance.load_catalog.return_value = {"packages_created": 10}
         mock_eessi_loader.return_value = mock_eessi_instance
 
-        # Setup Spack to fail at loader instantiation (before catalog lookup)
+        # Fail at Spack loader instantiation for the existing row
         mock_spack_loader.side_effect = Exception("Spack parsing error")
 
         with override_config(
@@ -550,16 +547,13 @@ class CatalogTaskPerformanceTest(TestCase):
         ):
             result = update_software_catalogs()
 
-        # Verify partial completion (EESSI succeeded, Spack failed)
         self.assertEqual(result["status"], "partial")
         self.assertEqual(result["catalogs_updated"], 1)  # EESSI
         self.assertEqual(result["catalogs_failed"], 1)  # Spack
 
-        # Verify specific results
         self.assertEqual(result["results"]["eessi"]["status"], "success")
         self.assertEqual(result["results"]["spack"]["status"], "error")
 
-        # Verify EESSI was processed successfully despite Spack failure
         mock_eessi_loader.assert_called_once()
         mock_eessi_instance.load_catalog.assert_called_once()
 
@@ -712,6 +706,51 @@ class EESSIMultiCatalogUpdateTest(TestCase):
         self.assertEqual(result["results"]["eessi"]["status"], "skipped")
         self.assertEqual(result["results"]["eessi"]["reason"], "no_existing_catalog")
 
+    @override_config(
+        SOFTWARE_CATALOG_EESSI_UPDATE_ENABLED=False,
+        SOFTWARE_CATALOG_SPACK_UPDATE_ENABLED=True,
+        SOFTWARE_CATALOG_SPACK_DATA_URL="https://test.spack.io/data.json",
+        SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES=True,
+    )
+    @patch("waldur_mastermind.marketplace.tasks.SpackCatalogLoader")
+    def test_daily_update_updates_all_spack_catalogs(self, mock_loader_class):
+        """Spack snapshot versions are refreshed independently, not collapsed."""
+        mock_loader = Mock()
+        mock_loader.load_catalog.return_value = {"packages_created": 1}
+        mock_loader_class.return_value = mock_loader
+
+        older = SoftwareCatalog.objects.create(
+            name="Spack",
+            version="2026.01.15",
+            catalog_type="source_package",
+        )
+        newer = SoftwareCatalog.objects.create(
+            name="Spack",
+            version="2026.10.06",
+            catalog_type="source_package",
+        )
+
+        result = update_software_catalogs()
+
+        self.assertEqual(result["results"]["spack"]["status"], "success")
+        self.assertEqual(result["results"]["spack"]["catalogs_updated"], 2)
+        self.assertCountEqual(
+            result["results"]["spack"]["catalog_versions"],
+            ["2026.01.15", "2026.10.06"],
+        )
+
+        older.refresh_from_db()
+        newer.refresh_from_db()
+        self.assertEqual(older.version, "2026.01.15")
+        self.assertEqual(newer.version, "2026.10.06")
+        self.assertIsNotNone(older.last_successful_update)
+        self.assertIsNotNone(newer.last_successful_update)
+        self.assertEqual(mock_loader_class.call_count, 2)
+        pinned_versions = {
+            call.kwargs["catalog_version"] for call in mock_loader_class.call_args_list
+        }
+        self.assertEqual(pinned_versions, {"2026.01.15", "2026.10.06"})
+
 
 class CatalogCleanupTasksTest(TestCase):
     """Test cases for software catalog cleanup task."""
@@ -829,30 +868,146 @@ class CatalogCleanupTasksTest(TestCase):
     @override_config(
         SOFTWARE_CATALOG_CLEANUP_ENABLED=True, SOFTWARE_CATALOG_RETENTION_DAYS=200
     )
-    def test_cleanup_removes_duplicate_catalogs(self):
-        """Test that cleanup removes duplicate catalogs, keeping only the newest."""
+    def test_cleanup_preserves_distinct_catalog_versions(self):
+        """Different versions of the same catalog must not be collapsed as duplicates."""
         from datetime import timedelta
 
         now = timezone.now()
 
-        # Create duplicate catalogs with same name/type but different versions
-        older_duplicate = SoftwareCatalog.objects.create(
+        eessi_2023 = SoftwareCatalog.objects.create(
+            name="EESSI",
+            version="2023.06",
+            catalog_type="binary_runtime",
+            last_successful_update=now - timedelta(days=10),
+        )
+        eessi_2025 = SoftwareCatalog.objects.create(
+            name="EESSI",
+            version="2025.06",
+            catalog_type="binary_runtime",
+            last_successful_update=now - timedelta(days=5),
+        )
+        eessi_2026 = SoftwareCatalog.objects.create(
+            name="EESSI",
+            version="2026.06",
+            catalog_type="binary_runtime",
+            last_successful_update=now - timedelta(days=1),
+        )
+        # Distinct Spack versions (same name/type) must also survive.
+        spack_older = SoftwareCatalog.objects.create(
             name="Spack",
             version="2026.01.20",
             catalog_type="source_package",
             last_successful_update=now - timedelta(days=5),
         )
-        oldest_duplicate = SoftwareCatalog.objects.create(
+        spack_oldest = SoftwareCatalog.objects.create(
             name="Spack",
             version="2026.01.15",
             catalog_type="source_package",
             last_successful_update=now - timedelta(days=10),
         )
 
-        # Now we have 3 Spack catalogs - self.recent_catalog is newest
+        offering = marketplace_factories.OfferingFactory()
+        for catalog in (eessi_2023, eessi_2025, eessi_2026):
+            marketplace_factories.OfferingSoftwareCatalogFactory(
+                offering=offering, catalog=catalog
+            )
+
+        result = cleanup_old_software_catalogs()
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["duplicates_deleted"], 0)
+        self.assertEqual(result["deleted_count"], 0)
+
+        self.assertEqual(
+            SoftwareCatalog.objects.filter(
+                name="EESSI", catalog_type="binary_runtime"
+            ).count(),
+            3,
+        )
         self.assertEqual(
             SoftwareCatalog.objects.filter(
                 name="Spack", catalog_type="source_package"
+            ).count(),
+            3,  # self.recent_catalog + two extra versions
+        )
+        for catalog in (
+            eessi_2023,
+            eessi_2025,
+            eessi_2026,
+            spack_older,
+            spack_oldest,
+            self.recent_catalog,
+        ):
+            self.assertTrue(SoftwareCatalog.objects.filter(pk=catalog.pk).exists())
+
+        self.assertEqual(
+            OfferingSoftwareCatalog.objects.filter(offering=offering).count(),
+            3,
+        )
+
+    def _drop_name_version_type_unique(self):
+        """Drop UNIQUE (name, version, catalog_type) for true-duplicate inserts.
+
+        Django's alter_unique_together cannot always resolve the truncated
+        Postgres constraint name; drop by definition instead. TestCase
+        rollback restores the constraint — do not re-add it mid-test.
+        """
+        from django.db import connection
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT conname FROM pg_constraint
+                WHERE conrelid = 'marketplace_softwarecatalog'::regclass
+                  AND contype = 'u'
+                  AND pg_get_constraintdef(oid) = 'UNIQUE (name, version, catalog_type)'
+                """
+            )
+            row = cursor.fetchone()
+            self.assertIsNotNone(
+                row, "Expected UNIQUE (name, version, catalog_type) on SoftwareCatalog"
+            )
+            cursor.execute(
+                f'ALTER TABLE marketplace_softwarecatalog DROP CONSTRAINT "{row[0]}"'
+            )
+
+    def _insert_true_duplicate(self, template, *, last_successful_update):
+        """Insert a second row with the same (name, version, catalog_type)."""
+        duplicate = SoftwareCatalog(
+            name=template.name,
+            version=template.version,
+            catalog_type=template.catalog_type,
+            last_successful_update=last_successful_update,
+            description="true duplicate for cleanup test",
+        )
+        duplicate.save(force_insert=True)
+        return duplicate
+
+    @override_config(
+        SOFTWARE_CATALOG_CLEANUP_ENABLED=True, SOFTWARE_CATALOG_RETENTION_DAYS=200
+    )
+    def test_cleanup_removes_true_duplicate_catalogs(self):
+        """True duplicates (same name+version+type) collapse to the newest row."""
+        from datetime import timedelta
+
+        now = timezone.now()
+        kept = SoftwareCatalog.objects.create(
+            name="EESSI",
+            version="2026.06",
+            catalog_type="binary_runtime",
+            last_successful_update=now - timedelta(days=1),
+        )
+        self._drop_name_version_type_unique()
+        older_duplicate = self._insert_true_duplicate(
+            kept, last_successful_update=now - timedelta(days=5)
+        )
+        oldest_duplicate = self._insert_true_duplicate(
+            kept, last_successful_update=now - timedelta(days=10)
+        )
+
+        self.assertEqual(
+            SoftwareCatalog.objects.filter(
+                name="EESSI", version="2026.06", catalog_type="binary_runtime"
             ).count(),
             3,
         )
@@ -861,17 +1016,13 @@ class CatalogCleanupTasksTest(TestCase):
 
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["duplicates_deleted"], 2)
-
-        # Only the newest Spack catalog should remain
         self.assertEqual(
             SoftwareCatalog.objects.filter(
-                name="Spack", catalog_type="source_package"
+                name="EESSI", version="2026.06", catalog_type="binary_runtime"
             ).count(),
             1,
         )
-        self.assertTrue(
-            SoftwareCatalog.objects.filter(pk=self.recent_catalog.pk).exists()
-        )
+        self.assertTrue(SoftwareCatalog.objects.filter(pk=kept.pk).exists())
         self.assertFalse(SoftwareCatalog.objects.filter(pk=older_duplicate.pk).exists())
         self.assertFalse(
             SoftwareCatalog.objects.filter(pk=oldest_duplicate.pk).exists()
@@ -880,24 +1031,30 @@ class CatalogCleanupTasksTest(TestCase):
     @override_config(
         SOFTWARE_CATALOG_CLEANUP_ENABLED=True, SOFTWARE_CATALOG_RETENTION_DAYS=200
     )
-    def test_cleanup_duplicate_catalogs_with_overlapping_offering_links(self):
-        """Cleanup succeeds when an offering links to both newest and old duplicate catalogs."""
+    def test_cleanup_true_duplicates_with_overlapping_offering_links(self):
+        """Offering already on the kept row is skipped; others migrate onto it."""
         from datetime import timedelta
 
         now = timezone.now()
-
-        older_duplicate = SoftwareCatalog.objects.create(
-            name="Spack",
-            version="2026.01.20",
-            catalog_type="source_package",
-            last_successful_update=now - timedelta(days=5),
+        kept = SoftwareCatalog.objects.create(
+            name="EESSI",
+            version="2026.06",
+            catalog_type="binary_runtime",
+            last_successful_update=now - timedelta(days=1),
+        )
+        self._drop_name_version_type_unique()
+        older_duplicate = self._insert_true_duplicate(
+            kept, last_successful_update=now - timedelta(days=5)
         )
 
         offering = marketplace_factories.OfferingFactory()
         newest_link = marketplace_factories.OfferingSoftwareCatalogFactory(
             offering=offering,
-            catalog=self.recent_catalog,
+            catalog=kept,
         )
+        # Same offering also points at the duplicate PK (different catalog_id
+        # until cleanup). That link is dropped with the duplicate row because
+        # migrating it would violate unique_together (offering, catalog).
         marketplace_factories.OfferingSoftwareCatalogFactory(
             offering=offering,
             catalog=older_duplicate,
@@ -919,9 +1076,9 @@ class CatalogCleanupTasksTest(TestCase):
             1,
         )
         newest_link.refresh_from_db()
-        self.assertEqual(newest_link.catalog_id, self.recent_catalog.pk)
+        self.assertEqual(newest_link.catalog_id, kept.pk)
 
         migrated_link.refresh_from_db()
-        self.assertEqual(migrated_link.catalog_id, self.recent_catalog.pk)
+        self.assertEqual(migrated_link.catalog_id, kept.pk)
 
         self.assertFalse(SoftwareCatalog.objects.filter(pk=older_duplicate.pk).exists())

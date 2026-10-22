@@ -5,10 +5,13 @@ import re
 import threading
 import time
 import uuid as uuid_mod
+from collections.abc import Callable
+from typing import Any
 
 import stomp
 from django.apps import apps
 from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
 from django.core.cache import cache
 from django.db.models import QuerySet
 from rest_framework.exceptions import ValidationError
@@ -483,6 +486,75 @@ def get_scope_types_mapping():
 
 def get_reverse_scope_types_mapping():
     return {m: str(m._meta) for m in get_loggable_models()}
+
+
+# Per-model guards on reading a scope's event feed, registered by apps from
+# their AppConfig.ready(). Being able to read an object does not always mean
+# being able to read the audit trail about it.
+_scope_event_guards: dict[type, Callable[[Any, Any], bool]] = {}
+
+
+def register_scope_event_guard(model: type, guard: Callable[[Any, Any], bool]):
+    """Register ``guard(user, scope) -> bool``; returning ``False`` hides the
+    events logged against ``scope`` from ``user``."""
+    _scope_event_guards[model] = guard
+
+
+def can_view_scope_events(user, scope) -> bool:
+    guard = _scope_event_guards.get(type(scope))
+    return guard is None or guard(user, scope)
+
+
+def has_scope_event_guard(scope) -> bool:
+    """Whether ``scope`` restricts who reads its events. Such a scope's events
+    must not also be filed on a wider feed (its organization's, say), whose
+    readers the guard would never be asked about."""
+    return type(scope) in _scope_event_guards
+
+
+# Per-event-type guards, registered by apps from their AppConfig.ready().
+# Reading a feed does not always mean reading every event on it: an event may
+# tell something its readers are only to learn later. Each guard names, for a
+# user, the scopes whose events of its type that user may not read -- one rule,
+# from which both the listings (in SQL) and hook delivery (per event) derive.
+_event_type_guards: dict[str, Callable[[Any], QuerySet | None]] = {}
+
+
+def register_event_type_guard(
+    event_type: str, hidden_scopes: Callable[[Any], QuerySet | None]
+):
+    """Register ``hidden_scopes(user) -> QuerySet | None``: events of
+    ``event_type`` filed on any of the returned scopes are hidden from
+    ``user``; ``None`` hides none of them."""
+    _event_type_guards[event_type] = hidden_scopes
+
+
+def _hidden_feeds(user, event_type: str):
+    guard = _event_type_guards.get(event_type)
+    scopes = guard(user) if guard else None
+    if scopes is None:
+        return None
+    return models.Feed.objects.filter(
+        content_type=ContentType.objects.get_for_model(scopes.model),
+        object_id__in=scopes.values("pk"),
+    )
+
+
+def can_view_event(user, event) -> bool:
+    feeds = _hidden_feeds(user, event.event_type)
+    return feeds is None or not feeds.filter(event=event).exists()
+
+
+def exclude_hidden_events(user, queryset: QuerySet) -> QuerySet:
+    """Leave out of an event queryset what the event-type guards hide from
+    ``user``."""
+    for event_type in _event_type_guards:
+        feeds = _hidden_feeds(user, event_type)
+        if feeds is not None:
+            queryset = queryset.exclude(
+                pk__in=feeds.filter(event__event_type=event_type).values("event_id")
+            )
+    return queryset
 
 
 def delete_stale_subscriptions(

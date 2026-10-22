@@ -67,6 +67,9 @@ _CALL_REFERENCE_CODE = "reference_code"
 # import must not either. State restarts at requested on the new portal.
 _REQUESTED_OFFERING_EXCLUDED = frozenset({"state", "require_purchase_order"})
 
+# A round's lifecycle after its cut-off is what happened to it on this portal.
+_ROUND_EXCLUDED = frozenset(models.Round.LIFECYCLE_FIELDS)
+
 _ONE_TO_ONE_CONFIGS = {
     "field_configs": (
         ("proposal_field_config", models.CallProposalFieldConfig),
@@ -117,6 +120,16 @@ def _role_ref(role):
     if not role:
         return None
     return {"name": role.name}
+
+
+def _dump_rule(rule):
+    return {
+        **_dump(rule),
+        "notified_proposal_roles": [
+            _role_ref(role)
+            for role in sorted(rule.notified_proposal_roles.all(), key=lambda r: r.name)
+        ],
+    }
 
 
 def _export_document(document, warnings):
@@ -178,7 +191,10 @@ def export_call(call, sections=None):
         ]
 
     if sections["rounds"]:
-        data["rounds"] = [_dump(r) for r in call.round_set.order_by("start_time", "id")]
+        data["rounds"] = [
+            _dump(r, _ROUND_EXCLUDED)
+            for r in call.round_set.order_by("start_time", "id")
+        ]
 
     if sections["offerings"]:
         data["requested_offerings"] = [
@@ -212,7 +228,7 @@ def export_call(call, sections=None):
             {
                 **_dump(step),
                 "checklist": _checklist_ref(step.checklist),
-                "notification_rules": [_dump(r) for r in step.ordered_rules],
+                "notification_rules": [_dump_rule(r) for r in step.ordered_rules],
                 "criteria": [_dump(c) for c in step.ordered_criteria],
             }
             for step in call.workflow_steps.select_related("checklist")
@@ -221,7 +237,7 @@ def export_call(call, sections=None):
                     "notification_rules",
                     queryset=models.CallWorkflowStepNotificationRule.objects.order_by(
                         "trigger", "recipient", "id"
-                    ),
+                    ).prefetch_related("notified_proposal_roles"),
                     to_attr="ordered_rules",
                 ),
                 Prefetch(
@@ -519,7 +535,9 @@ class _Importer:
         created = []
         for index, values in enumerate(self._list(self.data["rounds"], "rounds")):
             context = f"rounds[{index}]"
-            round_obj = self._assign(models.Round(call=call), values, context)
+            round_obj = self._assign(
+                models.Round(call=call), values, context, _ROUND_EXCLUDED
+            )
             self._validate(round_obj, context)
             # The rules ProtectedRoundSerializer applies to a round created
             # through the API.
@@ -614,6 +632,22 @@ class _Importer:
                 )
                 self._validate(rule, r_context)
                 rule.save()
+                roles = []
+                for role_index, ref in enumerate(
+                    self._list(
+                        rule_values.get("notified_proposal_roles"),
+                        f"{r_context}.notified_proposal_roles",
+                    )
+                ):
+                    role = self._role(
+                        ref,
+                        models.Proposal,
+                        "Proposal",
+                        f"{r_context}.notified_proposal_roles[{role_index}]",
+                    )
+                    if role:
+                        roles.append(role)
+                rule.notified_proposal_roles.set(roles)
 
             step.criteria.all().delete()
             criteria = self._list(values.get("criteria"), f"{context}.criteria")
@@ -647,6 +681,8 @@ class _Importer:
         self.mark_imported(section, count)
 
     def _import_role_mappings(self, call):
+        # The document's mappings replace the defaults the call was seeded with.
+        call.proposalprojectrolemapping_set.all().delete()
         count = 0
         for index, values in enumerate(
             self._list(self.data["role_mappings"], "role_mappings")
@@ -688,6 +724,7 @@ _NESTED_KEYS = frozenset(
         "resource_templates",
         "checklist",
         "notification_rules",
+        "notified_proposal_roles",
         "criteria",
         _CALL_REFERENCE_CODE,
     }

@@ -9,11 +9,13 @@ from django.utils import timezone
 from waldur_core.core.middleware import get_skip_side_effects
 from waldur_core.core.models import User
 from waldur_core.logging import event_logger
+from waldur_core.logging import utils as logging_utils
 from waldur_core.logging.enums import EventType
 from waldur_core.logging.middleware import get_event_context
 from waldur_core.permissions.models import Role, UserRole
 from waldur_core.permissions.utils import (
     build_org_role_name,
+    describe_role_event,
     ensure_unique_role_name,
     get_active_roles,
     get_role_customers,
@@ -269,11 +271,28 @@ def log(
         if is_quiet_grant_source(source):
             event_context["suppress_email"] = True
 
+    details = describe_role_event(instance)
+    if details:
+        event_context.update(details.context)
+        if details.role_label:
+            event_context["role_description"] = details.role_label
+            message = message.replace("{role_name}", "{role_description}")
+        if details.scope_note:
+            # The note is fixed text, but the message is formatted against
+            # the context, so any braces in it must not act as placeholders.
+            note = details.scope_note.replace("{", "{{").replace("}", "}}")
+            message = message.replace("{scope_name}", "{scope_name} " + note, 1)
+
+    # A scope that guards its event feed keeps its team changes off the
+    # organization's feed, whose readers the guard is never asked about.
+    scopes = [instance.scope]
+    if not logging_utils.has_scope_event_guard(instance.scope):
+        scopes.append(customer)
     event_logger.emit(
         message,
         event_type=event_type,
         event_context=event_context,
-        scopes=[instance.scope, customer],
+        scopes=scopes,
     )
 
 

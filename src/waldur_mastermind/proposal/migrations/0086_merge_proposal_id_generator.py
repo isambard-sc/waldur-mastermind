@@ -4,7 +4,6 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("proposal", "0081_proposal_id_generator"),
         ("proposal", "0085_proposal_submitted_at"),
