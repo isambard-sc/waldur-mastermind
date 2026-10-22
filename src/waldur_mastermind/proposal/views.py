@@ -1,4 +1,5 @@
 import logging
+import re
 import secrets
 import uuid
 import uuid as uuid_module
@@ -53,6 +54,10 @@ from waldur_core.core.views import (
 )
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
+from waldur_core.media import models as media_models
+from waldur_core.media import views as media_views
+from waldur_core.permissions import models as permissions_models
+from waldur_core.permissions import serializers as permissions_serializers
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CallRole, ProposalRole
@@ -166,13 +171,13 @@ class FormbricksRedirectTokenAuthentication(rf_authentication.BaseAuthentication
             return None
 
         resolver_match = getattr(request, "resolver_match", None)
-        proposal_uuid = (
-            (resolver_match.kwargs or {}).get("uuid") if resolver_match else None
-        )
+        proposal_uuid = (resolver_match.kwargs or {}).get("uuid") if resolver_match else None
 
         user_pk = formbricks_client.verify_redirect_token(token, proposal_uuid)
         if user_pk is None:
-            raise exceptions.AuthenticationFailed("Invalid or expired redirect token.")
+            raise exceptions.AuthenticationFailed(
+                "Invalid or expired redirect token."
+            )
 
         try:
             user = User.objects.get(pk=user_pk, is_active=True)
@@ -180,22 +185,6 @@ class FormbricksRedirectTokenAuthentication(rf_authentication.BaseAuthentication
             raise exceptions.AuthenticationFailed("Invalid redirect token.")
 
         return (user, None)
-
-
-def _validate_adjustment_window(proposal):
-    """Resource adjustments are scoped to the award decision point, not the
-    whole review window: a proposal has no active workflow step while
-    SUBMITTED (steps only activate once evaluation starts), and the only
-    step whose responsible_role is call_manager is allocation_decision.
-    """
-    if (
-        proposal.state != ProposalStates.IN_REVIEW
-        or proposal.workflow_step != "allocation_decision"
-    ):
-        raise IncorrectStateException(
-            "Resource adjustments can only be made while the proposal is in "
-            "review at its allocation decision step."
-        )
 
 
 def validate_round_is_open(proposal):
@@ -3613,164 +3602,6 @@ class ProposalViewSet(
     )
 
     @extend_schema(
-        methods=["get"],
-        operation_id="proposal_proposals_resource_adjustments_list",
-        request=None,
-        responses=serializers.ProposalResourceAdjustmentSerializer(many=True),
-        description="List resource adjustments for a proposal.",
-        filters=False,
-    )
-    @extend_schema(
-        methods=["post"],
-        operation_id="proposal_proposals_resource_adjustments_create",
-        request=serializers.ProposalResourceAdjustmentSerializer,
-        responses=serializers.ProposalResourceAdjustmentSerializer,
-        description="Create a resource adjustment for a proposal.",
-    )
-    @decorators.action(detail=True, methods=["get", "post"])
-    def resource_adjustments(self, request, uuid=None):
-        proposal = cast(models.Proposal, self.get_object())
-        if request.method == "GET":
-            adjustments = proposal.resource_adjustments.all()
-            serializer = self.get_serializer(
-                adjustments, context=self.get_serializer_context(), many=True
-            )
-            return response.Response(serializer.data, status=status.HTTP_200_OK)
-
-        _validate_adjustment_window(proposal)
-        context = self.get_serializer_context()
-        context["proposal"] = proposal
-        serializer = self.get_serializer(context=context, data=request.data)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return response.Response(serializer.data, status=status.HTTP_201_CREATED)
-
-    resource_adjustments_serializer_class = (
-        serializers.ProposalResourceAdjustmentSerializer
-    )
-    resource_adjustments_permissions = [
-        proposal_permissions.can_manage_resource_adjustments
-    ]
-
-    @extend_schema(
-        responses={status.HTTP_200_OK: serializers.ProposalResourceAdjustmentSerializer}
-    )
-    def resource_adjustment_detail(self, request, uuid=None, obj_uuid=None):
-        proposal = cast(models.Proposal, self.get_object())
-        try:
-            adjustment = proposal.resource_adjustments.get(uuid=obj_uuid)
-        except models.ProposalResourceAdjustment.DoesNotExist:
-            return response.Response(status=status.HTTP_404_NOT_FOUND)
-
-        if request.method == "GET":
-            serializer = self.get_serializer(
-                adjustment, context=self.get_serializer_context()
-            )
-            return response.Response(serializer.data, status=status.HTTP_200_OK)
-
-        _validate_adjustment_window(proposal)
-        if request.method == "DELETE":
-            adjustment.delete()
-            return response.Response(status=status.HTTP_204_NO_CONTENT)
-
-        context = self.get_serializer_context()
-        context["proposal"] = proposal
-        serializer = self.get_serializer(
-            adjustment,
-            context=context,
-            data=request.data,
-            partial=(request.method == "PATCH"),
-        )
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
-        return response.Response(serializer.data, status=status.HTTP_200_OK)
-
-    resource_adjustment_detail_serializer_class = (
-        serializers.ProposalResourceAdjustmentSerializer
-    )
-    resource_adjustment_detail_permissions = [
-        proposal_permissions.can_manage_resource_adjustments
-    ]
-
-    @extend_schema(
-        description="Get effective resource allocation for a proposal (after adjustments).",
-        request=None,
-        responses=serializers.EffectiveAllocationItemSerializer(many=True),
-    )
-    @decorators.action(detail=True, methods=["get"])
-    def effective_allocation(self, request, uuid=None):
-        proposal = cast(models.Proposal, self.get_object())
-        result = []
-        for requested_resource in proposal.requestedresource_set.all():
-            adjustment = models.effective_adjustment(requested_resource)
-            is_removed = bool(
-                adjustment
-                and adjustment.action
-                == models.ProposalResourceAdjustment.Actions.REMOVE
-            )
-            has_modifications = bool(
-                adjustment
-                and adjustment.action
-                == models.ProposalResourceAdjustment.Actions.MODIFY
-            )
-            result.append(
-                {
-                    "requested_resource_uuid": requested_resource.uuid,
-                    "requested_resource_name": str(
-                        requested_resource.requested_offering.offering.name
-                    ),
-                    "offering_uuid": requested_resource.requested_offering.offering.uuid,
-                    "offering_name": requested_resource.requested_offering.offering.name,
-                    "original_attributes": requested_resource.attributes,
-                    "original_limits": requested_resource.limits,
-                    "effective_attributes": adjustment.get_effective_attributes()
-                    if has_modifications
-                    else dict(requested_resource.attributes),
-                    "effective_limits": adjustment.get_effective_limits()
-                    if has_modifications
-                    else dict(requested_resource.limits),
-                    "is_removed": is_removed,
-                    "is_added": False,
-                    "has_modifications": has_modifications,
-                    "adjustment": serializers.ProposalResourceAdjustmentSerializer(
-                        adjustment, context=self.get_serializer_context()
-                    ).data
-                    if adjustment
-                    else None,
-                }
-            )
-
-        for adjustment in proposal.resource_adjustments.filter(
-            action=models.ProposalResourceAdjustment.Actions.ADD
-        ):
-            result.append(
-                {
-                    "requested_resource_uuid": None,
-                    "requested_resource_name": None,
-                    "offering_uuid": adjustment.call_offering.offering.uuid,
-                    "offering_name": adjustment.call_offering.offering.name,
-                    "original_attributes": {},
-                    "original_limits": {},
-                    "effective_attributes": adjustment.get_effective_attributes(),
-                    "effective_limits": adjustment.get_effective_limits(),
-                    "is_removed": False,
-                    "is_added": True,
-                    "has_modifications": False,
-                    "adjustment": serializers.ProposalResourceAdjustmentSerializer(
-                        adjustment, context=self.get_serializer_context()
-                    ).data,
-                }
-            )
-        return response.Response(result, status=status.HTTP_200_OK)
-
-    effective_allocation_serializer_class = (
-        serializers.EffectiveAllocationItemSerializer
-    )
-    effective_allocation_permissions = [
-        proposal_permissions.can_manage_resource_adjustments
-    ]
-
-    @extend_schema(
         description="Attach document to proposal.",
         request=serializers.ProposalDocumentationSerializer,
         responses=None,
@@ -4226,7 +4057,9 @@ class ProposalViewSet(
         request=serializers.StartFormbricksFlowSerializer,
         responses={status.HTTP_201_CREATED: None},
     )
-    @decorators.action(detail=False, methods=["post"], url_path="start-formbricks-flow")
+    @decorators.action(
+        detail=False, methods=["post"], url_path="start-formbricks-flow"
+    )
     def start_formbricks_flow(self, request):
         serializer = serializers.StartFormbricksFlowSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -4252,7 +4085,9 @@ class ProposalViewSet(
             created_by=request.user,
             state=ProposalStates.DRAFT,
         )
-        proposal.add_user(request.user, ProposalRole.MANAGER, created_by=request.user)
+        proposal.add_user(
+            request.user, ProposalRole.MANAGER, created_by=request.user
+        )
 
         first_step = flow[0]
         redirect_url = formbricks_client.build_survey_url(
@@ -4401,7 +4236,9 @@ class ProposalViewSet(
             ),
         ],
     )
-    @decorators.action(detail=True, methods=["get"], url_path="formbricks-edit-link")
+    @decorators.action(
+        detail=True, methods=["get"], url_path="formbricks-edit-link"
+    )
     def formbricks_edit_link(self, request, uuid=None):
         proposal = self.get_object()
         if proposal.state != ProposalStates.DRAFT:
@@ -4801,11 +4638,7 @@ class FormbricksWebhookViewSet(viewsets.ViewSet):
 
         try:
             proposal = models.Proposal.objects.get(uuid=proposal_uuid)
-        except (
-            models.Proposal.DoesNotExist,
-            ValueError,
-            django_exceptions.ValidationError,
-        ):
+        except (models.Proposal.DoesNotExist, ValueError, django_exceptions.ValidationError):
             logger.warning(
                 "Formbricks webhook referenced unknown proposal %s", proposal_uuid
             )
