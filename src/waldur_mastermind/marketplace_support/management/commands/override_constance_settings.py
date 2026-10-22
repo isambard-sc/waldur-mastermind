@@ -8,6 +8,7 @@ from django.core.management.base import BaseCommand
 from rest_framework.exceptions import ValidationError
 
 from waldur_core.core import logos
+from waldur_core.core.constance_backend import is_constance_secret
 from waldur_core.core.serializers import ConstanceSettingsSerializer
 
 WHITELABELING_LOGOS = logos.LOGO_MAP.keys()
@@ -139,7 +140,9 @@ class Command(BaseCommand):
             )
 
         for setting_key, setting_value in constance_settings.items():
-            if "password" in setting_key.lower() or "token" in setting_key.lower():
+            # This output lands in container logs. The name heuristic also
+            # hides settings declared before secret_field existed.
+            if is_constance_secret(setting_key, name_heuristic=True):
                 setting_value = "<redacted>"
 
             self.stdout.write(

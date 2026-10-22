@@ -24,7 +24,7 @@ from waldur_core.checklist import models as checklist_models
 from waldur_core.core import models as core_models
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
 from waldur_core.permissions.mixins import PermissionMixin
-from waldur_core.permissions.models import Role
+from waldur_core.permissions.models import Role, UserRole
 from waldur_core.permissions.utils import get_users
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace import models as marketplace_models
@@ -59,21 +59,33 @@ from waldur_mastermind.proposal.enums import (
     ProposalStates,
     PublicationVenueTypes,
     RequestedOfferingStates,
+    ResultsPublication,
     ReviewerAffiliationTypes,
     ReviewerBidChoices,
     ReviewerPoolInvitationStatuses,
     ReviewerSuggestionStatuses,
+    RoundLifecycleStates,
     RoundStatuses,
     SuggestionSourceTypes,
+    UndecidedAtRoundCompletion,
 )
 
 from . import managers
 
 logger = logging.getLogger(__name__)
 
+MISSING_PROPOSAL_MANAGER_MESSAGE = _(
+    "A proposal needs at least one proposal manager to be submitted. Grant the "
+    "proposal manager role to one of the team members."
+)
+
 EVALUATION_START_LOCKED_MESSAGE = _(
     "Cannot change when evaluation starts while the call has proposals that "
     "are submitted or in review."
+)
+PUBLISH_RESULTS_LOCKED_MESSAGE = _(
+    "Cannot change when results are published while the call holds decisions "
+    "that have not been published yet."
 )
 
 
@@ -267,7 +279,40 @@ class Call(
         ),
     )
 
+    carry_over_drafts = models.BooleanField(
+        default=True,
+        help_text=(
+            "Whether a draft still open when its round's cut-off passes moves "
+            "on to the call's next round instead of being cancelled. Without a "
+            "later round the draft is cancelled either way."
+        ),
+    )
+
+    publish_results = models.CharField(
+        max_length=20,
+        choices=ResultsPublication.CHOICES,
+        default=ResultsPublication.IMMEDIATELY,
+        help_text=(
+            "When applicants learn the allocation decision: as soon as it is "
+            "made, or for every proposal of a round together when a call "
+            "manager publishes the round's results. Cannot be changed while "
+            "decisions are held."
+        ),
+    )
+
+    undecided_at_round_completion = models.CharField(
+        max_length=20,
+        choices=UndecidedAtRoundCompletion.CHOICES,
+        default=UndecidedAtRoundCompletion.REFUSE,
+        help_text=(
+            "What completing a round does with its proposals that still have "
+            "no decision: refuse to complete the round, or reject them. A "
+            "round may override it."
+        ),
+    )
+
     coi_configuration: "CallCOIConfiguration"
+    round_set: models.Manager["Round"]
 
     objects = managers.CallManager()
     tracker = cast(FieldInstanceTracker, FieldTracker())
@@ -291,6 +336,9 @@ class Call(
     @property
     def customer(self):
         return self.manager.customer
+
+    def has_held_decisions(self):
+        return Proposal.objects.filter(round__call=self, decision_held=True).exists()
 
     def has_proposals_under_evaluation(self):
         return Proposal.objects.filter(
@@ -317,6 +365,12 @@ class Call(
             and self.has_proposals_under_evaluation()
         ):
             raise ValidationError({"evaluation_start": EVALUATION_START_LOCKED_MESSAGE})
+        if (
+            self.pk
+            and self.tracker.has_changed("publish_results")
+            and self.has_held_decisions()
+        ):
+            raise ValidationError({"publish_results": PUBLISH_RESULTS_LOCKED_MESSAGE})
         if self.pk and self.proposal_set.exists():
             if self.tracker.has_changed("compliance_checklist"):
                 raise ValidationError(
@@ -656,6 +710,16 @@ class CallWorkflowStepNotificationRule(
         ),
     )
     is_enabled = models.BooleanField(default=True)
+    notified_proposal_roles = models.ManyToManyField(
+        Role,
+        blank=True,
+        related_name="+",
+        help_text=(
+            "Only for an applicant audience: the proposal roles whose holders "
+            "are notified. Empty notifies the proposal creator and every "
+            "member of the proposal team."
+        ),
+    )
 
     class Meta:
         unique_together = ("workflow_step", "trigger", "recipient")
@@ -892,6 +956,58 @@ class Round(
     call = models.ForeignKey(Call, on_delete=models.PROTECT)
     proposal_set: models.Manager["Proposal"]
 
+    # Stored lifecycle after the cut-off; null until the cut-off is processed.
+    # scheduled/open/ended stay derived from the times (``status``).
+    lifecycle_state = models.CharField(
+        max_length=20,
+        choices=RoundLifecycleStates.CHOICES,
+        null=True,
+        blank=True,
+        editable=False,
+        help_text=(
+            "Where the round stands after its cut-off: evaluating, deciding, "
+            "results_published or closed. Empty before the cut-off."
+        ),
+    )
+    evaluation_started_at = models.DateTimeField(null=True, blank=True, editable=False)
+    deciding_started_at = models.DateTimeField(null=True, blank=True, editable=False)
+    results_published_at = models.DateTimeField(null=True, blank=True, editable=False)
+    results_published_by = models.ForeignKey(
+        core_models.User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        editable=False,
+        related_name="+",
+    )
+    results_forced_reason = models.TextField(
+        blank=True,
+        editable=False,
+        help_text=(
+            "Why results were published while some proposals of the round "
+            "still had no decision."
+        ),
+    )
+    closed_at = models.DateTimeField(null=True, blank=True, editable=False)
+    undecided_at_round_completion = models.CharField(
+        max_length=20,
+        choices=UndecidedAtRoundCompletion.CHOICES,
+        null=True,
+        blank=True,
+        help_text=(
+            "Overrides the call's rule for proposals still without a decision "
+            "when the round is completed. Empty: the call's rule applies."
+        ),
+    )
+    # Adoption of the round's results by the body entitled to (e.g. a board).
+    adopted_at = models.DateField(
+        null=True, blank=True, help_text="When the round's results were adopted."
+    )
+    adoption_note = models.TextField(blank=True)
+    adoption_document = models.FileField(
+        upload_to="proposal_round_adoption", null=True, blank=True
+    )
+
     class Permissions:
         customer_path = "call__manager__customer"
         list_permission = PermissionEnum.LIST_ROUNDS
@@ -914,6 +1030,41 @@ class Round(
             return self.Statuses.ENDED
         else:
             return self.Statuses.OPEN
+
+    # Where the round stands after its cut-off belongs to this round alone: a
+    # duplicated or exported call starts its rounds without it.
+    LIFECYCLE_FIELDS = (
+        "lifecycle_state",
+        "evaluation_started_at",
+        "deciding_started_at",
+        "results_published_at",
+        "results_published_by",
+        "results_forced_reason",
+        "closed_at",
+        "adopted_at",
+        "adoption_note",
+        "adoption_document",
+    )
+
+    def reset_lifecycle(self):
+        for name in self.LIFECYCLE_FIELDS:
+            setattr(self, name, self._meta.get_field(name).get_default())
+
+    @property
+    def undecided_at_completion_rule(self) -> str:
+        """The rule for undecided proposals when the round is completed."""
+        return (
+            self.undecided_at_round_completion
+            or self.call.undecided_at_round_completion
+        )
+
+    @property
+    def withholds_results(self) -> bool:
+        """Whether an allocation decision made now is held for publication."""
+        return (
+            self.call.publish_results == ResultsPublication.WITH_ROUND
+            and self.lifecycle_state not in RoundLifecycleStates.PUBLISHED
+        )
 
     def save(self, *args, **kwargs):
         if not self.slug:
@@ -1042,6 +1193,25 @@ class ProposalIDGenerator(models.Model):
         )
 
 
+def has_proposal_manager_expression():
+    """``Exists`` over a proposal's active proposal manager grants.
+
+    For querysets that serialise ``can_submit`` for many proposals at once;
+    ``Proposal.has_proposal_manager`` reads the annotation when present.
+    """
+    return models.Exists(
+        UserRole.objects.filter(
+            # Matched by natural key rather than a ContentType lookup, so
+            # building the queryset touches no database (schema generation).
+            content_type__app_label="proposal",
+            content_type__model="proposal",
+            object_id=models.OuterRef("pk"),
+            is_active=True,
+            role__name=RoleEnum.PROPOSAL_MANAGER,
+        )
+    )
+
+
 def filter_proposals(user):
     return (
         Q(created_by=user)
@@ -1061,6 +1231,27 @@ def filter_proposals(user):
         # assignment grants none.
         | Q(pk__in=managers.get_reviewed_proposals(user))
     )
+
+
+def names_an_amount(offering, limits) -> bool:
+    """Whether ``limits`` name an amount for something ``offering`` sells by it.
+
+    The requestable components are the ones ``get_limit_components()`` selects
+    -- limit components and one-time components bought by the month -- read off
+    ``offering.components.all()`` so a prefetched list is used as is. An
+    offering with none of them has no amount to name and always passes.
+    Provisioning limits that name nothing creates a resource with no quota.
+    """
+    requestable = [
+        component.type
+        for component in offering.components.all()
+        if component.billing_type == BillingTypes.LIMIT
+        or (component.billing_type == BillingTypes.ONE_TIME and component.is_prepaid)
+    ]
+    if not requestable:
+        return True
+    limits = limits or {}
+    return any(limits.get(component_type) for component_type in requestable)
 
 
 class Proposal(
@@ -1126,6 +1317,15 @@ class Proposal(
         related_name="proposals",
     )
 
+    decision_held = models.BooleanField(
+        default=False,
+        editable=False,
+        help_text=(
+            "The allocation decision is recorded but held until the round's "
+            "results are published; the applicant is not told yet."
+        ),
+    )
+
     # Workflow tracking
     workflow_step = models.CharField(
         max_length=64,
@@ -1134,12 +1334,24 @@ class Proposal(
         default=None,
         help_text="Current active workflow step for this proposal.",
     )
+    awarded_resources_prefilled_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        editable=False,
+        help_text=(
+            "When the awarded resources were first copied from the request. "
+            "Set once: an award the call manager emptied stays empty rather "
+            "than being refilled from the request."
+        ),
+    )
 
     # Note: checklist_completions relationship is automatically available via ChecklistCompletion.scope
 
     tracker = cast(FieldInstanceTracker, FieldTracker())
     requestedresource_set: models.Manager["RequestedResource"]
+    awarded_resources: models.Manager["AwardedResource"]
     review_set: models.Manager["Review"]
+    workflow_step_instances: models.Manager["ProposalWorkflowStepInstance"]
 
     class Permissions:
         customer_path = "round__call__manager__customer"
@@ -1219,26 +1431,45 @@ class Proposal(
         Offerings with nothing to ask for (no limit or prepaid component) are
         exempt: there is no amount to name in the first place.
         """
-        missing = set()
-        for requested_resource in self.requestedresource_set.all():
-            offering = requested_resource.requested_offering.offering
-            # The same components get_limit_components() selects, read off the
-            # prefetched list instead of querying per offering.
-            requestable = [
-                component.type
-                for component in offering.components.all()
-                if component.billing_type == BillingTypes.LIMIT
-                or (
-                    component.billing_type == BillingTypes.ONE_TIME
-                    and component.is_prepaid
+        return sorted(
+            {
+                requested_resource.requested_offering.offering.name
+                for requested_resource in self.requestedresource_set.all()
+                if not names_an_amount(
+                    requested_resource.requested_offering.offering,
+                    requested_resource.limits,
                 )
-            ]
-            if not requestable:
-                continue
-            limits = requested_resource.limits or {}
-            if not any(limits.get(component_type) for component_type in requestable):
-                missing.add(offering.name)
-        return sorted(missing)
+            }
+        )
+
+    def offerings_missing_awarded_amounts(self) -> list[str]:
+        """Offerings the award grants without naming any amount.
+
+        The award's counterpart of :meth:`offerings_missing_requested_amounts`,
+        over the items allocation provisions: those on offerings the provider
+        still accepts. Anything else is skipped at allocation anyway.
+        """
+        return sorted(
+            {
+                awarded.requested_offering.offering.name
+                for awarded in self.awarded_resources.filter(
+                    requested_offering__state=RequestedOfferingStates.ACCEPTED
+                )
+                .select_related("requested_offering__offering")
+                .prefetch_related("requested_offering__offering__components")
+                if not names_an_amount(
+                    awarded.requested_offering.offering, awarded.limits
+                )
+            }
+        )
+
+    def has_proposal_manager(self) -> bool:
+        annotated = getattr(self, "_has_proposal_manager", None)
+        if annotated is not None:
+            return annotated
+        return UserRole.objects.filter(
+            scope=self, is_active=True, role__name=RoleEnum.PROPOSAL_MANAGER
+        ).exists()
 
     def can_submit(self):
         """Whether the proposal may leave draft, and why not when it may not.
@@ -1261,6 +1492,9 @@ class Proposal(
                 "A purchase order is required for the following offerings: "
                 "%(offerings)s."
             ) % {"offerings": ", ".join(missing_orders)}
+
+        if not self.has_proposal_manager():
+            return False, MISSING_PROPOSAL_MANAGER_MESSAGE
 
         return True, None
 
@@ -1405,6 +1639,9 @@ class RequestedResource(
     )
     proposal = models.ForeignKey(Proposal, on_delete=models.CASCADE)
 
+    requested_offering_id: int
+    awarded_resources: models.Manager["AwardedResource"]
+
     @property
     def purchase_order_required(self) -> bool:
         return self.requested_offering.require_purchase_order
@@ -1418,6 +1655,91 @@ class RequestedResource(
         group for no gain.
         """
         return bool(self.attachment) or bool(self.purchase_order_reference)
+
+
+class AwardedResource(
+    core_models.UuidMixin,
+    TimeStampedModel,
+    core_models.DescribableMixin,
+):
+    """What the allocation decision grants, which may differ from the request.
+
+    Prefilled from the proposal's requested resources when the allocation
+    decision starts, then edited by the call manager while that step is
+    active: amounts changed, an item moved to another accepted offering of the
+    call, items added or removed. Allocation provisions these rows; the
+    requested resources stay as the applicant submitted them.
+    """
+
+    class Meta:
+        ordering = ["created", "id"]
+
+    class Permissions:
+        project_path = "proposal__project"
+
+    proposal = models.ForeignKey(
+        Proposal, on_delete=models.CASCADE, related_name="awarded_resources"
+    )
+    requested_resource = models.ForeignKey(
+        RequestedResource,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="awarded_resources",
+        help_text=(
+            "The request this item was prefilled from; empty for an item the "
+            "call manager added."
+        ),
+    )
+    requested_offering = models.ForeignKey(
+        RequestedOffering,
+        related_name="+",
+        on_delete=models.PROTECT,
+        help_text="The call's offering the item is awarded on.",
+    )
+    plan = models.ForeignKey(
+        marketplace_models.Plan,
+        related_name="+",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        help_text=(
+            "The plan the call manager chose for the item. Empty for an item "
+            "that follows the plan of the call offering it is awarded on."
+        ),
+    )
+    attributes = models.JSONField(blank=True, default=dict)
+    limits = models.JSONField(blank=True, default=dict)
+    created_by = models.ForeignKey(
+        core_models.User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    resource = models.ForeignKey(
+        marketplace_models.Resource,
+        related_name="+",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        help_text="The resource allocation provisioned for this item.",
+    )
+
+    requested_offering_id: int
+
+    @property
+    def effective_plan(self) -> marketplace_models.Plan | None:
+        """The plan allocation provisions the item on.
+
+        The one the call manager chose, or else the call offering's plan as it
+        is at the time of asking -- so an item nobody changed the plan of
+        provisions on the call's plan at allocation, as a request always has.
+        """
+        return self.plan or self.requested_offering.plan
+
+    def __str__(self):
+        return f"{self.proposal.name} - {self.requested_offering.offering.name}"
 
 
 class ProposalWorkflowStepInstance(

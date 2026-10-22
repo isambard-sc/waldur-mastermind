@@ -1,3 +1,6 @@
+# PROJECT.SET_SLUG and RESOURCE.SET_SLUG are deliberately granted to no role
+# here, so only staff can set slugs out of the box. Grant them per deployment
+# with add_permissions in permissions-override.yaml.
 - role: CUSTOMER.OWNER
   description: Organization owner
   scope: customer
@@ -128,6 +131,7 @@
   scope: service_provider
   description: Service provider manager
   permissions:
+    - RESOURCE.SET_USAGE
     - RESOURCE.SET_END_DATE
     - RESOURCE.SET_BACKEND_ID
     - RESOURCE.SET_BACKEND_METADATA
@@ -170,6 +174,9 @@
     - OFFERING.CREATE_USER
     - OFFERING.UPDATE_USER
     - OFFERING.DELETE_USER
+    - ORDER.LIST
+    - ORDER.APPROVE
+    - ORDER.REJECT
     - POSIX_ID_POOL.MANAGE
     - OFFERINGUSER.UPDATE_RESTRICTION
     - RESOURCE.CONSUMPTION_LIMITATION
@@ -334,6 +341,15 @@
   scope: proposal
   permissions:
     - PROPOSAL.MANAGE
+    - PROPOSAL.UPDATE
+    - PROPOSAL.UPDATE_PERMISSION
+    - PROPOSAL.DELETE_PERMISSION
+
+- role: PROPOSAL.ADMIN
+  description: Proposal administrator
+  scope: proposal
+  permissions:
+    - PROPOSAL.UPDATE
 
 - role: PROPOSAL.MEMBER
   description: Proposal member
@@ -354,6 +370,11 @@
   scope: customer
   permissions:
     - CUSTOMER.VIEW_TEAM
+    - CUSTOMER.LIST_USERS
+    - PROJECT.LIST
+    - RESOURCE.LIST
+    - ORDER.LIST
+    - INVITATION.LIST
 
 - role: CUSTOMER.CALL_ORGANIZER
   scope: call_organizer

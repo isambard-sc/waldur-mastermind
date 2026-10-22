@@ -57,6 +57,9 @@ class CustomerSection(FeatureSection):
     show_project_digest = Feature(
         "Enable display of project digest configuration in organization settings."
     )
+    show_organisation_reporting = Feature(
+        "Show the Reporting menu with organisation-scoped reports to organisation owners."
+    )
 
     show_openportal_remote_projects = Feature(
         "Allows to show OpenPortal Remote Projects (remotes) in an organization."
@@ -120,6 +123,11 @@ class ProjectSection(FeatureSection):
     show_matrix_chat = Feature(
         "Render the project Matrix chat UI. Backend access is gated "
         "separately on the MATRIX_ENABLED Constance setting."
+    )
+
+    show_custom_metrics = Feature(
+        "Show custom metrics: the project Metrics tab and the offering metrics "
+        "a provider adopts."
     )
 
 
@@ -228,18 +236,28 @@ class MarketplaceSection(FeatureSection):
     )
 
     show_call_management_functionality = Feature(
-        "Enabled display of call management functionality."
+        "Show call management: the call-managing organization's workspace, "
+        "providers' requests for offerings, and proposal reports. Independent "
+        "of SERVICE_ACCESS_MODE, which governs how applicants reach services."
     )
 
     lexis_links = Feature("Enabled LEXIS link integrations for offerings.")
 
-    catalogue_only = Feature("Allow marketplace to function as a catalogue only.")
+    catalogue_only = Feature(
+        "Run the marketplace as a catalogue: offerings can be browsed but not "
+        "ordered, order lists and pricing are hidden, and anonymous visitors "
+        "land on the marketplace instead of the login page."
+    )
 
     conceal_offering_pricing_tab_in_public_view = Feature(
         "Conceal offering pricing tab in the offering's public view."
     )
 
-    call_only = Feature("Allow marketplace to serve only as aggregator of call info.")
+    call_only = Feature(
+        "List calls that are run outside Waldur: each call links to an external "
+        "URL where applications are made, and rounds, proposals and reviews "
+        "are hidden."
+    )
 
     show_resource_end_date = Feature(
         "Show resource end date as a non optional column in resources list."
@@ -319,6 +337,12 @@ class DashboardSection(FeatureSection):
     usage_period_over_period = Feature(
         "Show usage for the current period overlaid on the previous one, "
         "per offering component."
+    )
+
+    usage_include_terminated = Feature(
+        "Let usage charts include terminated resources: an organization "
+        "dashboard switch, and a removed project's own usage. While off, the "
+        "usage endpoints ignore include_terminated."
     )
 
     spend_forecast = Feature(

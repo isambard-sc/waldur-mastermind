@@ -2,12 +2,14 @@ import datetime
 import logging
 import uuid
 from collections import Counter
+from collections.abc import Callable
 from typing import cast
 
 from constance import config
 from dateutil.relativedelta import relativedelta
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -15,9 +17,12 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core.fields import StringUUID
 from waldur_core.core.models import NAME_LENGTH
 from waldur_core.core.utils import get_system_robot
+from waldur_core.logging import event_logger
+from waldur_core.logging.enums import EventType
 from waldur_core.permissions.enums import RoleEnum
 from waldur_core.permissions.utils import get_users
 from waldur_core.structure import models as structure_models
+from waldur_core.structure.permissions import _get_customer
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import permissions as marketplace_permissions
 from waldur_mastermind.marketplace import utils as marketplace_utils
@@ -32,21 +37,25 @@ from waldur_mastermind.proposal.enums import (
     CallStates,
     OrderAuthors,
     ProposalDisclosureLevels,
+    ProposalStates,
     RequestedOfferingStates,
+    RoundLifecycleStates,
 )
 
 logger = logging.getLogger(__name__)
 
 
 def requested_months(
-    requested_resource: proposal_models.RequestedResource,
+    requested_resource: proposal_models.RequestedResource
+    | proposal_models.AwardedResource,
 ) -> int | None:
-    """How many whole months the request asks for, or None when it names none.
+    """How many whole months the request (or award) asks for, or None.
 
     The length is the contract. ``attributes.end_date`` is the older form of the
     same answer, kept for requests written before the form asked for months, and
     measured from the day that request was created because that is the day its
-    date was computed from.
+    date was computed from. An award prefilled from such a request carries its
+    date along, so it is measured from the request's creation too.
     """
     attributes = requested_resource.attributes or {}
 
@@ -82,11 +91,26 @@ def requested_months(
         return None
 
     return core_utils.calculate_duration_months(
-        requested_resource.created.date(), requested_end
+        _length_anchor(requested_resource), requested_end
     )
 
 
-def _is_prepaid(requested_resource: proposal_models.RequestedResource) -> bool:
+def _length_anchor(
+    item: proposal_models.RequestedResource | proposal_models.AwardedResource,
+) -> datetime.date:
+    """The day a legacy ``end_date`` was computed from."""
+    if (
+        isinstance(item, proposal_models.AwardedResource)
+        and item.requested_resource is not None
+    ):
+        return item.requested_resource.created.date()
+    return item.created.date()
+
+
+def _is_prepaid(
+    requested_resource: proposal_models.RequestedResource
+    | proposal_models.AwardedResource,
+) -> bool:
     """Whether this request buys a subscription at all.
 
     The stored length means nothing on an offering with no prepaid component —
@@ -114,6 +138,29 @@ def get_proposal_duration_months(proposal: proposal_models.Proposal) -> int | No
         and (months := requested_months(requested_resource)) is not None
     ]
     return max(lengths) if lengths else None
+
+
+def get_awarded_duration_months(proposal: proposal_models.Proposal) -> int | None:
+    """The longest subscription the proposal is awarded, in whole months.
+
+    The counterpart of :func:`get_proposal_duration_months` for the award, which
+    is what allocation provisions; None when nothing awarded is a subscription.
+    """
+    lengths = [
+        months
+        for awarded in proposal.awarded_resources.filter(
+            requested_offering__state=RequestedOfferingStates.ACCEPTED
+        ).select_related("requested_offering__offering", "requested_resource")
+        if _is_prepaid(awarded) and (months := requested_months(awarded)) is not None
+    ]
+    return max(lengths) if lengths else None
+
+
+def _duration_months_to_provision(proposal: proposal_models.Proposal) -> int | None:
+    """The award's longest subscription once there is one, else the request's."""
+    if proposal.awarded_resources_prefilled_at is not None:
+        return get_awarded_duration_months(proposal)
+    return get_proposal_duration_months(proposal)
 
 
 def allocation_start_date(
@@ -180,7 +227,7 @@ def project_end_date(
     if fixed_days:
         return start_date + datetime.timedelta(days=fixed_days)
 
-    months = get_proposal_duration_months(proposal)
+    months = _duration_months_to_provision(proposal)
     if months is not None:
         return start_date + relativedelta(months=months)
 
@@ -254,7 +301,8 @@ def _allocated_resource_name(
 
 
 def _requested_end_date(
-    requested_resource: proposal_models.RequestedResource,
+    requested_resource: proposal_models.RequestedResource
+    | proposal_models.AwardedResource,
     project: structure_models.Project,
     today: datetime.date,
 ) -> datetime.date | None:
@@ -404,6 +452,75 @@ def _first_reachable_holder(scope, role_name):
     return get_users(scope, role_name).exclude(email="").order_by("id").first()
 
 
+def prefill_awarded_resources(proposal: proposal_models.Proposal) -> None:
+    """Start the award as a copy of the request, once per proposal.
+
+    Each requested resource becomes an awarded item on the same call offering,
+    with its limits, attributes and description, in the order the requests
+    were made -- which is the order allocation numbers repeated offerings in.
+    The plan is not copied: an item follows the call offering's plan, whatever
+    it is at allocation, until the call manager picks another (see
+    ``AwardedResource.effective_plan``). Items on offerings the provider has
+    not accepted are copied too: the call manager may move them to one that
+    is, and allocation skips whatever is left on them, exactly as it skips
+    such requests.
+
+    Idempotent, and only ever once: ``awarded_resources_prefilled_at`` records
+    that the award exists, so an award the call manager emptied is not refilled
+    from the request. The proposal row is locked while this runs so that two
+    callers cannot both copy the request.
+    """
+    if proposal.awarded_resources_prefilled_at is not None:
+        return
+    with transaction.atomic():
+        locked = proposal_models.Proposal.objects.select_for_update().get(
+            pk=proposal.pk
+        )
+        if locked.awarded_resources_prefilled_at is not None:
+            proposal.awarded_resources_prefilled_at = (
+                locked.awarded_resources_prefilled_at
+            )
+            return
+        requested_resources = proposal.requestedresource_set.select_related(
+            "requested_offering"
+        ).order_by("created", "id")
+        proposal_models.AwardedResource.objects.bulk_create(
+            [
+                proposal_models.AwardedResource(
+                    proposal=proposal,
+                    requested_resource=requested,
+                    requested_offering=requested.requested_offering,
+                    attributes=requested.attributes,
+                    limits=requested.limits,
+                    description=requested.description,
+                )
+                for requested in requested_resources
+            ]
+        )
+        proposal.awarded_resources_prefilled_at = timezone.now()
+        proposal_models.Proposal.objects.filter(pk=proposal.pk).update(
+            awarded_resources_prefilled_at=proposal.awarded_resources_prefilled_at
+        )
+
+
+def _purchase_order_source(
+    awarded: proposal_models.AwardedResource,
+) -> proposal_models.RequestedResource | None:
+    """The request whose purchase order the awarded item's order carries.
+
+    A purchase order authorises one provider's offering. It follows an item
+    that stayed on the offering it was requested for, and is left behind when
+    the call manager moves the item elsewhere or adds it: the other provider's
+    own purchase-order gate then applies to the order.
+    """
+    requested = awarded.requested_resource
+    if requested is None:
+        return None
+    if requested.requested_offering_id != awarded.requested_offering_id:
+        return None
+    return requested
+
+
 def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
     # Idempotency guard: a proposal is provisioned exactly once. Without this a
     # second allocation (e.g. re-driving the workflow, or a stale caller) would
@@ -417,6 +534,11 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
             proposal.project,
         )
         return
+    # What is provisioned is the award. A proposal that reaches allocation
+    # without one -- its decision predates awards, or the step was never
+    # activated through the workflow -- gets one copied from its request now,
+    # which provisions exactly what was requested.
+    prefill_awarded_resources(proposal)
     proposal_round = proposal.round
     name = proposal.name
     start_date = None
@@ -470,9 +592,9 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
             "Project %s ends on %s, derived from %s.",
             project,
             end_date,
-            "the longest requested subscription"
-            if get_proposal_duration_months(proposal) is not None
-            else "the call's fixed duration",
+            "the call's fixed duration"
+            if proposal_round.call.fixed_duration_in_days
+            else "the longest awarded subscription",
         )
 
     proposal.project = project
@@ -480,17 +602,24 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
         proposal.approved_by = approved_by
     proposal.save()
 
-    # Oldest first, so repeated offerings are numbered in the order requested.
-    requested_resources = list(
-        proposal.requestedresource_set.filter(
+    # Oldest first, so repeated offerings are numbered in the order requested:
+    # the prefill copies the request in that order, and items the call manager
+    # added come after it.
+    awarded_resources = list(
+        proposal.awarded_resources.filter(
             requested_offering__state=RequestedOfferingStates.ACCEPTED
         )
-        .select_related("requested_offering__offering")
+        .select_related(
+            "requested_offering__offering",
+            "requested_offering__plan",
+            "requested_resource",
+            "plan",
+        )
         .order_by("created", "id")
     )
     # Model instances hash and compare by primary key.
     offering_counts = Counter(
-        requested.requested_offering.offering for requested in requested_resources
+        awarded.requested_offering.offering for awarded in awarded_resources
     )
     offering_seen = Counter()
 
@@ -511,17 +640,17 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
     # Proposal.approved_by.
     consumer_reviewer = approved_by or get_system_robot()
 
-    for requested_resource in requested_resources:
-        offering = requested_resource.requested_offering.offering
+    for awarded in awarded_resources:
+        offering = awarded.requested_offering.offering
         offering_seen[offering] += 1
         index = offering_seen[offering] if offering_counts[offering] > 1 else None
         with transaction.atomic():
             attrs = dict(
                 project=project,
                 offering=offering,
-                plan=requested_resource.requested_offering.plan,
-                attributes=requested_resource.attributes,
-                limits=requested_resource.limits,
+                plan=awarded.effective_plan,
+                attributes=awarded.attributes,
+                limits=awarded.limits,
             )
             resource = marketplace_models.Resource(
                 **attrs,
@@ -531,7 +660,7 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
             # in the invoice item builder both read this field, so setting it
             # afterwards would price and bill a six-month grant as one month.
             # The marketplace order path sets it in the same order and says so.
-            resource.end_date = _requested_end_date(requested_resource, project, today)
+            resource.end_date = _requested_end_date(awarded, project, today)
             resource.init_cost()
             resource.save()
 
@@ -545,13 +674,14 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
             # marketplace.permissions is already satisfied. Without this the
             # applicant supplies it during the proposal and is asked again the
             # moment the allocation lands.
-            if requested_resource.attachment:
+            purchase_order = _purchase_order_source(awarded)
+            if purchase_order is not None and purchase_order.attachment:
                 # Point at the stored file rather than assigning the FieldFile:
                 # the document is already committed, so this records the same
                 # path without re-uploading a copy.
-                order.attachment.name = requested_resource.attachment.name
-            if requested_resource.purchase_order_reference:
-                order.request_comment = requested_resource.purchase_order_reference
+                order.attachment.name = purchase_order.attachment.name
+            if purchase_order is not None and purchase_order.purchase_order_reference:
+                order.request_comment = purchase_order.purchase_order_reference
             # Record the consumer approval up front rather than leaning on a
             # staff creator to bypass it. Accepting the proposal *is* the
             # consumer-side decision: the granted project belongs to the call's
@@ -571,8 +701,13 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
             order.init_cost()
             order.save()
 
-            requested_resource.resource = resource
-            requested_resource.save()
+            awarded.resource = resource
+            awarded.save(update_fields=["resource", "modified"])
+            # The request keeps pointing at the resource that fulfils it, as it
+            # always has; nothing else on it changes.
+            if awarded.requested_resource is not None:
+                awarded.requested_resource.resource = resource
+                awarded.requested_resource.save(update_fields=["resource", "modified"])
 
             # No second approval here: order.save() above has already fired
             # notify_approvers_when_order_is_created, and that handler owns the
@@ -588,9 +723,99 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
             )
 
 
-def process_closed_round(call_round: proposal_models.Round):
-    """Process a closed round: cancel draft proposals."""
-    from waldur_mastermind.proposal.enums import ProposalStates
+def next_round_for_drafts(
+    call_round: proposal_models.Round,
+) -> proposal_models.Round | None:
+    """The round a draft of ``call_round`` moves on to at its cut-off, if any.
+
+    The earliest round of the same call that has not ended and either starts
+    at or after ``call_round``'s cut-off or is open now. None when the call
+    does not carry drafts over, is not active, or has no such round -- the
+    draft is then cancelled.
+    """
+    call = call_round.call
+    if not call.carry_over_drafts or call.state != CallStates.ACTIVE:
+        return None
+    now = timezone.now()
+    return (
+        call.round_set.exclude(pk=call_round.pk)
+        .filter(cutoff_time__gt=now)
+        .filter(Q(start_time__gte=call_round.cutoff_time) | Q(start_time__lte=now))
+        .order_by("start_time", "id")
+        .first()
+    )
+
+
+def carry_over_drafts(
+    call_round: proposal_models.Round,
+    announce: Callable[[list, proposal_models.Round], None] | None = None,
+) -> list[proposal_models.Proposal]:
+    """Move the drafts of an ended round to the call's next round.
+
+    Returns the drafts moved, with ``round`` already pointing at the new round.
+    Nothing moves when there is no next round; the caller cancels what is left.
+    Content, team, documents and requested resources all hang off the proposal
+    (and requested offerings off the call), so the round is the only thing
+    that changes -- the slug too stays as it is.
+
+    ``announce(moved, call_round)`` runs in the same transaction as the move
+    and its events, so a failure anywhere leaves every draft where it was and
+    nobody told: the drafts are either moved and announced, or not moved.
+    """
+    target = next_round_for_drafts(call_round)
+    if target is None:
+        return []
+
+    # Same lock as the cancellation below: a concurrent submit, a second sweep
+    # or a close holding a draft wins, and the row is re-checked against the
+    # filter once the lock is ours, so no draft is moved twice or moved after
+    # it was submitted or cancelled.
+    with transaction.atomic():
+        drafts = list(
+            call_round.proposal_set.select_for_update(of=("self",))
+            .filter(state=ProposalStates.DRAFT)
+            .select_related("round__call__manager__customer")
+            # One lock order for every multi-row lock on proposals.
+            .order_by("pk")
+        )
+        # State is unchanged, so no post_save consumer has anything to say
+        # about the move; the caller announces it.
+        proposal_models.Proposal.objects.filter(
+            pk__in=[proposal.pk for proposal in drafts]
+        ).update(round=target, modified=timezone.now())
+        for proposal in drafts:
+            proposal.round = target
+
+        for proposal in drafts:
+            # Placeholders, not an f-string: emit() formats the message with
+            # the context, and a proposal name is free text that may hold
+            # braces.
+            event_logger.emit(
+                "Draft proposal {proposal_name} has been moved from "
+                "{previous_round_name} to {round_name}.",
+                event_type=EventType.PROPOSAL_DRAFT_CARRIED_OVER,
+                event_context={
+                    "proposal": proposal,
+                    "previous_round_name": call_round.name,
+                    "round_name": target.name,
+                },
+                scopes=[_get_customer(proposal)],
+            )
+        if announce is not None:
+            announce(drafts, call_round)
+    return drafts
+
+
+def process_closed_round(
+    call_round: proposal_models.Round,
+    announce: Callable[[list, proposal_models.Round], None] | None = None,
+) -> list[proposal_models.Proposal]:
+    """Process a closed round: move its drafts on, or cancel them.
+
+    Returns the drafts moved to the call's next round; ``announce`` tells
+    their applicants, see ``carry_over_drafts``.
+    """
+    moved = carry_over_drafts(call_round, announce=announce)
 
     # Lock the drafts while reading them, so the proposals announced are exactly
     # the rows updated: a concurrent submit holds the same row lock, and if it
@@ -601,6 +826,7 @@ def process_closed_round(call_round: proposal_models.Round):
             call_round.proposal_set.select_for_update(of=("self",))
             .filter(state=ProposalStates.DRAFT)
             .select_related("round__call__manager__customer")
+            .order_by("pk")
         )
         # A bulk update skips post_save, so announce each cancellation explicitly.
         proposal_models.Proposal.objects.filter(
@@ -620,6 +846,61 @@ def process_closed_round(call_round: proposal_models.Round):
     event_publishing.publish_proposal_state_changes(
         (proposal, ProposalStates.DRAFT) for proposal in drafts
     )
+    return moved
+
+
+def emit_round_event(
+    call_round: proposal_models.Round, message: str, event_type, **context
+):
+    """Log a round lifecycle transition against the call it belongs to.
+
+    ``message`` is a template formatted with the context (``round_name``,
+    ``call_name``, ``lifecycle_state``, and whatever ``context`` adds), never
+    an f-string of names.
+    """
+    event_logger.emit(
+        message,
+        event_type=event_type,
+        event_context={
+            "call": call_round.call,
+            "round_uuid": call_round.uuid.hex,
+            "round_name": call_round.name,
+            "lifecycle_state": call_round.lifecycle_state,
+            **context,
+        },
+        scopes=[call_round.call.manager.customer],
+    )
+
+
+def start_round_evaluation(call_round: proposal_models.Round) -> bool:
+    """Move a round whose cut-off has passed into ``evaluating``.
+
+    A conditional update, so the sweep, a close and the evaluation-start task
+    can all call it and exactly one of them records the transition. Returns
+    whether this call did.
+    """
+    now = timezone.now()
+    updated = proposal_models.Round.objects.filter(
+        pk=call_round.pk, lifecycle_state__isnull=True, cutoff_time__lte=now
+    ).update(lifecycle_state=RoundLifecycleStates.EVALUATING, evaluation_started_at=now)
+    if not updated:
+        return False
+    call_round.lifecycle_state = RoundLifecycleStates.EVALUATING
+    call_round.evaluation_started_at = now
+    emit_round_event(
+        call_round,
+        "Evaluation of {round_name} of call {call_name} has started.",
+        EventType.ROUND_EVALUATION_STARTED,
+    )
+    return True
+
+
+def start_evaluation_of_ended_rounds() -> int:
+    """Start the lifecycle of every round whose cut-off has passed."""
+    ended = proposal_models.Round.objects.filter(
+        lifecycle_state__isnull=True, cutoff_time__lte=timezone.now()
+    ).select_related("call__manager__customer")
+    return sum(start_round_evaluation(call_round) for call_round in ended)
 
 
 def get_proposal_review_counts(proposal: proposal_models.Proposal) -> dict:
@@ -740,6 +1021,7 @@ def duplicate_call(
             _prepare_clone(src_round)
             src_round.slug = ""
             src_round.call = new_call
+            src_round.reset_lifecycle()
             src_round.save()
 
     if opts["copy_workflow_steps"]:
@@ -768,6 +1050,8 @@ def duplicate_call(
             src_template.save()
 
     if opts["copy_role_mappings"]:
+        # The source's mappings replace the defaults the new call was seeded with.
+        new_call.proposalprojectrolemapping_set.all().delete()  # type: ignore
         for src_mapping in source.proposalprojectrolemapping_set.all():  # type: ignore
             _prepare_clone(src_mapping)
             src_mapping.call = new_call

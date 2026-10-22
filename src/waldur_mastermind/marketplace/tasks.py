@@ -27,6 +27,7 @@ from waldur_core.core import features as core_features
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import ReviewStates
+from waldur_core.core.middleware import get_skip_side_effects
 from waldur_core.core.models import User
 from waldur_core.logging import event_logger
 from waldur_core.logging import models as logging_models
@@ -48,6 +49,7 @@ from waldur_mastermind.marketplace import (
     offering_merge,
     plugins,
     project_groups,
+    resource_api_keys,
     utils,
 )
 from waldur_mastermind.marketplace import log as marketplace_log
@@ -114,6 +116,16 @@ def re_evaluate_usage_limit_restrictions():
     )
     for resource in restricted:
         evaluate_usage_limit_restriction(resource)
+
+
+@shared_task(name="waldur_mastermind.marketplace.resume_api_keys_under_limit")
+def resume_api_keys_under_limit():
+    """Resume the API keys Waldur paused for a limit once a new month resets it.
+
+    The per-key counterpart of ``re_evaluate_usage_limit_restrictions``: a usage
+    report resumes such a key on its own, but a new month may begin without one.
+    """
+    resource_api_keys.resume_keys_under_limit()
 
 
 def process_order_on_commit(order: models.Order, user):
@@ -255,11 +267,14 @@ def close_course_accounts_task(accounts: list[dict]):
                     exc,
                 )
                 continue
-            if user_id:
-                core_models.User.objects.filter(pk=user_id).update(
-                    is_active=False,
-                    deactivation_reason=f"Course account for {username} closed",
-                )
+            # Active users only: one already deactivated keeps its reason.
+            user = core_models.User.objects.filter(pk=user_id).first()
+            if user:
+                # A save rather than an update, so whatever reacts to a
+                # deactivation (token and chat session revocation) runs too.
+                user.is_active = False
+                user.deactivation_reason = f"Course account for {username} closed"
+                user.save(update_fields=["is_active", "deactivation_reason"])
             continue
 
         _close_course_account_and_mark_erred_on_any_failure(
@@ -355,6 +370,52 @@ def notify_provider_about_pending_order(order_uuid):
     core_utils.broadcast_mail(
         "marketplace", "notify_provider_about_pending_order", context, approvers
     )
+
+
+def order_is_announced_as_new(order: models.Order) -> bool:
+    """Whether the offering's new-order recipients should hear about this order
+    once the consumer side has cleared it.
+
+    Cheap by design: it reads the order and its offering only, so callers can
+    rule out the common case -- no recipients configured -- before doing
+    anything costlier.
+
+    Orders nobody placed are not announced. Robots place orders on their own
+    initiative: the cost-policy sweep creates one termination order per
+    over-budget resource, and openportal mirrors remote activity. And an order
+    placed automatically names the person it is for, not somebody who placed
+    it: proposal allocation, and the termination sweeps when they carry an
+    allocated resource's author over. Announcing any of these as a new order
+    would be wrong, and all of them arrive in bulk.
+    """
+    if get_skip_side_effects():
+        return False
+
+    if order.created_by is None or core_utils.is_robot_user(order.created_by):
+        return False
+
+    if order.placed_automatically:
+        return False
+
+    secret_options = order.offering.secret_options or {}
+    return bool(
+        secret_options.get("order_notification_emails")
+        or secret_options.get("order_notification_roles")
+    )
+
+
+def notify_about_new_order_on_commit(order: models.Order):
+    """Schedule the new-order notification for an order the consumer side has
+    cleared, if order_is_announced_as_new allows it.
+
+    Called once per order: on creation for an order which needs no consumer
+    review, and on consumer approval for one which does.
+    """
+    if not order_is_announced_as_new(order):
+        return
+
+    order_uuid = order.uuid
+    transaction.on_commit(lambda: notify_about_new_order.delay(order_uuid))
 
 
 @shared_task
@@ -945,9 +1006,17 @@ def terminate_resources_if_project_end_date_has_been_reached():
     """Terminate resources when their project has reached its end date (including grace period).
 
     Also pauses resources for projects currently in the grace period,
-    if the offering has supports_pausing=True in plugin_options.
+    if the offering has supports_pausing=True in plugin_options, and lifts that
+    pause from resources whose project has left the grace period without
+    expiring (its end date was extended or cleared).
     """
-    today = timezone.datetime.today().date()
+    today = timezone.localdate()
+
+    # Recover grace-period pauses missing their marker, then lift the ones whose
+    # project left the grace period. A safety net for the release done when a
+    # project is saved: also covers end dates changed without a save signal.
+    utils.adopt_grace_period_pauses()
+    utils.release_project_grace_pauses(models.Resource.objects.all())
 
     # Single pass over projects with an end date: pause resources that are inside
     # the grace period, and terminate resources whose offering opts out of the
@@ -978,23 +1047,7 @@ def terminate_resources_if_project_end_date_has_been_reached():
                 )
             )
             for resource in resources_to_pause:
-                resource.paused = True
-                resource.save(update_fields=["paused"])
-                logger.info(
-                    "Resource %s paused due to project %s entering grace period",
-                    resource.uuid,
-                    project.uuid,
-                )
-                event_logger.emit(
-                    "Resource {resource_name} has been paused because "
-                    "project {project_name} has entered the grace period.",
-                    event_type=EventType.MARKETPLACE_RESOURCE_PAUSED,
-                    event_context={
-                        "resource": resource,
-                        "project": project,
-                    },
-                    scopes=[resource, project, project.customer],
-                )
+                utils.pause_for_project_grace(resource)
 
         # Terminate resources whose offering disables the grace period as soon as
         # the project end date is reached, ignoring the grace window. Projects
@@ -1017,7 +1070,7 @@ def terminate_resources_if_project_end_date_has_been_reached():
             # schedule_resources_termination is a no-op on an empty queryset, so
             # no explicit emptiness guard is needed here.
             termination_comment = (
-                f"Project end date has been reached on {timezone.datetime.today()}; "
+                f"Project end date has been reached on {today}; "
                 "grace period disabled for this offering."
             )
             utils.schedule_resources_termination(
@@ -1061,7 +1114,7 @@ def terminate_resources_if_project_end_date_has_been_reached():
         )
         project.get_effective_end_date()
         grace_days = project.get_grace_period_days()
-        termination_comment = f"Project effective end date (including {grace_days} day grace period) has been reached on {timezone.datetime.today()}"
+        termination_comment = f"Project effective end date (including {grace_days} day grace period) has been reached on {today}"
         utils.schedule_resources_termination(
             terminatable_resources,
             termination_comment=termination_comment,
@@ -1294,7 +1347,7 @@ def terminate_expired_resources():
     """Terminate marketplace resources that have reached their end date."""
     expired_resources = models.Resource.objects.filter(
         _ready_for_scheduled_termination_filter(),
-        end_date__lte=timezone.datetime.today(),
+        end_date__lte=timezone.localdate(),
     ).distinct()
     logger.info(
         "About to terminate expired resources: %s",
@@ -1302,7 +1355,7 @@ def terminate_expired_resources():
     )
     utils.schedule_resources_termination(
         expired_resources,
-        termination_comment=f"Resource expired on {timezone.datetime.today()}",
+        termination_comment=f"Resource expired on {timezone.localdate()}",
     )
 
 
@@ -1408,10 +1461,10 @@ def notify_about_resource_termination(resource_uuid, user_uuid, is_staff_action=
 @shared_task(name="waldur_mastermind.marketplace.notification_about_project_ending")
 def notification_about_project_ending():
     """Send notifications about projects ending in 1 day and 7 days."""
-    date_1 = timezone.datetime.today().date() + datetime.timedelta(days=1)
+    date_1 = timezone.localdate() + datetime.timedelta(days=1)
     utils.notification_about_project_ending(date_1)
 
-    date_7 = timezone.datetime.today().date() + datetime.timedelta(days=7)
+    date_7 = timezone.localdate() + datetime.timedelta(days=7)
     utils.notification_about_project_ending(date_7)
 
 
@@ -1427,7 +1480,7 @@ def notification_about_resource_ending():
     an own end date — but only when the project has an actual grace window,
     otherwise raw == effective and the project-ending notice already covers them.
     """
-    today = timezone.datetime.today().date()
+    today = timezone.localdate()
     date_1 = today + datetime.timedelta(days=1)
     date_7 = today + datetime.timedelta(days=7)
 
@@ -2625,111 +2678,52 @@ def update_software_catalogs():
 
             logger.info(f"Updating {catalog_name} catalog")
 
-            if catalog_name == "EESSI":
-                # EESSI: update ALL existing catalogs, each with its own version
-                eessi_catalogs = list(
-                    models.SoftwareCatalog.objects.filter(
-                        name="EESSI",
-                        catalog_type=catalog_config["catalog_type"],
-                    )
+            existing_catalogs = list(
+                models.SoftwareCatalog.objects.filter(
+                    name=catalog_name,
+                    catalog_type=catalog_config["catalog_type"],
                 )
-                if not eessi_catalogs:
-                    results[catalog_name.lower()] = {
-                        "status": "skipped",
-                        "reason": "no_existing_catalog",
-                    }
-                    continue
-
-                updated_catalogs = []
-                for eessi_catalog in eessi_catalogs:
-                    try:
-                        loader_kwargs = dict(catalog_config["loader_kwargs"])
-                        loader_kwargs["catalog_version"] = eessi_catalog.version
-                        loader = catalog_config["loader_class"](**loader_kwargs)
-                    except Exception as loader_error:
-                        raise Exception(
-                            f"Failed to initialize {catalog_name} loader for version {eessi_catalog.version}: {loader_error}"
-                        ) from loader_error
-
-                    try:
-                        update_existing = (
-                            config.SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES
-                        )
-                        eessi_catalog.last_update_attempt = timezone.now()
-                        eessi_catalog.save(update_fields=["last_update_attempt"])
-
-                        loader.load_catalog(
-                            update_existing=update_existing,
-                            dry_run=False,
-                            catalog=eessi_catalog,
-                            sync=True,
-                        )
-
-                        eessi_catalog.last_successful_update = timezone.now()
-                        eessi_catalog.update_errors = ""
-                        eessi_catalog.save(
-                            update_fields=["last_successful_update", "update_errors"]
-                        )
-                        updated_catalogs.append(eessi_catalog)
-                    except Exception as update_error:
-                        eessi_catalog.update_errors = (
-                            f"Catalog update failed: {update_error}"
-                        )
-                        eessi_catalog.save(update_fields=["update_errors"])
-                        raise Exception(
-                            f"Failed to update {catalog_name} catalog version {eessi_catalog.version}: {update_error}"
-                        ) from update_error
-
-                # Record success for all EESSI catalogs
+            )
+            if not existing_catalogs:
                 results[catalog_name.lower()] = {
-                    "status": "success",
-                    "catalogs_updated": len(updated_catalogs),
-                    "catalog_versions": [c.version for c in updated_catalogs],
+                    "status": "skipped",
+                    "reason": "no_existing_catalog",
                 }
-                logger.info(
-                    f"{catalog_name} catalog update completed for {len(updated_catalogs)} catalog(s)"
-                )
-            else:
-                # Non-EESSI catalogs: use standard single-catalog update
+                continue
+
+            updated_catalogs = []
+            for existing_catalog in existing_catalogs:
                 try:
-                    loader_class = catalog_config["loader_class"]
-                    loader_kwargs = catalog_config["loader_kwargs"]
-                    loader = loader_class(**loader_kwargs)
+                    loader_kwargs = dict(catalog_config["loader_kwargs"])
+                    loader_kwargs["catalog_version"] = existing_catalog.version
+                    loader = catalog_config["loader_class"](**loader_kwargs)
                 except Exception as loader_error:
                     raise Exception(
-                        f"Failed to initialize {catalog_name} loader: {loader_error}"
+                        f"Failed to initialize {catalog_name} loader for version "
+                        f"{existing_catalog.version}: {loader_error}"
                     ) from loader_error
 
                 try:
-                    catalog = _update_catalog_with_error_handling(
+                    _update_single_catalog_row(
                         loader=loader,
-                        catalog_name=catalog_name,
-                        catalog_type=catalog_config["catalog_type"],
+                        catalog=existing_catalog,
                     )
+                    updated_catalogs.append(existing_catalog)
                 except Exception as update_error:
                     raise Exception(
-                        f"Failed to update {catalog_name} catalog: {update_error}"
+                        f"Failed to update {catalog_name} catalog version "
+                        f"{existing_catalog.version}: {update_error}"
                     ) from update_error
 
-                if catalog is None:
-                    results[catalog_name.lower()] = {
-                        "status": "skipped",
-                        "reason": "no_existing_catalog",
-                    }
-                    continue
-
-                # Record success
-                results[catalog_name.lower()] = {
-                    "status": "success",
-                    "catalog_uuid": str(catalog.uuid),
-                    "catalog_name": catalog.name,
-                    "catalog_version": catalog.version,
-                    "last_update": catalog.last_successful_update.isoformat()
-                    if catalog.last_successful_update
-                    else None,
-                }
-                logger.info(f"{catalog_name} catalog update completed successfully")
-
+            results[catalog_name.lower()] = {
+                "status": "success",
+                "catalogs_updated": len(updated_catalogs),
+                "catalog_versions": [c.version for c in updated_catalogs],
+            }
+            logger.info(
+                f"{catalog_name} catalog update completed for "
+                f"{len(updated_catalogs)} catalog(s)"
+            )
         except Exception as e:
             # Log error but continue with next catalog
             error_msg = f"{catalog_name} catalog update failed: {e}"
@@ -2777,26 +2771,47 @@ def update_software_catalogs():
     return summary
 
 
+def _update_single_catalog_row(loader, catalog):
+    """Refresh one SoftwareCatalog row without changing its version identity.
+
+    The loader must already be pinned to ``catalog.version``. Package content
+    is updated in place; the version string is never rewritten (multiple
+    versions of EESSI/Spack are first-class).
+    """
+    catalog.last_update_attempt = timezone.now()
+    catalog.save(update_fields=["last_update_attempt"])
+
+    try:
+        update_existing = config.SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES
+        stats = loader.load_catalog(
+            update_existing=update_existing,
+            dry_run=False,
+            catalog=catalog,
+            sync=True,
+        )
+
+        catalog.last_successful_update = timezone.now()
+        catalog.update_errors = ""
+        catalog.save(update_fields=["last_successful_update", "update_errors"])
+
+        logger.info(
+            f"Successfully updated {catalog.name} v{catalog.version} catalog: {stats}"
+        )
+        return catalog
+    except Exception as e:
+        catalog.update_errors = f"Catalog update failed: {e}"
+        catalog.save(update_fields=["update_errors"])
+        raise
+
+
 def _update_catalog_with_error_handling(loader, catalog_name: str, catalog_type: str):
     """
-    Helper to update catalog with proper error handling and logging.
+    Update the newest catalog row for name+type (test/helper path).
 
-    Only updates existing catalogs — does not create new ones.
-    If no catalog exists for the given name+type, returns None so the
-    daily task skips it instead of producing orphaned catalog records.
-
-    Args:
-        loader: Catalog loader instance
-        catalog_name: Name of the catalog
-        catalog_type: Type of the catalog
-
-    Returns:
-        Updated SoftwareCatalog instance, or None if no existing catalog found
+    Does not create catalogs and does not rewrite ``version``. Prefer the
+    daily task path that refreshes every stored version. Returns None when
+    no matching catalog exists.
     """
-    # Lookup by name + catalog_type only - version is updated, not used as lookup key.
-    # Use filter().first() instead of get_or_create because the unique constraint
-    # includes version, so multiple catalogs with the same name+type but different
-    # versions may exist (PUHURI-PORTALS-EF7).
     catalog = (
         models.SoftwareCatalog.objects.filter(
             name=catalog_name,
@@ -2813,35 +2828,9 @@ def _update_catalog_with_error_handling(loader, catalog_name: str, catalog_type:
         )
         return None
 
-    try:
-        # Update version if it changed
-        if catalog.version != loader.catalog_version:
-            catalog.version = loader.catalog_version
-            catalog.save(update_fields=["version"])
-
-        # Update attempt timestamp
-        catalog.last_update_attempt = timezone.now()
-        catalog.save(update_fields=["last_update_attempt"])
-
-        # Perform the actual update
-        update_existing = config.SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES
-        stats = loader.load_catalog(
-            update_existing=update_existing, dry_run=False, catalog=catalog
-        )
-
-        # Update success timestamp and clear errors
-        catalog.last_successful_update = timezone.now()
-        catalog.update_errors = ""
-        catalog.save(update_fields=["last_successful_update", "update_errors"])
-
-        logger.info(f"Successfully updated {catalog_name} catalog: {stats}")
-        return catalog
-
-    except Exception as e:
-        error_msg = f"Catalog update failed: {e}"
-        catalog.update_errors = error_msg
-        catalog.save(update_fields=["update_errors"])
-        raise e
+    # Pin loader to the row's version so load_catalog does not rename it.
+    loader.catalog_version = catalog.version
+    return _update_single_catalog_row(loader, catalog)
 
 
 def _validate_catalog_config(catalog_config):
@@ -2935,6 +2924,16 @@ def import_software_catalog(name, catalog_type):
     loader_kwargs = catalog_config["loader_kwargs"]
     loader = loader_class(**loader_kwargs)
 
+    # Defensive check: API already rejects an existing (name, type, version),
+    # but the async task can race or be called directly.
+    if models.SoftwareCatalog.objects.filter(
+        name=name, catalog_type=catalog_type, version=loader.catalog_version
+    ).exists():
+        raise ValueError(
+            f"A catalog with name={name}, version={loader.catalog_version}, "
+            f"and type={catalog_type} already exists."
+        )
+
     catalog = models.SoftwareCatalog.objects.create(
         name=name,
         catalog_type=catalog_type,
@@ -2952,7 +2951,10 @@ def import_software_catalog(name, catalog_type):
         catalog.last_successful_update = timezone.now()
         catalog.update_errors = ""
         catalog.save(update_fields=["last_successful_update", "update_errors"])
-        logger.info(f"Successfully imported {name} catalog (uuid={catalog.uuid})")
+        logger.info(
+            f"Successfully imported {name} v{catalog.version} catalog "
+            f"(uuid={catalog.uuid})"
+        )
     except Exception as e:
         error_msg = f"Catalog import failed: {e}"
         catalog.update_errors = error_msg
@@ -3026,7 +3028,9 @@ def cleanup_old_software_catalogs():
     Periodic task to clean up old and duplicate software catalog data.
 
     This task performs two cleanup operations:
-    1. Removes duplicate catalogs, keeping only the newest one per (name, catalog_type)
+    1. Removes true duplicate catalogs — same (name, version, catalog_type) —
+       keeping only the newest row. Different versions of the same catalog
+       (e.g. EESSI 2023.06 and 2026.06) are intentional and are never collapsed.
     2. Removes catalogs that haven't been updated within the retention period
 
     This task respects the SOFTWARE_CATALOG_CLEANUP_ENABLED setting.
@@ -3046,7 +3050,7 @@ def cleanup_old_software_catalogs():
     deleted_count = 0
     deleted_catalogs = []
 
-    # Step 1: Remove duplicate catalogs (keep only newest per name/catalog_type)
+    # Step 1: Remove true duplicates (same name + version + catalog_type)
     duplicates_deleted = _cleanup_duplicate_catalogs()
     deleted_count += duplicates_deleted
 
@@ -3096,18 +3100,22 @@ def cleanup_old_software_catalogs():
 
 def _cleanup_duplicate_catalogs():
     """
-    Remove duplicate catalogs, keeping only the newest one per (name, catalog_type).
+    Remove true duplicate catalogs, keeping the newest per
+    (name, version, catalog_type).
 
-    Updates OfferingSoftwareCatalog references before deletion to preserve relationships.
-    Returns the count of deleted duplicate catalogs.
+    Multiple versions of the same catalog name/type (e.g. EESSI 2023.06 and
+    2026.06) are valid and must not be collapsed. The model unique constraint
+    already uses the same key; this is a safety net for legacy/corrupt rows.
+
+    Updates OfferingSoftwareCatalog references before deletion to preserve
+    relationships. Returns the count of deleted duplicate catalogs.
     """
     deleted_count = 0
 
-    # Find unique (name, catalog_type) combinations with more than one catalog
     from django.db.models import Count
 
     duplicated_groups = (
-        models.SoftwareCatalog.objects.values("name", "catalog_type")
+        models.SoftwareCatalog.objects.values("name", "version", "catalog_type")
         .annotate(count=Count("id"))
         .filter(count__gt=1)
     )
@@ -3116,7 +3124,9 @@ def _cleanup_duplicate_catalogs():
         # Get all catalogs for this group, newest first
         catalogs = list(
             models.SoftwareCatalog.objects.filter(
-                name=group["name"], catalog_type=group["catalog_type"]
+                name=group["name"],
+                version=group["version"],
+                catalog_type=group["catalog_type"],
             ).order_by("-last_successful_update", "-created")
         )
 
@@ -3129,7 +3139,8 @@ def _cleanup_duplicate_catalogs():
 
         logger.info(
             f"Found {len(catalogs_to_delete)} duplicate catalogs for "
-            f"{group['name']}/{group['catalog_type']}, keeping v{newest_catalog.version}"
+            f"{group['name']}/{group['version']}/{group['catalog_type']}, "
+            f"keeping uuid={newest_catalog.uuid}"
         )
 
         # Update OfferingSoftwareCatalog references to point to newest catalog
@@ -3147,11 +3158,13 @@ def _cleanup_duplicate_catalogs():
             if updated:
                 logger.info(
                     f"Migrated {updated} offering references from "
-                    f"v{old_catalog.version} to v{newest_catalog.version}"
+                    f"uuid={old_catalog.uuid} to uuid={newest_catalog.uuid} "
+                    f"({old_catalog.name} v{old_catalog.version})"
                 )
 
             logger.info(
-                f"Deleting duplicate catalog {old_catalog.name} v{old_catalog.version}"
+                f"Deleting duplicate catalog {old_catalog.name} "
+                f"v{old_catalog.version} (uuid={old_catalog.uuid})"
             )
             old_catalog.delete()
             deleted_count += 1

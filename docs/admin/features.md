@@ -16,6 +16,10 @@ Allows to hide domain field in organization detail.
 
 Enable onboarding functionality.
 
+## customer.show_organisation_reporting
+
+Show the Reporting menu with organisation-scoped reports to organisation owners.
+
 ## customer.show_permission_reviews
 
 Allows to show permission reviews tab and popups for organisations.
@@ -27,6 +31,10 @@ Enable display of project digest configuration in organization settings.
 ## dashboard.spend_forecast
 
 Show credit burn-down with a projected exhaustion date on the project dashboard.
+
+## dashboard.usage_include_terminated
+
+Let usage charts include terminated resources: an organization dashboard switch, and a removed project's own usage. While off, the usage endpoints ignore include_terminated.
 
 ## dashboard.usage_limit_horizon
 
@@ -78,11 +86,11 @@ Allow display of images in markdown format.
 
 ## marketplace.call_only
 
-Allow marketplace to serve only as aggregator of call info.
+List calls that are run outside Waldur: each call links to an external URL where applications are made, and rounds, proposals and reviews are hidden.
 
 ## marketplace.catalogue_only
 
-Allow marketplace to function as a catalogue only.
+Run the marketplace as a catalogue: offerings can be browsed but not ordered, order lists and pricing are hidden, and anonymous visitors land on the marketplace instead of the login page.
 
 ## marketplace.conceal_audit_log_from_end_users
 
@@ -142,7 +150,7 @@ Enable push-driven UI updates over the event-consumer WebSocket (experimental). 
 
 ## marketplace.show_call_management_functionality
 
-Enabled display of call management functionality.
+Show call management: the call-managing organization's workspace, providers' requests for offerings, and proposal reports. Independent of SERVICE_ACCESS_MODE, which governs how applicants reach services.
 
 ## marketplace.show_experimental_ui_components
 
@@ -191,6 +199,10 @@ Enable science domain/sub-domain selection for projects.
 ## project.show_credit_in_create_dialog
 
 Show credit field in project create dialog.
+
+## project.show_custom_metrics
+
+Show custom metrics: the project Metrics tab and the offering metrics a provider adopts.
 
 ## project.show_description_in_create_dialog
 

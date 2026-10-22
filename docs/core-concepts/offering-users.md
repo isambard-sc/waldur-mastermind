@@ -570,41 +570,32 @@ flowchart LR
 
 ### API Endpoints
 
-#### Get/Update Attribute Configuration
+The configuration is read and written through actions on the provider offering:
 
-**Endpoint**: `/api/marketplace-offering-user-attribute-configs/`
-
-```http
-GET /api/marketplace-offering-user-attribute-configs/?offering_uuid={uuid}
-```
-
-```http
-POST /api/marketplace-offering-user-attribute-configs/
-Content-Type: application/json
-
-{
-  "offering": "https://api.example.com/api/marketplace-offerings/{uuid}/",
-  "expose_username": true,
-  "expose_full_name": true,
-  "expose_email": true,
-  "expose_phone_number": false,
-  "expose_organization": true,
-  "expose_nationality": true,
-  "expose_civil_number": false
-}
-```
-
-#### Update Existing Configuration
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| `GET` | `/api/marketplace-provider-offerings/{uuid}/user-attribute-config/` | Read the configuration (the defaults if none is stored) |
+| `POST` / `PUT` | `/api/marketplace-provider-offerings/{uuid}/update-user-attribute-config/` | Replace the configuration, creating it if missing |
+| `PATCH` | `/api/marketplace-provider-offerings/{uuid}/update-user-attribute-config/` | Change only the fields sent |
+| `DELETE` | `/api/marketplace-provider-offerings/{uuid}/delete-user-attribute-config/` | Remove it; the offering falls back to the defaults |
 
 ```http
-PATCH /api/marketplace-offering-user-attribute-configs/{uuid}/
+PATCH /api/marketplace-provider-offerings/{uuid}/update-user-attribute-config/
 Content-Type: application/json
 
 {
   "expose_phone_number": true,
-  "expose_nationality": false
+  "expose_civil_number": true
 }
 ```
+
+If the offering has no configuration yet, any of the update methods creates one, and attributes left out
+of the request take their model defaults (username, full name and email exposed, everything else hidden).
+
+In homeport the configuration is edited on the offering's integration settings, under
+**User attribute exposure**. That tab is only shown when the offering lets the service provider create
+offering users (`plugin_options.service_provider_can_create_offering_user`). For other offerings, use the
+API.
 
 ### Available Attributes
 
@@ -649,10 +640,50 @@ Content-Type: application/json
 }
 ```
 
+### Where Exposed Attributes Are Returned
+
+The same configuration governs every provider-facing view of a user:
+
+| Endpoint | What it returns |
+|----------|-----------------|
+| `GET /api/marketplace-offering-users/` | Offering users of the offering, with the exposed `user_<attr>` fields |
+| `GET /api/marketplace-provider-resources/{uuid}/list_users/` | Role grants on the resource itself, with the exposed `user_<attr>` fields |
+| `GET /api/marketplace-provider-resource-projects/{uuid}/list_users/` | Role grants on the resource project, with the exposed `user_<attr>` fields |
+
+The two `list_users` endpoints cover users who hold a role on a resource or one of its resource projects
+without being on the parent project's team, so they may have no offering user at all. A site agent that
+grants access per resource project reads its members there.
+
+On the `list_users` endpoints, `user_username`, `user_full_name` and `user_email` are part of the role
+details and are always returned. Every other `user_<attr>` field (for example `user_civil_number`) is
+present only when the offering exposes that attribute. Consumer-side `list_users` endpoints return no
+profile attributes.
+
+For example, the site agent's `rancher-kc-crd` plugin can match users by civil code in a Rancher Keycloak
+that Waldur does not share. That needs `expose_civil_number: true` on the offering:
+
+```http
+GET /api/marketplace-provider-resource-projects/{uuid}/list_users/
+```
+
+```json
+[
+  {
+    "role_name": "project_member",
+    "user_uuid": "3a57ca3e2bf94fbd8767f6f0a52ea03e",
+    "user_username": "alice",
+    "user_full_name": "Alice Smith",
+    "user_email": "alice@example.com",
+    "user_civil_number": "EE38001010001"
+  }
+]
+```
+
 ### Permissions
 
-- **View**: Users with `VIEW_OFFERING` permission on the offering
-- **Create/Update**: Offering owner or customer owner
+- **View**: owners of the offering's organization, or anyone with `UPDATE_OFFERING_USER` on the offering,
+  its organization or its service provider (this covers a site agent running as offering manager)
+- **Create/Update/Delete**: owners of the offering's organization
 
 ### GDPR Compliance
 

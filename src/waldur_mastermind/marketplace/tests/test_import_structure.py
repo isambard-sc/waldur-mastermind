@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import tempfile
+import uuid
 from io import StringIO
 
 from django.contrib.contenttypes.models import ContentType
@@ -10,6 +11,7 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
 from django.test import TestCase
+from django.utils import timezone
 
 from waldur_core.checklist.models import ChecklistCompletion
 from waldur_core.core.models import User
@@ -37,6 +39,7 @@ from waldur_mastermind.marketplace.models import (
     Plan,
     PlanComponent,
     Resource,
+    ResourceProject,
     RobotAccount,
     SoftwareCatalog,
 )
@@ -49,6 +52,7 @@ from waldur_mastermind.policy.models import (
 from waldur_mastermind.policy.tests import factories as policy_factories
 from waldur_mastermind.proposal.enums import COITypes, ProposalDisclosureLevels
 from waldur_mastermind.proposal.models import (
+    AwardedResource,
     CallAssignmentConfiguration,
     CallCOIConfiguration,
     CallWorkflowStep,
@@ -827,6 +831,88 @@ class ImportStructureCommandTest(TestCase):
 
         # Verify role not created
         self.assertFalse(Role.objects.filter(name="TestRole").exists())
+
+    def test_offering_role_is_made_available_on_its_offerings(self):
+        offering = marketplace_factories.OfferingFactory()
+        role_uuid = uuid.uuid4().hex
+        self._create_test_json(
+            {
+                "roles": [
+                    {
+                        "uuid": role_uuid,
+                        "name": "Data Manager",
+                        "content_type": "marketplace.resource",
+                        "offering_uuids": [offering.uuid.hex, uuid.uuid4().hex],
+                    }
+                ]
+            }
+        )
+
+        self._call_import_command("-i", self.test_file_path)
+
+        role = Role.objects.get(uuid=role_uuid)
+        self.assertEqual(
+            list(role.availability.values_list("object_id", flat=True)),
+            [offering.id],
+        )
+        self.assertEqual(
+            role.availability.get().content_type,
+            ContentType.objects.get_for_model(Offering),
+        )
+
+    # Resource Project Tests
+
+    def test_resource_project_keeps_limits_and_defaults_to_ok(self):
+        resource = marketplace_factories.ResourceFactory(limits={"storage": 50})
+        rp_uuid = uuid.uuid4().hex
+        self._create_test_json(
+            {
+                "resource_projects": [
+                    {
+                        "uuid": rp_uuid,
+                        "resource_uuid": resource.uuid.hex,
+                        "name": "Imaging Cohort A",
+                        "description": "MRI scans",
+                        "backend_id": "P090U0A3j99q",
+                        "limits": {"storage": 18},
+                        "current_usages": {"storage": 12},
+                    }
+                ]
+            }
+        )
+
+        self._call_import_command("-i", self.test_file_path)
+
+        project = ResourceProject.objects.get(uuid=rp_uuid)
+        self.assertEqual(project.resource, resource)
+        self.assertEqual(project.description, "MRI scans")
+        self.assertEqual(project.backend_id, "P090U0A3j99q")
+        self.assertEqual(project.state, ResourceProject.States.OK)
+        self.assertEqual(project.limits, {"storage": 18})
+        self.assertEqual(project.current_usages, {"storage": 12})
+
+    def test_resource_project_state_can_be_set(self):
+        resource = marketplace_factories.ResourceFactory()
+        rp_uuid = uuid.uuid4().hex
+        self._create_test_json(
+            {
+                "resource_projects": [
+                    {
+                        "uuid": rp_uuid,
+                        "resource_uuid": resource.uuid.hex,
+                        "name": "pending",
+                        "state": ResourceProject.States.CREATING,
+                    }
+                ]
+            }
+        )
+
+        self._call_import_command("-i", self.test_file_path)
+
+        self.assertEqual(
+            ResourceProject.objects.get(uuid=rp_uuid).state,
+            ResourceProject.States.CREATING,
+        )
 
     # Statistics Summary Tests
 
@@ -4035,3 +4121,95 @@ class CallConfigurationRoundTripTest(TestCase):
             snapshot(CallAssignmentConfiguration.objects.get(call=self.call)),
             expected_assignment,
         )
+
+
+class AwardedResourcesRoundTripTest(TestCase):
+    """What an allocation decision awards travels with the proposal."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.temp_dir, "structure.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_export_then_import_restores_the_award(self):
+        requested = proposal_factories.RequestedResourceFactory(
+            resource=None, limits={"cpu": 100}
+        )
+        proposal = requested.proposal
+        proposal.awarded_resources_prefilled_at = timezone.now()
+        proposal.save()
+        awarded = AwardedResource.objects.create(
+            proposal=proposal,
+            requested_resource=requested,
+            requested_offering=requested.requested_offering,
+            plan=requested.requested_offering.plan,
+            limits={"cpu": 40},
+            attributes={"prepaid_duration_months": 3},
+        )
+        awarded_uuid = awarded.uuid.hex
+
+        call_command("export_structure", "-o", self.path, stdout=StringIO())
+        with open(self.path, encoding="utf-8") as f:
+            data = json.load(f)
+        exported = [
+            row for row in data["awarded_resources"] if row["uuid"] == awarded_uuid
+        ]
+        self.assertEqual(len(exported), 1)
+        self.assertEqual(exported[0]["limits"], {"cpu": 40})
+        self.assertEqual(exported[0]["requested_resource_uuid"], requested.uuid.hex)
+
+        awarded.delete()
+        Proposal.objects.filter(pk=proposal.pk).update(
+            awarded_resources_prefilled_at=None
+        )
+        call_command("import_structure", input=self.path, stdout=StringIO())
+
+        restored = AwardedResource.objects.get(uuid=awarded_uuid)
+        self.assertEqual(restored.proposal, proposal)
+        self.assertEqual(restored.requested_resource, requested)
+        self.assertEqual(restored.plan, requested.requested_offering.plan)
+        self.assertEqual(restored.limits, {"cpu": 40})
+        self.assertEqual(restored.attributes, {"prepaid_duration_months": 3})
+        proposal.refresh_from_db()
+        self.assertIsNotNone(proposal.awarded_resources_prefilled_at)
+
+    def test_a_reference_that_is_not_found_is_reported(self):
+        requested = proposal_factories.RequestedResourceFactory(
+            resource=None, limits={"cpu": 100}
+        )
+        missing_plan = uuid.uuid4().hex
+        missing_request = uuid.uuid4().hex
+        missing_resource = uuid.uuid4().hex
+        awarded_uuid = uuid.uuid4().hex
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "awarded_resources": [
+                        {
+                            "uuid": awarded_uuid,
+                            "proposal_uuid": requested.proposal.uuid.hex,
+                            "requested_offering_uuid": (
+                                requested.requested_offering.uuid.hex
+                            ),
+                            "plan_uuid": missing_plan,
+                            "requested_resource_uuid": missing_request,
+                            "resource_uuid": missing_resource,
+                            "limits": {"cpu": 40},
+                        }
+                    ]
+                },
+                f,
+            )
+
+        out = StringIO()
+        call_command("import_structure", input=self.path, stdout=out)
+
+        restored = AwardedResource.objects.get(uuid=awarded_uuid)
+        self.assertIsNone(restored.plan)
+        self.assertIsNone(restored.requested_resource)
+        self.assertIsNone(restored.resource)
+        output = out.getvalue()
+        for missing in (missing_plan, missing_request, missing_resource):
+            self.assertIn(missing, output)

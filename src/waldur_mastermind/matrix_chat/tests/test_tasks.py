@@ -1,14 +1,19 @@
-import json
-import zipfile
-from io import BytesIO
 from unittest import mock
 
 from django.contrib.contenttypes.models import ContentType
 from django.test import TestCase
 
+from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.fixtures import CustomerRole, ProjectRole
+from waldur_core.permissions.models import UserRole
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.matrix_chat import models, tasks
 from waldur_mastermind.matrix_chat.tests import fixtures
+
+
+def _posted():
+    """What Waldur queued for the bot to post, oldest first."""
+    return list(models.MatrixOutboxMessage.objects.values_list("body", flat=True))
 
 
 @mock.patch("waldur_mastermind.matrix_chat.tasks.matrix_client")
@@ -172,7 +177,6 @@ class InviteUserTaskTest(TestCase):
         mock_client.join_room_as_user.assert_called_once_with(
             "!test:matrix.example.com", "@alice:matrix.example.com"
         )
-        mock_client.get_access_token_for_user.assert_not_called()
         member = models.MatrixRoomMember.objects.get(room=room, user=user)
         self.assertEqual(member.membership_state, models.MembershipStates.JOINED)
 
@@ -223,6 +227,88 @@ class InviteUserTaskTest(TestCase):
 
         mock_client.set_power_level.assert_called_once_with(
             "!test:matrix.example.com", "@admin:matrix.example.com", 50
+        )
+
+    def test_lowers_the_power_level_of_a_former_admin(self, mock_client):
+        # A project admin given a member role instead is invited again by the
+        # grant, and must not keep the admin level in the room.
+        mock_client.is_enabled.return_value = True
+        mock_client.ensure_user_exists.return_value = "@alice:matrix.example.com"
+        mock_client.get_power_level_for_scope.return_value = 0
+        project = structure_factories.ProjectFactory()
+        user = structure_factories.UserFactory(username="alice")
+        room = models.MatrixRoom.objects.create(
+            room_id="!test:matrix.example.com",
+            room_name="Test Room",
+            state=models.RoomStates.ACTIVE,
+            content_type=ContentType.objects.get_for_model(project),
+            object_id=project.id,
+        )
+        models.MatrixRoomMember.objects.create(
+            room=room,
+            user=user,
+            matrix_user_id="@alice:matrix.example.com",
+            power_level=50,
+            membership_state=models.MembershipStates.JOINED,
+        )
+
+        tasks.invite_user_to_room(str(room.uuid), str(user.uuid))
+
+        mock_client.set_power_level.assert_called_once_with(
+            "!test:matrix.example.com", "@alice:matrix.example.com", 0
+        )
+        member = models.MatrixRoomMember.objects.get(room=room, user=user)
+        self.assertEqual(member.power_level, 0)
+
+    def test_records_the_member_when_the_power_level_cannot_be_set(self, mock_client):
+        # Revocation finds the rooms to kick a user from by their member rows.
+        mock_client.is_enabled.return_value = True
+        mock_client.ensure_user_exists.return_value = "@alice:matrix.example.com"
+        mock_client.get_power_level_for_scope.return_value = 0
+        mock_client.set_power_level.side_effect = RuntimeError("homeserver down")
+        project = structure_factories.ProjectFactory()
+        user = structure_factories.UserFactory(username="alice")
+        room = models.MatrixRoom.objects.create(
+            room_id="!test:matrix.example.com",
+            room_name="Test Room",
+            state=models.RoomStates.ACTIVE,
+            content_type=ContentType.objects.get_for_model(project),
+            object_id=project.id,
+        )
+
+        tasks.invite_user_to_room(str(room.uuid), str(user.uuid))
+
+        member = models.MatrixRoomMember.objects.get(room=room, user=user)
+        self.assertEqual(member.membership_state, models.MembershipStates.JOINED)
+
+    def test_keeps_staff_who_joined_with_the_button_at_their_level(self, mock_client):
+        mock_client.is_enabled.return_value = True
+        mock_client.ensure_user_exists.return_value = "@staff:matrix.example.com"
+        mock_client.get_power_level_for_scope.return_value = 0
+        project = structure_factories.ProjectFactory()
+        staff = structure_factories.UserFactory(username="staff", is_staff=True)
+        room = models.MatrixRoom.objects.create(
+            room_id="!test:matrix.example.com",
+            room_name="Test Room",
+            state=models.RoomStates.ACTIVE,
+            content_type=ContentType.objects.get_for_model(project),
+            object_id=project.id,
+        )
+        models.MatrixRoomMember.objects.create(
+            room=room,
+            user=staff,
+            matrix_user_id="@staff:matrix.example.com",
+            power_level=tasks.STAFF_POWER_LEVEL,
+            membership_state=models.MembershipStates.JOINED,
+            manually_joined=True,
+        )
+
+        tasks.invite_user_to_room(str(room.uuid), str(staff.uuid))
+
+        mock_client.set_power_level.assert_called_once_with(
+            "!test:matrix.example.com",
+            "@staff:matrix.example.com",
+            tasks.STAFF_POWER_LEVEL,
         )
 
 
@@ -383,9 +469,7 @@ class DisableRoomTaskTest(TestCase):
 
         tasks.disable_room(str(room.uuid))
 
-        mock_client.send_message.assert_called_once_with(
-            "!test:matrix.example.com", "Chat room was deactivated"
-        )
+        self.assertEqual(_posted(), ["Chat room was deactivated"])
 
     def test_deactivation_message_includes_reason(self, mock_client, mock_config):
         mock_client.is_enabled.return_value = True
@@ -394,9 +478,8 @@ class DisableRoomTaskTest(TestCase):
 
         tasks.disable_room(str(room.uuid), reason="project termination")
 
-        mock_client.send_message.assert_called_once_with(
-            "!test:matrix.example.com",
-            "Chat room was deactivated due to project termination",
+        self.assertEqual(
+            _posted(), ["Chat room was deactivated due to project termination"]
         )
 
     def test_no_export_when_discarding_history(self, mock_client, mock_config):
@@ -428,9 +511,7 @@ class SendRoomNotificationTaskTest(TestCase):
 
         tasks.send_room_notification(str(room.uuid), "Hello from Waldur")
 
-        mock_client.send_message.assert_called_once_with(
-            "!test:matrix.example.com", "Hello from Waldur"
-        )
+        self.assertEqual(_posted(), ["Hello from Waldur"])
 
     def test_skips_when_disabled(self, mock_client):
         mock_client.is_enabled.return_value = False
@@ -483,194 +564,6 @@ class SendRoomNotificationTaskTest(TestCase):
 
 
 @mock.patch("waldur_mastermind.matrix_chat.tasks.matrix_client")
-class ExportRoomHistoryTaskTest(TestCase):
-    def _create_room_and_export(self):
-        project = structure_factories.ProjectFactory()
-        ct = ContentType.objects.get_for_model(project)
-        room = models.MatrixRoom.objects.create(
-            room_id="!test:matrix.example.com",
-            room_name="Test Room",
-            state=models.RoomStates.ACTIVE,
-            content_type=ct,
-            object_id=project.id,
-        )
-        export = models.MatrixHistoryExport.objects.create(
-            room=room,
-            export_type=models.ExportTypes.MANUAL,
-        )
-        return room, export
-
-    @mock.patch("waldur_mastermind.matrix_chat.tasks.config")
-    def test_exports_messages(self, mock_config, mock_client):
-        mock_config.MATRIX_EXPORT_MEDIA = True
-        mock_client.is_enabled.return_value = True
-        mock_client.get_room_messages.side_effect = [
-            {
-                "messages": [
-                    {
-                        "event_id": "$1",
-                        "sender": "@alice:matrix.example.com",
-                        "body": "Hello",
-                        "timestamp": 1234567890,
-                        "type": "m.room.message",
-                        "msgtype": "m.text",
-                    }
-                ],
-                "end_token": "token_1",
-            },
-            {"messages": [], "end_token": None},
-        ]
-
-        room, export = self._create_room_and_export()
-        tasks.export_room_history(str(export.uuid))
-
-        export.refresh_from_db()
-        self.assertEqual(export.state, models.ExportStates.COMPLETED)
-        self.assertEqual(export.message_count, 1)
-        self.assertEqual(export.media_count, 0)
-        self.assertTrue(export.export_file)
-        self.assertFalse(export.media_file)
-
-    def test_handles_export_failure(self, mock_client):
-        mock_client.is_enabled.return_value = True
-        mock_client.get_room_messages.side_effect = Exception("API error")
-
-        room, export = self._create_room_and_export()
-        tasks.export_room_history(str(export.uuid))
-
-        export.refresh_from_db()
-        self.assertEqual(export.state, models.ExportStates.FAILED)
-        self.assertIn("API error", export.error_message)
-
-    @mock.patch("waldur_mastermind.matrix_chat.tasks.config")
-    def test_exports_with_media(self, mock_config, mock_client):
-        mock_config.MATRIX_EXPORT_MEDIA = True
-        mock_client.is_enabled.return_value = True
-        mock_client.get_room_messages.side_effect = [
-            {
-                "messages": [
-                    {
-                        "event_id": "$img1",
-                        "sender": "@alice:matrix.example.com",
-                        "body": "photo.jpg",
-                        "timestamp": 1234567890,
-                        "type": "m.room.message",
-                        "msgtype": "m.image",
-                        "has_media": True,
-                        "media_url": "mxc://example.com/media123",
-                        "media_info": {"mimetype": "image/jpeg", "size": 5},
-                    },
-                    {
-                        "event_id": "$txt1",
-                        "sender": "@bob:matrix.example.com",
-                        "body": "Nice photo!",
-                        "timestamp": 1234567891,
-                        "type": "m.room.message",
-                        "msgtype": "m.text",
-                    },
-                ],
-                "end_token": "token_1",
-            },
-            {"messages": [], "end_token": None},
-        ]
-        mock_client.download_media.return_value = (
-            b"fake-image-data",
-            "image/jpeg",
-            "photo.jpg",
-        )
-
-        room, export = self._create_room_and_export()
-        tasks.export_room_history(str(export.uuid))
-
-        export.refresh_from_db()
-        self.assertEqual(export.state, models.ExportStates.COMPLETED)
-        self.assertEqual(export.message_count, 2)
-        self.assertEqual(export.media_count, 1)
-        self.assertTrue(export.media_file)
-
-        # Verify ZIP contents
-        export.media_file.seek(0)
-        with zipfile.ZipFile(BytesIO(export.media_file.read())) as zf:
-            names = zf.namelist()
-            self.assertEqual(len(names), 1)
-            self.assertIn("photo.jpg", names[0])
-            self.assertEqual(zf.read(names[0]), b"fake-image-data")
-
-        # Verify JSON has media_path
-        export.export_file.seek(0)
-        export_data = json.loads(export.export_file.read())
-        img_msg = [m for m in export_data["messages"] if m["event_id"] == "$img1"][0]
-        self.assertIn("media_path", img_msg)
-        self.assertEqual(export_data["media_count"], 1)
-
-    @mock.patch("waldur_mastermind.matrix_chat.tasks.config")
-    def test_media_download_failure_does_not_fail_export(
-        self, mock_config, mock_client
-    ):
-        mock_config.MATRIX_EXPORT_MEDIA = True
-        mock_client.is_enabled.return_value = True
-        mock_client.get_room_messages.side_effect = [
-            {
-                "messages": [
-                    {
-                        "event_id": "$img1",
-                        "sender": "@alice:matrix.example.com",
-                        "body": "photo.jpg",
-                        "timestamp": 1234567890,
-                        "type": "m.room.message",
-                        "msgtype": "m.image",
-                        "has_media": True,
-                        "media_url": "mxc://example.com/broken",
-                        "media_info": {},
-                    },
-                ],
-                "end_token": None,
-            },
-        ]
-        mock_client.download_media.side_effect = Exception("download failed")
-
-        room, export = self._create_room_and_export()
-        tasks.export_room_history(str(export.uuid))
-
-        export.refresh_from_db()
-        self.assertEqual(export.state, models.ExportStates.COMPLETED)
-        self.assertEqual(export.message_count, 1)
-        self.assertEqual(export.media_count, 0)
-        self.assertFalse(export.media_file)
-
-    @mock.patch("waldur_mastermind.matrix_chat.tasks.config")
-    def test_media_skipped_when_disabled(self, mock_config, mock_client):
-        mock_config.MATRIX_EXPORT_MEDIA = False
-        mock_client.is_enabled.return_value = True
-        mock_client.get_room_messages.side_effect = [
-            {
-                "messages": [
-                    {
-                        "event_id": "$img1",
-                        "sender": "@alice:matrix.example.com",
-                        "body": "photo.jpg",
-                        "timestamp": 1234567890,
-                        "type": "m.room.message",
-                        "msgtype": "m.image",
-                        "has_media": True,
-                        "media_url": "mxc://example.com/media123",
-                        "media_info": {},
-                    },
-                ],
-                "end_token": None,
-            },
-        ]
-
-        room, export = self._create_room_and_export()
-        tasks.export_room_history(str(export.uuid))
-
-        export.refresh_from_db()
-        self.assertEqual(export.state, models.ExportStates.COMPLETED)
-        self.assertEqual(export.media_count, 0)
-        mock_client.download_media.assert_not_called()
-
-
-@mock.patch("waldur_mastermind.matrix_chat.tasks.matrix_client")
 class StaffJoinRoomTaskTest(TestCase):
     def _make_room(self):
         project = structure_factories.ProjectFactory()
@@ -700,16 +593,13 @@ class StaffJoinRoomTaskTest(TestCase):
         mock_client.join_room_as_user.assert_called_once_with(
             "!staff:matrix.example.com", "@staff:matrix.example.com"
         )
-        mock_client.get_access_token_for_user.assert_not_called()
         mock_client.set_power_level.assert_called_once_with(
             "!staff:matrix.example.com", "@staff:matrix.example.com", 50
         )
         member = models.MatrixRoomMember.objects.get(room=room, user=user)
         self.assertEqual(member.power_level, 50)
         self.assertEqual(member.membership_state, models.MembershipStates.JOINED)
-        mock_client.send_message.assert_called_once_with(
-            "!staff:matrix.example.com", "Staff Member joined the room."
-        )
+        self.assertEqual(_posted(), ["Staff Member joined the room."])
 
     def test_join_left_invited_when_join_fails(self, mock_client):
         mock_client.is_enabled.return_value = True
@@ -762,13 +652,10 @@ class StaffLeaveRoomTaskTest(TestCase):
 
         tasks.staff_leave_room(str(room.uuid), str(user.uuid))
 
-        mock_client.send_message.assert_called_once_with(
-            "!staff:matrix.example.com", "Staff Member left the room."
-        )
+        self.assertEqual(_posted(), ["Staff Member left the room."])
         mock_client.leave_room_as_user.assert_called_once_with(
             "!staff:matrix.example.com", "@staff:matrix.example.com"
         )
-        mock_client.get_access_token_for_user.assert_not_called()
         member.refresh_from_db()
         self.assertEqual(member.membership_state, models.MembershipStates.LEFT)
 
@@ -804,7 +691,6 @@ class SyncProjectMembersJoinTest(TestCase):
         mock_client.join_room_as_user.assert_any_call(
             room.room_id, "@admin:matrix.example.com"
         )
-        mock_client.get_access_token_for_user.assert_not_called()
         member = models.MatrixRoomMember.objects.get(room=room, user=admin)
         self.assertEqual(member.membership_state, models.MembershipStates.JOINED)
 
@@ -832,11 +718,250 @@ class SyncDoesNotKickStaffTest(TestCase):
             matrix_user_id="@staff:matrix.example.com",
             power_level=50,
             membership_state=models.MembershipStates.JOINED,
+            manually_joined=True,
         )
 
         tasks.sync_project_members_to_room(str(room.uuid))
 
         mock_client.kick_user.assert_not_called()
+
+
+@mock.patch("waldur_mastermind.matrix_chat.tasks.matrix_client")
+class SyncPowerLevelTest(TestCase):
+    def setUp(self):
+        self.project = structure_factories.ProjectFactory()
+        self.room = models.MatrixRoom.objects.create(
+            room_id="!sync:matrix.example.com",
+            room_name="Sync Room",
+            state=models.RoomStates.ACTIVE,
+            content_type=ContentType.objects.get_for_model(self.project),
+            object_id=self.project.id,
+        )
+
+    def _enable(self, mock_client):
+        mock_client.is_enabled.return_value = True
+        mock_client.ensure_user_exists.side_effect = (
+            lambda user: f"@{user.username}:matrix.example.com"
+        )
+        mock_client.get_power_level_for_scope.return_value = 0
+
+    def test_lowers_a_power_level_the_roles_no_longer_give(self, mock_client):
+        self._enable(mock_client)
+        user = structure_factories.UserFactory(username="alice")
+        self.project.add_user(user, ProjectRole.MEMBER)
+
+        tasks.sync_project_members_to_room(str(self.room.uuid))
+
+        mock_client.set_power_level.assert_called_once_with(
+            self.room.room_id, "@alice:matrix.example.com", 0
+        )
+
+    def test_keeps_staff_who_joined_with_the_button_at_their_level(self, mock_client):
+        # Staff hold the level by joining, not by a role, so a role they
+        # also have must not take it away.
+        self._enable(mock_client)
+        staff = structure_factories.UserFactory(username="staff", is_staff=True)
+        self.project.add_user(staff, ProjectRole.MEMBER)
+        models.MatrixRoomMember.objects.create(
+            room=self.room,
+            user=staff,
+            matrix_user_id="@staff:matrix.example.com",
+            power_level=tasks.STAFF_POWER_LEVEL,
+            membership_state=models.MembershipStates.JOINED,
+            manually_joined=True,
+        )
+
+        tasks.sync_project_members_to_room(str(self.room.uuid))
+
+        mock_client.set_power_level.assert_called_once_with(
+            self.room.room_id, "@staff:matrix.example.com", tasks.STAFF_POWER_LEVEL
+        )
+        member = models.MatrixRoomMember.objects.get(room=self.room, user=staff)
+        self.assertEqual(member.power_level, tasks.STAFF_POWER_LEVEL)
+
+    def test_former_staff_fall_back_to_the_level_of_their_roles(self, mock_client):
+        self._enable(mock_client)
+        user = structure_factories.UserFactory(username="former")
+        self.project.add_user(user, ProjectRole.MEMBER)
+        models.MatrixRoomMember.objects.create(
+            room=self.room,
+            user=user,
+            matrix_user_id="@former:matrix.example.com",
+            power_level=tasks.STAFF_POWER_LEVEL,
+            membership_state=models.MembershipStates.JOINED,
+            manually_joined=True,
+        )
+
+        tasks.sync_project_members_to_room(str(self.room.uuid))
+
+        mock_client.set_power_level.assert_called_once_with(
+            self.room.room_id, "@former:matrix.example.com", 0
+        )
+
+    def test_records_the_member_when_the_power_level_cannot_be_set(self, mock_client):
+        # Revocation and the stale-member kick find members by their rows.
+        self._enable(mock_client)
+        mock_client.set_power_level.side_effect = RuntimeError("homeserver down")
+        user = structure_factories.UserFactory(username="alice")
+        self.project.add_user(user, ProjectRole.MEMBER)
+
+        tasks.sync_project_members_to_room(str(self.room.uuid))
+
+        member = models.MatrixRoomMember.objects.get(room=self.room, user=user)
+        self.assertEqual(member.membership_state, models.MembershipStates.JOINED)
+
+
+@mock.patch("waldur_mastermind.matrix_chat.tasks.sync_project_members_to_room")
+@mock.patch("waldur_mastermind.matrix_chat.tasks.matrix_client")
+class SyncRoomsOfRoleTest(TestCase):
+    def setUp(self):
+        self.customer = structure_factories.CustomerFactory()
+        self.user = structure_factories.UserFactory()
+
+    def _room(self, customer):
+        project = structure_factories.ProjectFactory(customer=customer)
+        return models.MatrixRoom.objects.create(
+            room_id=f"!{project.uuid.hex}:matrix.example.com",
+            room_name=project.name,
+            state=models.RoomStates.ACTIVE,
+            content_type=ContentType.objects.get_for_model(project),
+            object_id=project.id,
+        )
+
+    def _synced(self, room_sync):
+        return [call.args[0] for call in room_sync.delay.call_args_list]
+
+    def test_syncs_the_rooms_of_the_organizations_where_the_role_is_held(
+        self, mock_client, room_sync
+    ):
+        mock_client.is_enabled.return_value = True
+        rooms = [self._room(self.customer), self._room(self.customer)]
+        self._room(structure_factories.CustomerFactory())
+        self.customer.add_user(self.user, CustomerRole.SUPPORT)
+
+        tasks.sync_rooms_of_role(CustomerRole.SUPPORT.id)
+
+        self.assertCountEqual(
+            self._synced(room_sync), [str(room.uuid) for room in rooms]
+        )
+
+    def test_a_project_role_syncs_only_the_rooms_of_its_projects(
+        self, mock_client, room_sync
+    ):
+        mock_client.is_enabled.return_value = True
+        room = self._room(self.customer)
+        self._room(self.customer)
+        room.project.add_user(self.user, ProjectRole.MANAGER)
+
+        tasks.sync_rooms_of_role(ProjectRole.MANAGER.id)
+
+        self.assertEqual(self._synced(room_sync), [str(room.uuid)])
+
+    def test_leaves_out_holders_whose_role_has_ended(self, mock_client, room_sync):
+        mock_client.is_enabled.return_value = True
+        self._room(self.customer)
+        self.customer.add_user(self.user, CustomerRole.SUPPORT)
+        UserRole.objects.filter(user=self.user).update(is_active=False)
+
+        tasks.sync_rooms_of_role(CustomerRole.SUPPORT.id)
+
+        room_sync.delay.assert_not_called()
+
+    def test_no_op_when_disabled(self, mock_client, room_sync):
+        mock_client.is_enabled.return_value = False
+        self._room(self.customer)
+        self.customer.add_user(self.user, CustomerRole.SUPPORT)
+
+        tasks.sync_rooms_of_role(CustomerRole.SUPPORT.id)
+
+        room_sync.delay.assert_not_called()
+
+
+@mock.patch("waldur_mastermind.matrix_chat.tasks.matrix_client")
+class SyncCustomerRoleHoldersTest(TestCase):
+    # A customer role only reaches the project rooms if it may create the
+    # customer's chat rooms; seeing the customer's projects is not enough.
+
+    def setUp(self):
+        self.project = structure_factories.ProjectFactory()
+        self.room = models.MatrixRoom.objects.create(
+            room_id="!sync:matrix.example.com",
+            room_name="Sync Room",
+            state=models.RoomStates.ACTIVE,
+            content_type=ContentType.objects.get_for_model(self.project),
+            object_id=self.project.id,
+        )
+        self.user = structure_factories.UserFactory()
+        CustomerRole.OWNER.add_permission(PermissionEnum.CREATE_MATRIX_ROOM)
+
+    def _enable(self, mock_client):
+        mock_client.is_enabled.return_value = True
+        mock_client.ensure_user_exists.side_effect = (
+            lambda user: f"@{user.username}:matrix.example.com"
+        )
+        mock_client.get_power_level_for_scope.return_value = 0
+
+    def test_syncs_a_role_that_can_create_rooms(self, mock_client):
+        self._enable(mock_client)
+        self.project.customer.add_user(self.user, CustomerRole.OWNER)
+
+        tasks.sync_project_members_to_room(str(self.room.uuid))
+
+        self.assertTrue(
+            models.MatrixRoomMember.objects.filter(
+                room=self.room, user=self.user
+            ).exists()
+        )
+
+    def test_leaves_out_a_role_that_cannot_create_rooms(self, mock_client):
+        self._enable(mock_client)
+        CustomerRole.READER.add_permission(PermissionEnum.LIST_PROJECTS)
+        self.project.customer.add_user(self.user, CustomerRole.READER)
+
+        tasks.sync_project_members_to_room(str(self.room.uuid))
+
+        mock_client.invite_user.assert_not_called()
+        self.assertFalse(
+            models.MatrixRoomMember.objects.filter(
+                room=self.room, user=self.user
+            ).exists()
+        )
+
+    def test_kicks_a_member_whose_customer_role_cannot_create_rooms(self, mock_client):
+        self._enable(mock_client)
+        self.project.customer.add_user(self.user, CustomerRole.READER)
+        models.MatrixRoomMember.objects.create(
+            room=self.room,
+            user=self.user,
+            matrix_user_id=f"@{self.user.username}:matrix.example.com",
+            membership_state=models.MembershipStates.JOINED,
+        )
+
+        tasks.sync_project_members_to_room(str(self.room.uuid))
+
+        mock_client.kick_user.assert_called_once_with(
+            self.room.room_id,
+            f"@{self.user.username}:matrix.example.com",
+            reason="Role removed in Waldur",
+        )
+
+    def test_keeps_a_reader_who_also_holds_a_project_role(self, mock_client):
+        self._enable(mock_client)
+        self.project.customer.add_user(self.user, CustomerRole.READER)
+        self.project.add_user(self.user, ProjectRole.MEMBER)
+        models.MatrixRoomMember.objects.create(
+            room=self.room,
+            user=self.user,
+            matrix_user_id=f"@{self.user.username}:matrix.example.com",
+            membership_state=models.MembershipStates.JOINED,
+        )
+
+        tasks.sync_project_members_to_room(str(self.room.uuid))
+
+        mock_client.kick_user.assert_not_called()
+        mock_client.invite_user.assert_called_once_with(
+            self.room.room_id, f"@{self.user.username}:matrix.example.com"
+        )
 
 
 @mock.patch("waldur_mastermind.matrix_chat.tasks.matrix_client")
@@ -863,9 +988,17 @@ class BotCommandSenderAuthTest(TestCase):
         }
         return project, room, event
 
-    def test_command_from_authorized_user_dispatches(self, mock_client):
+    def _answer(self, room, event):
+        tasks.answer_command(
+            room.room_id,
+            event["sender"],
+            event["event_id"],
+            event["content"]["body"],
+        )
+        return models.MatrixOutboxMessage.objects.get(room=room)
+
+    def test_command_from_authorized_user_is_answered(self, mock_client):
         mock_client.is_enabled.return_value = True
-        mock_client.get_bot_user_id.return_value = "@waldur-bot:matrix.example.com"
 
         project, room, event = self._build_room_and_event(
             sender_id="@member:matrix.example.com"
@@ -875,36 +1008,37 @@ class BotCommandSenderAuthTest(TestCase):
             user=user,
             matrix_user_id="@member:matrix.example.com",
         )
-        from waldur_core.permissions.fixtures import ProjectRole
-
         project.add_user(user, ProjectRole.MANAGER)
 
-        with mock.patch(
-            "waldur_mastermind.matrix_chat.tasks.handle_bot_command.delay"
-        ) as mock_dispatch:
-            tasks.process_appservice_events("txn1", [event])
+        reply = self._answer(room, event)
 
-        mock_dispatch.assert_called_once_with(
-            room.room_id, "@member:matrix.example.com", event["event_id"], "status"
-        )
-        mock_client.send_reply.assert_not_called()
+        self.assertEqual(reply.reply_to, event["event_id"])
+        self.assertIn("status", reply.body)
+        self.assertNotEqual(reply.body, tasks.ACCESS_DENIED_REPLY)
 
     def test_command_from_unknown_sender_is_denied(self, mock_client):
         mock_client.is_enabled.return_value = True
-        mock_client.get_bot_user_id.return_value = "@waldur-bot:matrix.example.com"
-
-        _, _, event = self._build_room_and_event(
+        _, room, event = self._build_room_and_event(
             sender_id="@stranger:other.example.com"
         )
 
-        with mock.patch(
-            "waldur_mastermind.matrix_chat.tasks.handle_bot_command.delay"
-        ) as mock_dispatch:
-            tasks.process_appservice_events("txn2", [event])
-
-        mock_dispatch.assert_not_called()
         # Friendly reply rather than silence — the sender should know why.
-        mock_client.send_reply.assert_called_once()
+        self.assertEqual(self._answer(room, event).body, tasks.ACCESS_DENIED_REPLY)
+
+    def test_command_from_customer_reader_is_denied(self, mock_client):
+        # Readers are left out of the customer's project rooms, so they get
+        # none of the project data the commands show either.
+        mock_client.is_enabled.return_value = True
+        project, room, event = self._build_room_and_event(
+            sender_id="@reader:matrix.example.com"
+        )
+        user = structure_factories.UserFactory()
+        models.MatrixUserProfile.objects.create(
+            user=user, matrix_user_id="@reader:matrix.example.com"
+        )
+        project.customer.add_user(user, CustomerRole.READER)
+
+        self.assertEqual(self._answer(room, event).body, tasks.ACCESS_DENIED_REPLY)
 
 
 class CleanupAppserviceTransactionsTest(TestCase):
@@ -937,3 +1071,174 @@ class CleanupAppserviceTransactionsTest(TestCase):
         self.assertFalse(
             models.MatrixAppserviceTransaction.objects.filter(pk=old.pk).exists()
         )
+
+
+@mock.patch("waldur_mastermind.matrix_chat.tasks.matrix_client")
+class PruneWebDevicesTaskTest(TestCase):
+    def test_logs_out_stale_web_devices(self, mock_client):
+        mock_client.is_homeserver_configured.return_value = True
+        mock_client.list_web_devices.return_value = [{"device_id": "WALDUR_WEB_A"}]
+        mock_client.stale_web_devices.return_value = ["WALDUR_WEB_A", "WALDUR_WEB_B"]
+
+        tasks.prune_web_devices("@alice:matrix.example.com", "WALDUR_WEB_NEW")
+
+        self.assertEqual(
+            mock_client.stale_web_devices.call_args.kwargs["keep_device_id"],
+            "WALDUR_WEB_NEW",
+        )
+
+        mock_client.logout_device.assert_has_calls(
+            [
+                mock.call("@alice:matrix.example.com", "WALDUR_WEB_A"),
+                mock.call("@alice:matrix.example.com", "WALDUR_WEB_B"),
+            ]
+        )
+
+    def test_one_failed_logout_does_not_stop_the_rest(self, mock_client):
+        mock_client.is_homeserver_configured.return_value = True
+        mock_client.stale_web_devices.return_value = ["WALDUR_WEB_A", "WALDUR_WEB_B"]
+        mock_client.logout_device.side_effect = [RuntimeError("boom"), None]
+
+        tasks.prune_web_devices("@alice:matrix.example.com")
+
+        self.assertEqual(mock_client.logout_device.call_count, 2)
+
+    def test_runs_while_chat_is_switched_off(self, mock_client):
+        mock_client.is_enabled.return_value = False
+        mock_client.is_homeserver_configured.return_value = True
+        mock_client.stale_web_devices.return_value = ["WALDUR_WEB_A"]
+
+        tasks.prune_web_devices("@alice:matrix.example.com")
+
+        mock_client.logout_device.assert_called_once_with(
+            "@alice:matrix.example.com", "WALDUR_WEB_A"
+        )
+
+    def test_skips_without_a_homeserver(self, mock_client):
+        mock_client.is_homeserver_configured.return_value = False
+
+        tasks.prune_web_devices("@alice:matrix.example.com")
+
+        mock_client.list_web_devices.assert_not_called()
+
+
+@mock.patch("waldur_mastermind.matrix_chat.tasks.matrix_client")
+class EndMatrixAccessTaskTest(TestCase):
+    def test_signs_out_every_device_of_deactivated_user(self, mock_client):
+        # Deactivation is the trigger, so the active manager would miss the user.
+        mock_client.is_homeserver_configured.return_value = True
+        user = structure_factories.UserFactory(is_active=False)
+        models.MatrixUserProfile.objects.create(
+            user=user, matrix_user_id="@gone:matrix.example.com", provisioned=True
+        )
+
+        tasks.end_matrix_access(user.uuid.hex)
+
+        mock_client.logout_all_devices.assert_called_once_with(
+            "@gone:matrix.example.com"
+        )
+
+    def test_user_never_provisioned_has_nothing_to_end(self, mock_client):
+        mock_client.is_homeserver_configured.return_value = True
+        user = structure_factories.UserFactory(is_active=False)
+
+        tasks.end_matrix_access(user.uuid.hex)
+
+        mock_client.logout_all_devices.assert_not_called()
+
+    def test_runs_while_chat_is_switched_off(self, mock_client):
+        mock_client.is_enabled.return_value = False
+        mock_client.is_homeserver_configured.return_value = True
+        user = structure_factories.UserFactory(is_active=False)
+        models.MatrixUserProfile.objects.create(
+            user=user, matrix_user_id="@gone:matrix.example.com", provisioned=True
+        )
+
+        tasks.end_matrix_access(user.uuid.hex)
+
+        mock_client.logout_all_devices.assert_called_once_with(
+            "@gone:matrix.example.com"
+        )
+
+    def test_skips_without_a_homeserver(self, mock_client):
+        mock_client.is_homeserver_configured.return_value = False
+        user = structure_factories.UserFactory(is_active=False)
+        models.MatrixUserProfile.objects.create(
+            user=user, matrix_user_id="@gone:matrix.example.com", provisioned=True
+        )
+
+        tasks.end_matrix_access(user.uuid.hex)
+
+        mock_client.logout_all_devices.assert_not_called()
+
+    def test_reactivated_user_keeps_sessions(self, mock_client):
+        # The task retries for minutes; a user reactivated meanwhile may have
+        # started new sessions that must survive.
+        mock_client.is_homeserver_configured.return_value = True
+        user = structure_factories.UserFactory(is_active=True)
+        models.MatrixUserProfile.objects.create(
+            user=user, matrix_user_id="@back:matrix.example.com", provisioned=True
+        )
+
+        tasks.end_matrix_access(user.uuid.hex)
+
+        mock_client.logout_all_devices.assert_not_called()
+
+
+class RevocationRetryTest(TestCase):
+    def test_revocations_keep_retrying_through_a_homeserver_restart(self):
+        # retry_backoff=True starts at 1 s, so three retries are spent within
+        # seconds; revocations must outlast a homeserver restart.
+        for task in (
+            tasks.end_matrix_access,
+            tasks.end_deleted_user_access,
+            tasks.restore_matrix_access,
+            tasks.kick_user_from_room,
+            tasks.kick_member,
+        ):
+            self.assertGreaterEqual(task.retry_backoff, 30, task.name)
+            self.assertGreaterEqual(task.max_retries, 5, task.name)
+
+
+@mock.patch("waldur_mastermind.matrix_chat.tasks.matrix_client")
+class EndDeletedUserAccessTaskTest(TestCase):
+    def test_kicks_from_the_rooms_and_signs_out_every_device(self, mock_client):
+        mock_client.is_homeserver_configured.return_value = True
+
+        tasks.end_deleted_user_access("@gone:matrix.example.com", ["!a:x", "!b:x"])
+
+        self.assertEqual(
+            [c.args[:2] for c in mock_client.kick_user.call_args_list],
+            [
+                ("!a:x", "@gone:matrix.example.com"),
+                ("!b:x", "@gone:matrix.example.com"),
+            ],
+        )
+        mock_client.logout_all_devices.assert_called_once_with(
+            "@gone:matrix.example.com"
+        )
+
+    def test_a_failed_kick_does_not_stop_the_sign_out(self, mock_client):
+        mock_client.is_homeserver_configured.return_value = True
+        mock_client.kick_user.side_effect = RuntimeError("not in room")
+
+        tasks.end_deleted_user_access("@gone:matrix.example.com", ["!a:x"])
+
+        mock_client.logout_all_devices.assert_called_once()
+
+    def test_runs_while_chat_is_switched_off(self, mock_client):
+        mock_client.is_enabled.return_value = False
+        mock_client.is_homeserver_configured.return_value = True
+
+        tasks.end_deleted_user_access("@gone:matrix.example.com")
+
+        mock_client.logout_all_devices.assert_called_once_with(
+            "@gone:matrix.example.com"
+        )
+
+    def test_skips_without_a_homeserver(self, mock_client):
+        mock_client.is_homeserver_configured.return_value = False
+
+        tasks.end_deleted_user_access("@gone:matrix.example.com")
+
+        mock_client.logout_all_devices.assert_not_called()

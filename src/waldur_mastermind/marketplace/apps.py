@@ -144,9 +144,9 @@ class MarketplaceConfig(AppConfig):
         )
 
         signals.post_save.connect(
-            handlers.notify_recipients_when_order_is_created,
+            handlers.notify_recipients_when_order_needs_no_consumer_approval,
             sender=models.Order,
-            dispatch_uid="waldur_mastermind.marketplace.notify_recipients_when_order_is_created",
+            dispatch_uid="waldur_mastermind.marketplace.notify_recipients_when_order_needs_no_consumer_approval",
         )
 
         signals.post_save.connect(
@@ -365,6 +365,12 @@ class MarketplaceConfig(AppConfig):
             handlers.update_customer_of_offering_if_project_has_been_moved,
             sender=structure_models.Project,
             dispatch_uid="waldur_mastermind.marketplace.update_customer_of_offering_if_project_has_been_moved",
+        )
+
+        signals.post_save.connect(
+            handlers.release_grace_pauses_when_project_end_date_changes,
+            sender=structure_models.Project,
+            dispatch_uid="waldur_mastermind.marketplace.release_grace_pauses_when_project_end_date_changes",
         )
 
         signals.post_save.connect(
@@ -611,6 +617,24 @@ class MarketplaceConfig(AppConfig):
         )
 
         signals.post_save.connect(
+            handlers.send_project_group_saved_message,
+            sender=models.ServiceProviderProjectGroup,
+            dispatch_uid="waldur_mastermind.marketplace.send_project_group_saved_message",
+        )
+
+        signals.post_delete.connect(
+            handlers.send_project_group_deleted_message,
+            sender=models.ServiceProviderProjectGroup,
+            dispatch_uid="waldur_mastermind.marketplace.send_project_group_deleted_message",
+        )
+
+        signals.post_save.connect(
+            handlers.send_project_groups_switch_message,
+            sender=models.ServiceProvider,
+            dispatch_uid="waldur_mastermind.marketplace.send_project_groups_switch_message",
+        )
+
+        signals.post_save.connect(
             handlers.backfill_project_groups_when_enabled,
             sender=models.ServiceProvider,
             dispatch_uid="waldur_mastermind.marketplace.backfill_project_groups_when_enabled",
@@ -696,14 +720,9 @@ class MarketplaceConfig(AppConfig):
         )
 
         signals.post_save.connect(
-            handlers.trigger_scim_sync_on_offering_endpoint_change,
-            sender=models.OfferingAccessEndpoint,
-            dispatch_uid="waldur_mastermind.marketplace.trigger_scim_sync_on_offering_endpoint_save",
-        )
-        signals.post_delete.connect(
-            handlers.trigger_scim_sync_on_offering_endpoint_change,
-            sender=models.OfferingAccessEndpoint,
-            dispatch_uid="waldur_mastermind.marketplace.trigger_scim_sync_on_offering_endpoint_delete",
+            handlers.trigger_scim_sync_on_login_nodes_change,
+            sender=models.Offering,
+            dispatch_uid="waldur_mastermind.marketplace.trigger_scim_sync_on_login_nodes_change",
         )
 
         signals.post_save.connect(

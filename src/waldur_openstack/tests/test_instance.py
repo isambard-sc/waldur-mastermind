@@ -28,7 +28,10 @@ from waldur_openstack.tests import factories, fixtures, helpers
 from waldur_openstack.tests.helpers import (
     override_openstack_settings,
 )
-from waldur_openstack.utils import volume_type_name_to_quota_name
+from waldur_openstack.utils import (
+    get_external_network_id,
+    volume_type_name_to_quota_name,
+)
 
 
 class InstanceFilterTest(test.APITestCase):
@@ -373,6 +376,11 @@ class InstanceCreateTest(test.APITestCase):
     def test_service_settings_should_have_external_network_id(self):
         self.openstack_settings.options = {"external_network_id": "invalid"}
         self.openstack_settings.save()
+        # The provider default is only reached when the tenant names no
+        # external network of its own.
+        self.fixture.tenant.external_network_id = ""
+        self.fixture.tenant.external_network_ref = None
+        self.fixture.tenant.save()
 
         subnet_url = factories.SubNetFactory.get_url(self.subnet)
         data = self.get_valid_data(floating_ips=[{"subnet": subnet_url}])
@@ -689,6 +697,48 @@ class InstanceCreateTest(test.APITestCase):
             if volume["name"] == "test-volume"
         ][0]
         self.assertEqual(serialized_volume["type_name"], volume_type.name)
+
+    def test_volume_without_type_has_null_type_name_in_instance_serializer(self):
+        instance = factories.InstanceFactory()
+        factories.VolumeFactory(
+            service_settings=instance.service_settings,
+            project=instance.project,
+            instance=instance,
+            type=None,
+            name="untyped-volume",
+        )
+        url = factories.InstanceFactory.get_url(instance)
+        staff = structure_factories.UserFactory(is_staff=True)
+        self.client.force_authenticate(user=staff)
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        serialized_volume = [
+            volume
+            for volume in response.data["volumes"]
+            if volume["name"] == "untyped-volume"
+        ][0]
+        self.assertIn("type_name", serialized_volume)
+        self.assertIsNone(serialized_volume["type_name"])
+
+    def test_instance_without_availability_zone_has_null_zone_name(self):
+        instance = factories.InstanceFactory(availability_zone=None)
+        staff = structure_factories.UserFactory(is_staff=True)
+        self.client.force_authenticate(user=staff)
+        response = self.client.get(factories.InstanceFactory.get_url(instance))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("availability_zone_name", response.data)
+        self.assertIsNone(response.data["availability_zone_name"])
+
+    def test_instance_with_availability_zone_shows_zone_name(self):
+        zone = self.fixture.instance_availability_zone
+        instance = factories.InstanceFactory(
+            tenant=self.fixture.tenant, availability_zone=zone
+        )
+        staff = structure_factories.UserFactory(is_staff=True)
+        self.client.force_authenticate(user=staff)
+        response = self.client.get(factories.InstanceFactory.get_url(instance))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["availability_zone_name"], zone.name)
 
     def test_user_can_define_instance_availability_zone(self):
         zone = self.fixture.instance_availability_zone
@@ -1877,9 +1927,9 @@ class InstanceUpdateFloatingIPsTest(test.APITestCase):
         self.assertEqual(self.instance.floating_ips.count(), 0)
 
     def test_free_floating_ip_is_used_for_allocation(self):
-        external_network_id = self.fixture.tenant.service_settings.options[
-            "external_network_id"
-        ]
+        # The network the tenant's router is connected to, which may be the
+        # tenant's own rather than the provider default.
+        external_network_id = get_external_network_id(self.fixture.tenant)
         self.fixture.floating_ip.backend_network_id = external_network_id
         self.fixture.floating_ip.save()
         data = {"floating_ips": [{"subnet": self.subnet_url}]}

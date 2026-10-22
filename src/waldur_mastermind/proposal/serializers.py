@@ -4,6 +4,7 @@ from datetime import datetime
 
 import yaml
 from constance import config
+from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db.models import Q
@@ -32,6 +33,7 @@ from waldur_core.structure import models as structure_models
 from waldur_core.structure.models import Customer
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import permissions as marketplace_permissions
+from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.serializers import (
     BasePublicPlanSerializer,
     LimitValueField,
@@ -59,6 +61,8 @@ from waldur_mastermind.proposal.enums import (
     ProposalFieldStates,
     ProposalStates,
     RequestedOfferingStates,
+    ResponsibleRoles,
+    ResultsPublication,
     ReviewerPoolInvitationStatuses,
     RoundStatuses,
     WorkflowStepInstanceStatuses,
@@ -66,7 +70,7 @@ from waldur_mastermind.proposal.enums import (
 )
 
 from . import models, notification_rules, utils, workflow_service
-from .managers import get_connected_calls, holds_live_review
+from .managers import get_connected_calls, get_reviewed_proposals
 
 logger = logging.getLogger(__name__)
 
@@ -112,28 +116,97 @@ APPLICANT_FIELD_MAP: dict[str, list[str]] = {
 }
 
 
-def _is_reviewer_only_view(user, proposal) -> bool:
-    """True if the user views this proposal solely as a reviewer.
+class ApplicantVisibility:
+    """Whether one viewer sees proposals solely as an evaluator, and which
+    applicant attributes the call's visibility config then conceals.
 
-    Returns False for the applicant, call managers, staff, support, and
-    anonymous users — all of whom should see unfiltered data. True for call
-    reviewers and for anyone holding a live review of the proposal.
+    Full-data viewers are staff, support, anyone holding a role on the
+    proposal itself (the applicant team), the proposal's author, and whoever
+    manages the call -- a call manager, or an organiser through the managing
+    organisation. Among the rest, evaluators are call reviewers, panel members
+    and anyone holding a live review of the proposal (an accepted assignment
+    grants no role); they see only what the call exposes. Anyone else is not
+    an evaluator and sees whatever their access otherwise gives them.
+
+    Lookups are per viewer, per call or per proposal set and are memoised, so
+    one instance can resolve a whole listing without a query per row.
     """
-    if not user or user.is_anonymous:
-        return False
-    if user.is_staff or user.is_support:
-        return False
-    if proposal.created_by_id == user.id:
-        return False
-    call_id = proposal.round.call_id
-    if call_id in get_connected_calls(user, CallRole.MANAGER):
-        return False
-    # A reviewer reaches the proposal either through a call role or through a
-    # review they hold on it (an accepted assignment grants no role); both see
-    # only what the call's applicant visibility config exposes.
-    return call_id in get_connected_calls(user, CallRole.REVIEWER) or holds_live_review(
-        user, proposal
-    )
+
+    def __init__(self, user):
+        self.user = user
+        self._evaluator_call_ids = None
+        self._reviewed_proposal_ids = None
+        self._proposal_role_ids = None
+        self._call_managed = {}
+        self._concealed_by_call = {}
+
+    def _evaluates(self, proposal) -> bool:
+        if self._evaluator_call_ids is None:
+            self._evaluator_call_ids = set(
+                get_connected_calls(
+                    self.user, [CallRole.REVIEWER, CallRole.PANEL_MEMBER]
+                )
+            )
+        if proposal.round.call_id in self._evaluator_call_ids:
+            return True
+        if self._reviewed_proposal_ids is None:
+            self._reviewed_proposal_ids = set(get_reviewed_proposals(self.user))
+        return proposal.id in self._reviewed_proposal_ids
+
+    def _on_applicant_team(self, proposal) -> bool:
+        if proposal.created_by_id == self.user.id:
+            return True
+        if self._proposal_role_ids is None:
+            self._proposal_role_ids = set(
+                permissions_utils.get_scope_ids(
+                    self.user, ContentType.objects.get_for_model(models.Proposal)
+                )
+            )
+        return proposal.id in self._proposal_role_ids
+
+    def _manages_call(self, call) -> bool:
+        if call.id not in self._call_managed:
+            self._call_managed[call.id] = call.id in get_connected_calls(
+                self.user, CallRole.MANAGER
+            ) or permissions_utils.has_permission_on_any_source(
+                self.user,
+                permissions_enums.PermissionEnum.UPDATE_CALL,
+                call,
+                proposal_permissions.CALL_PERMISSION_SOURCES,
+            )
+        return self._call_managed[call.id]
+
+    def is_reviewer_only(self, proposal) -> bool:
+        user = self.user
+        if not user or user.is_anonymous:
+            return False
+        if user.is_staff or user.is_support:
+            return False
+        if not self._evaluates(proposal):
+            return False
+        if self._on_applicant_team(proposal):
+            return False
+        return not self._manages_call(proposal.round.call)
+
+    def concealed_attributes(self, proposal) -> set[str] | None:
+        """None for a viewer who is not solely an evaluator of ``proposal``;
+        otherwise the attributes its call's config conceals."""
+        if not self.is_reviewer_only(proposal):
+            return None
+        call_id = proposal.round.call_id
+        if call_id not in self._concealed_by_call:
+            config_model = models.CallApplicantVisibilityConfig
+            exposed = set(config_model.get_exposed_fields_for_call(proposal.round.call))
+            self._concealed_by_call[call_id] = (
+                set(config_model.get_attribute_names()) - exposed
+            )
+        return set(self._concealed_by_call[call_id])
+
+
+def _is_reviewer_only_view(user, proposal) -> bool:
+    """True if the user views this proposal solely as an evaluator; see
+    ``ApplicantVisibility``."""
+    return ApplicantVisibility(user).is_reviewer_only(proposal)
 
 
 # Maps applicant attribute name to the proposal team list (list_users) row
@@ -177,18 +250,27 @@ def get_concealed_applicant_attributes(user, proposal) -> set[str] | None:
     reviewer; such viewers see every attribute. Both the proposal payload and
     the proposal team list derive what to drop from this one set.
     """
-    if not _is_reviewer_only_view(user, proposal):
-        return None
-    config_model = models.CallApplicantVisibilityConfig
-    exposed = set(config_model.get_exposed_fields_for_call(proposal.round.call))
-    return set(config_model.get_attribute_names()) - exposed
+    return ApplicantVisibility(user).concealed_attributes(proposal)
 
 
-def filter_applicant_fields_for_reviewer(data: dict, proposal, user) -> dict:
+def get_applicant_visibility(context: dict, user) -> ApplicantVisibility:
+    """The viewer's ApplicantVisibility, shared through a serializer context
+    so that every row of one response reuses its lookups."""
+    visibility = context.get("_applicant_visibility")
+    if visibility is None or visibility.user != user:
+        visibility = ApplicantVisibility(user)
+        context["_applicant_visibility"] = visibility
+    return visibility
+
+
+def filter_applicant_fields_for_reviewer(
+    data: dict, proposal, user, visibility: ApplicantVisibility | None = None
+) -> dict:
     """Mutate the serialized representation to drop applicant fields that
     are not exposed by the call's visibility config when the user is a
     reviewer-only viewer."""
-    concealed = get_concealed_applicant_attributes(user, proposal)
+    visibility = visibility or ApplicantVisibility(user)
+    concealed = visibility.concealed_attributes(proposal)
     for attr in concealed or ():
         for field_name in APPLICANT_FIELD_MAP.get(attr, []):
             data.pop(field_name, None)
@@ -202,6 +284,44 @@ def filter_team_member_fields(rows, concealed: set[str]):
             for row in rows:
                 row.pop(field_name, None)
     return rows
+
+
+# Maps applicant attribute name to the keys of a checklist answer
+# (AnswerSerializer) that identify the answer's author, a member of the
+# applicant team. ``user`` is the author's primary key: an identity link, so it
+# follows username like the other user identifiers.
+CHECKLIST_ANSWER_FIELD_MAP: dict[str, list[str]] = {
+    "full_name": ["user_name"],
+    "username": ["user"],
+}
+
+
+def filter_checklist_answer_fields(questions, concealed: set[str]):
+    """Drop the answer author keys carrying a concealed applicant attribute
+    from each question's existing answer."""
+    for question in questions:
+        answer = question.get("existing_answer")
+        if not answer:
+            continue
+        for attr in concealed:
+            for field_name in CHECKLIST_ANSWER_FIELD_MAP.get(attr, []):
+                answer.pop(field_name, None)
+    return questions
+
+
+def can_view_proposal_event_feed(user, proposal) -> bool:
+    """Whether the user may read the events logged against the proposal.
+
+    The proposal feed is the applicant team's administration trail: role
+    grants, revocations and expiry changes, and invitations. Its messages are
+    rendered at emit time with the member's and the granter's names, and every
+    event's context carries the acting user's name, username, uuid, IP address
+    and user agent. None of that can be dropped field by field, none of it is
+    governed by the call's applicant visibility config, and none of it is
+    needed to evaluate the proposal -- so evaluators do not read the feed at
+    all, whatever the config exposes.
+    """
+    return not _is_reviewer_only_view(user, proposal)
 
 
 def get_concealed_team_member_query(query_params, concealed: set[str]) -> list[str]:
@@ -846,6 +966,18 @@ class NestedRoundSerializer(serializers.HyperlinkedModelSerializer):
             "status",
             "allocation_date",
             "review_duration_in_days",
+            "lifecycle_state",
+            "evaluation_started_at",
+            "deciding_started_at",
+            "results_published_at",
+            "closed_at",
+        ]
+        read_only_fields = [
+            "lifecycle_state",
+            "evaluation_started_at",
+            "deciding_started_at",
+            "results_published_at",
+            "closed_at",
         ]
         extra_kwargs = {
             "slug": {"required": False},
@@ -1108,6 +1240,8 @@ class PublicCallSerializer(
             # Public so an applicant can be told their evaluation waits for
             # the cut-off.
             "evaluation_start",
+            # Public so an applicant can be told results come with the round.
+            "publish_results",
         )
         view_name = "proposal-public-call-detail"
         extra_kwargs = {
@@ -1329,6 +1463,20 @@ class RequestedResourceSerializer(
     requested_offering_uuid = serializers.UUIDField(write_only=True, required=False)
     call_resource_template_uuid = serializers.UUIDField(write_only=True, required=False)
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # The request's creator is a member of the applicant team: an
+        # evaluator sees them only as far as the call's config exposes them.
+        request = self.context.get("request")
+        if request is not None:
+            filter_applicant_fields_for_reviewer(
+                data,
+                instance.proposal,
+                request.user,
+                get_applicant_visibility(self.context, request.user),
+            )
+        return data
+
     class Meta(NestedRequestedResourceSerializer.Meta):
         fields = NestedRequestedResourceSerializer.Meta.fields + [
             "requested_offering_uuid",
@@ -1458,6 +1606,211 @@ class RequestedResourcePurchaseOrderSerializer(serializers.ModelSerializer):
         }
 
 
+def _validate_awarded_limits(limits, offering, plan):
+    """Hold awarded limits to what the offering's components accept.
+
+    The keys must be the limit components of the plan (or of the offering
+    where there is no plan), and each value inside the component's bounds and
+    precision -- the checks every order placing these limits passes. The
+    running total against ``max_available_limit`` is left to the order that
+    allocation places, as it is for a requested amount.
+    """
+    try:
+        for component, value in marketplace_utils.get_components_map(
+            limits, offering, plan
+        ):
+            marketplace_utils.validate_limit_precision(value, component)
+            marketplace_utils.validate_min_max_limit(value, component)
+    except serializers.ValidationError as exc:
+        detail = exc.detail
+        if isinstance(detail, dict) and "limits" in detail:
+            detail = detail["limits"]
+        raise serializers.ValidationError({"limits": detail})
+
+
+class AwardedResourceSerializer(serializers.ModelSerializer):
+    """An item of the award the allocation decision grants.
+
+    Written by the call manager while the allocation decision is active: the
+    amounts, the call offering it is awarded on, its plan and attributes.
+    ``requested_resource`` names the request the item was prefilled from and is
+    empty for an item the call manager added.
+    """
+
+    url = serializers.SerializerMethodField()
+    requested_offering = NestedRequestedOfferingSerializer(read_only=True)
+    requested_offering_uuid = serializers.UUIDField(
+        write_only=True,
+        required=False,
+        help_text=(
+            "An accepted offering of the proposal's call to award the item on. "
+            "Required when adding an item."
+        ),
+    )
+    requested_resource = serializers.SlugRelatedField(
+        slug_field="uuid", read_only=True, allow_null=True
+    )
+    plan = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=marketplace_models.Plan.objects.all(),
+        required=False,
+        allow_null=True,
+        help_text=(
+            "Plan of the awarded offering. Read back as the plan the item is "
+            "provisioned on: the call offering's plan unless another was set. "
+            "Null (or leaving it out when adding or moving) follows the call "
+            "offering's plan."
+        ),
+    )
+    plan_name = serializers.ReadOnlyField(source="effective_plan.name", allow_null=True)
+    resource = serializers.SlugRelatedField(
+        slug_field="uuid", read_only=True, allow_null=True
+    )
+    resource_name = serializers.ReadOnlyField(source="resource.name", allow_null=True)
+    created_by = serializers.SlugRelatedField(
+        slug_field="uuid", read_only=True, allow_null=True
+    )
+    created_by_name = serializers.ReadOnlyField(
+        source="created_by.full_name", allow_null=True
+    )
+    limits = serializers.DictField(child=LimitValueField(), required=False)
+    attributes = serializers.JSONField(required=False)
+
+    class Meta:
+        model = models.AwardedResource
+        fields = [
+            "uuid",
+            "url",
+            "requested_resource",
+            "requested_offering",
+            "requested_offering_uuid",
+            "plan",
+            "plan_name",
+            "attributes",
+            "limits",
+            "description",
+            "resource",
+            "resource_name",
+            "created_by",
+            "created_by_name",
+            "created",
+            "modified",
+        ]
+        read_only_fields = ("created", "modified")
+
+    def get_url(self, awarded) -> str:
+        return self.context["request"].build_absolute_uri(
+            reverse(
+                "proposal-proposal-awarded_resource-detail",
+                kwargs={
+                    "uuid": awarded.proposal.uuid.hex,
+                    "obj_uuid": awarded.uuid.hex,
+                },
+            )
+        )
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # What allocation provisions, not only an explicit choice.
+        plan = instance.effective_plan
+        data["plan"] = (
+            None if plan is None else self.fields["plan"].to_representation(plan)
+        )
+        return data
+
+    def validate_attributes(self, attributes):
+        if not attributes:
+            return {}
+        if not isinstance(attributes, dict):
+            raise serializers.ValidationError(_("A JSON object is expected."))
+        return attributes
+
+    def validate(self, attrs):
+        proposal = self.instance.proposal if self.instance else attrs["proposal"]
+        call = proposal.round.call
+
+        requested_offering_uuid = attrs.pop("requested_offering_uuid", None)
+        moved = False
+        if requested_offering_uuid is not None:
+            try:
+                requested_offering = call.requestedoffering_set.select_related(
+                    "offering", "plan"
+                ).get(uuid=requested_offering_uuid)
+            except models.RequestedOffering.DoesNotExist:
+                raise serializers.ValidationError(
+                    {
+                        "requested_offering_uuid": _(
+                            "The offering is not part of this call."
+                        )
+                    }
+                )
+            if requested_offering.state != RequestedOfferingStates.ACCEPTED:
+                raise serializers.ValidationError(
+                    {
+                        "requested_offering_uuid": _(
+                            "The offering has not been accepted by its provider."
+                        )
+                    }
+                )
+            moved = (
+                self.instance is None
+                or self.instance.requested_offering_id != requested_offering.id
+            )
+            attrs["requested_offering"] = requested_offering
+        elif self.instance is None:
+            raise serializers.ValidationError(
+                {"requested_offering_uuid": _("This field is required.")}
+            )
+        else:
+            requested_offering = self.instance.requested_offering
+
+        offering = requested_offering.offering
+
+        if "plan" in attrs:
+            plan = attrs["plan"]
+            if plan is not None and plan.offering_id != offering.id:
+                raise serializers.ValidationError(
+                    {"plan": _("The plan does not belong to the awarded offering.")}
+                )
+            if plan is not None and plan.archived:
+                raise serializers.ValidationError({"plan": _("The plan is archived.")})
+        elif moved:
+            # The old plan belongs to another offering: follow the call's.
+            plan = attrs["plan"] = None
+        else:
+            plan = self.instance.plan if self.instance else None
+        # An item without a plan of its own is provisioned on the call's.
+        effective_plan = plan or requested_offering.plan
+
+        limits = (
+            attrs["limits"]
+            if "limits" in attrs
+            else (self.instance.limits if self.instance else {})
+        )
+        # The rule a proposal is submitted under: an amount must be named for
+        # an offering that sells by amount, or allocation provisions nothing.
+        if not models.names_an_amount(offering, limits):
+            raise serializers.ValidationError(
+                {"limits": _("An amount must be awarded for this offering.")}
+            )
+        if "limits" in attrs or moved or "plan" in attrs:
+            _validate_awarded_limits(limits or {}, offering, effective_plan)
+
+        attributes = (
+            attrs["attributes"]
+            if "attributes" in attrs
+            else (self.instance.attributes if self.instance else {})
+        )
+        if "attributes" in attrs or moved:
+            _validate_prepaid_duration(attributes, offering, proposal.round)
+
+        return attrs
+
+    def create(self, validated_data):
+        validated_data["created_by"] = self.context["request"].user
+        return super().create(validated_data)
+
+
 class ProviderRequestedResourceSerializer(NestedRequestedResourceSerializer):
     proposal_name = serializers.ReadOnlyField(source="proposal.name")
 
@@ -1575,6 +1928,16 @@ class ProtectedCallSerializer(PublicCallSerializer):
             "When a submitted proposal's evaluation starts: on submission, or "
             "for all proposals of a round together at its cut-off. Cannot be "
             "changed while the call has proposals submitted or in review."
+        ),
+    )
+    publish_results = serializers.ChoiceField(
+        choices=ResultsPublication.CHOICES,
+        required=False,
+        help_text=(
+            "When applicants learn the allocation decision: immediately, or "
+            "for every proposal of a round together when a call manager "
+            "publishes the round's results. Cannot be changed while decisions "
+            "are held."
         ),
     )
     # The queryset is narrowed to the call's own people in get_fields(); what
@@ -1699,6 +2062,8 @@ class ProtectedCallSerializer(PublicCallSerializer):
             "order_author_user",
             "order_author_user_uuid",
             "order_author_user_name",
+            "carry_over_drafts",
+            "undecided_at_round_completion",
         )
         view_name = "proposal-protected-call-detail"
         protected_fields = ("manager",)
@@ -1759,6 +2124,22 @@ class ProtectedCallSerializer(PublicCallSerializer):
             and call.has_proposals_under_evaluation()
         ):
             raise serializers.ValidationError(models.EVALUATION_START_LOCKED_MESSAGE)
+        return value
+
+    def validate_publish_results(self, value):
+        """Refuse a switch while decisions wait for publication.
+
+        Held decisions are released by publishing their round; switching to
+        ``immediately`` would not release them, it would only change what
+        the next decision does.
+        """
+        call = self.instance
+        if (
+            isinstance(call, models.Call)
+            and value != call.publish_results
+            and call.has_held_decisions()
+        ):
+            raise serializers.ValidationError(models.PUBLISH_RESULTS_LOCKED_MESSAGE)
         return value
 
     def _validate_order_author(self, attrs):
@@ -2029,13 +2410,90 @@ class ProtectedRoundSerializer(
     core_serializers.AugmentedSerializerMixin, NestedRoundSerializer
 ):
     url = serializers.SerializerMethodField()
-    proposals = ProtectedProposalListSerializer(
-        many=True, read_only=True, source="proposal_set"
-    )
+    proposals = serializers.SerializerMethodField()
     review_duration_in_days = serializers.IntegerField(required=False)
+    results_published_by_name = serializers.CharField(
+        source="results_published_by.full_name", read_only=True, allow_null=True
+    )
+    held_decisions_count = serializers.SerializerMethodField(
+        help_text=(
+            "Proposals of the round whose decision is recorded but not yet "
+            "published. After publication, decisions that could not be "
+            "carried out; publishing the results again retries them. Null "
+            "for anyone who may not see held decisions."
+        )
+    )
+    has_proposals = serializers.SerializerMethodField(
+        help_text=(
+            "Whether the round holds any proposal, in any state. A round with "
+            "proposals cannot be deleted. Unlike the proposals list, which "
+            "leaves out what the viewer may not see, this counts every one."
+        )
+    )
 
     class Meta(NestedRoundSerializer.Meta):
-        fields = NestedRoundSerializer.Meta.fields + ["url", "proposals"]
+        fields = NestedRoundSerializer.Meta.fields + [
+            "url",
+            "proposals",
+            "results_published_by_name",
+            "held_decisions_count",
+            "has_proposals",
+            "results_forced_reason",
+            "adopted_at",
+            "adoption_note",
+            "adoption_document",
+            "undecided_at_round_completion",
+        ]
+        # The adoption is recorded through the round's record_adoption action.
+        read_only_fields = NestedRoundSerializer.Meta.read_only_fields + [
+            "results_forced_reason",
+            "adopted_at",
+            "adoption_note",
+            "adoption_document",
+        ]
+        # Null for whoever may not read the adoption yet; see to_representation.
+        extra_kwargs = {
+            **getattr(NestedRoundSerializer.Meta, "extra_kwargs", {}),
+            **{
+                field: {"allow_null": True}
+                for field in (
+                    "results_forced_reason",
+                    "adoption_note",
+                    "adoption_document",
+                )
+            },
+        }
+
+    ADOPTION_FIELDS = ("results_forced_reason", "adoption_note", "adoption_document")
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not self._can_view_adoption(instance):
+            for field in self.ADOPTION_FIELDS:
+                if field in data:
+                    data[field] = None
+        return data
+
+    def _can_view_adoption(self, call_round) -> bool:
+        """Whether the viewer may read the round's adoption record yet.
+
+        Until the results are published the record states the outcome, which
+        only those who may see held decisions know; evaluators on the call
+        learn it with everyone else. Checked once per call.
+        """
+        if not call_round.withholds_results:
+            return True
+        request = self.context.get("request")
+        if not request:
+            return False
+        cache = self.context.setdefault("_held_decisions_visible", {})
+        if call_round.call_id not in cache:
+            cache[call_round.call_id] = (
+                proposal_permissions.user_can_view_held_decisions_of_call(
+                    request.user, call_round.call
+                )
+            )
+        return cache[call_round.call_id]
 
     def get_fields(self):
         fields = super().get_fields()
@@ -2047,6 +2505,68 @@ class ProtectedRoundSerializer(
                 fields["slug"].read_only = True
 
         return fields
+
+    def get_has_proposals(self, call_round) -> bool:
+        # Round lists annotate the count; a single round asks here.
+        count = getattr(call_round, "proposals_count", None)
+        if count is None:
+            return call_round.proposal_set.exists()
+        return count > 0
+
+    @extend_schema_field(serializers.IntegerField(allow_null=True))
+    def get_held_decisions_count(self, call_round) -> int | None:
+        # Null for anyone but the call managers (and staff and support): to
+        # everyone else a held decision is still being made, see
+        # ProposalSerializer.get_decision_held. Checked once per call.
+        request = self.context.get("request")
+        if not request:
+            return None
+        cache = self.context.setdefault("_held_decisions_visible", {})
+        if call_round.call_id not in cache:
+            cache[call_round.call_id] = (
+                proposal_permissions.user_can_view_held_decisions_of_call(
+                    request.user, call_round.call
+                )
+            )
+        if not cache[call_round.call_id]:
+            return None
+        # Round lists annotate the count; a single round counts it here.
+        count = getattr(call_round, "held_decisions_count", None)
+        if count is None:
+            count = call_round.proposal_set.filter(decision_held=True).count()
+        return count
+
+    @extend_schema_field(ProtectedProposalListSerializer(many=True))
+    def get_proposals(self, call_round):
+        """The round's proposals as this viewer may see them.
+
+        Every call role lists the round, evaluators included. An evaluator
+        (see ``get_concealed_applicant_attributes``) is not shown other
+        applicants' drafts -- an unsubmitted proposal is nothing to evaluate --
+        and sees the creator only as far as the call's applicant visibility
+        config exposes it.
+        """
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        visibility = get_applicant_visibility(self.context, user)
+        rows = []
+        if "proposal_set" in getattr(call_round, "_prefetched_objects_cache", {}):
+            # A round list prefetches them for every row at once.
+            proposals = call_round.proposal_set.all()
+        else:
+            proposals = call_round.proposal_set.select_related(
+                "round__call", "created_by", "approved_by"
+            )
+        for proposal in proposals:
+            concealed = visibility.concealed_attributes(proposal)
+            if concealed is not None and proposal.state == ProposalStates.DRAFT:
+                continue
+            data = ProtectedProposalListSerializer(proposal, context=self.context).data
+            for attr in concealed or ():
+                for field_name in APPLICANT_FIELD_MAP.get(attr, []):
+                    data.pop(field_name, None)
+            rows.append(data)
+        return rows
 
     def get_url(self, call_round) -> str:
         return self.context["request"].build_absolute_uri(
@@ -2247,6 +2767,7 @@ class ProposalSerializer(
     compliance_status = serializers.SerializerMethodField()
     can_submit = serializers.SerializerMethodField()
     awaiting_manual_advance = serializers.SerializerMethodField()
+    decision_held = serializers.SerializerMethodField()
 
     class Meta:
         model = models.Proposal
@@ -2309,6 +2830,7 @@ class ProposalSerializer(
             "compliance_status",
             "can_submit",
             "awaiting_manual_advance",
+            "decision_held",
             "workflow_step",
         ]
         read_only_fields = (
@@ -2449,10 +2971,32 @@ class ProposalSerializer(
         if hasattr(obj, "_awaiting_manual_step"):
             return bool(
                 obj.workflow_step
+                and not obj.decision_held
                 and obj._awaiting_manual_step
                 and obj._latest_step_status == WorkflowStepInstanceStatuses.COMPLETED
             )
         return workflow_service.is_awaiting_manual_advance(obj)
+
+    @extend_schema_field(serializers.BooleanField(allow_null=True))
+    def get_decision_held(self, obj) -> bool | None:
+        """Whether the allocation decision is made but held for the round.
+
+        Null for anyone but the call managers (and staff and support): to
+        everyone else a held decision is still being made, and a false here
+        would tell them apart.
+        """
+        request = self.context.get("request")
+        if not request:
+            return None
+        # The answer depends on the call and on whether the user is the
+        # applicant, so a list checks once per call, not per proposal.
+        cache = self.context.setdefault("_held_decision_visible", {})
+        key = (obj.round.call_id, obj.created_by_id == request.user.id)
+        if key not in cache:
+            cache[key] = proposal_permissions.user_can_view_held_decision(
+                request.user, obj
+            )
+        return obj.decision_held if cache[key] else None
 
 
 class RoundReviewerSerializer(serializers.Serializer):
@@ -5293,6 +5837,21 @@ class CallWorkflowStepNotificationRuleSerializer(
     call_uuid = serializers.UUIDField(
         source="workflow_step.call.uuid", read_only=True, format="hex"
     )
+    notified_proposal_roles = serializers.SlugRelatedField(
+        slug_field="name",
+        many=True,
+        required=False,
+        queryset=Role.objects.filter(
+            is_active=True,
+            content_type__app_label="proposal",
+            content_type__model="proposal",
+        ),
+        help_text=(
+            "Only for an applicant audience: names of the proposal roles whose "
+            "holders are notified. Empty notifies the proposal creator and "
+            "every member of the proposal team."
+        ),
+    )
 
     class Meta:
         model = models.CallWorkflowStepNotificationRule
@@ -5309,6 +5868,7 @@ class CallWorkflowStepNotificationRuleSerializer(
             "recipient",
             "days_before",
             "is_enabled",
+            "notified_proposal_roles",
         ]
         read_only_fields = ("uuid", "created", "modified")
         extra_kwargs = {
@@ -5369,15 +5929,46 @@ class CallWorkflowStepNotificationRuleSerializer(
                 }
             )
 
+        if "notified_proposal_roles" in attrs:
+            roles = attrs["notified_proposal_roles"]
+        elif self.instance:
+            roles = list(self.instance.notified_proposal_roles.all())
+        else:
+            roles = []
+        if (
+            roles
+            and workflow_step is not None
+            and not notification_rules.is_applicant_recipient(recipient, workflow_step)
+        ):
+            raise serializers.ValidationError(
+                {
+                    "notified_proposal_roles": _(
+                        "Proposal roles can only be chosen for a rule that "
+                        "notifies the applicant."
+                    )
+                }
+            )
+
         # Uniqueness of (workflow_step, trigger, recipient) is enforced by the
         # model's unique_together via DRF's UniqueTogetherValidator.
         return attrs
 
 
 class CallWorkflowStepNotificationRuleNestedSerializer(serializers.ModelSerializer):
+    notified_proposal_roles = serializers.SlugRelatedField(
+        slug_field="name", many=True, read_only=True
+    )
+
     class Meta:
         model = models.CallWorkflowStepNotificationRule
-        fields = ["uuid", "trigger", "recipient", "days_before", "is_enabled"]
+        fields = [
+            "uuid",
+            "trigger",
+            "recipient",
+            "days_before",
+            "is_enabled",
+            "notified_proposal_roles",
+        ]
         read_only_fields = fields
 
 
@@ -5653,6 +6244,16 @@ class ProposalWorkflowStepInstanceSerializer(serializers.ModelSerializer):
         # reviewer_identity_visible_to_submitters gate.
         if not self.context.get("can_view_step_actors"):
             data["completed_by"] = None
+        elif data["completed_by"] is not None and self._completed_by_applicant(
+            instance
+        ):
+            # The step actor gate admits the whole call team, evaluators
+            # included; an applicant-side completer (award_response, or the
+            # author wherever they acted) is applicant identity, which an
+            # evaluator sees only if the call exposes it.
+            concealed = self.context.get("concealed_applicant_attributes") or ()
+            if "username" in concealed:
+                data["completed_by"] = None
         # Hide the reviewer/panel verdict and free-text commentary on the peer
         # review steps from submitters when the call keeps reviews private. This
         # must strip *every* field that surfaces the reviewer's words:
@@ -5662,6 +6263,17 @@ class ProposalWorkflowStepInstanceSerializer(serializers.ModelSerializer):
         # the mask exists to hide. The applicant still learns the *decision* from
         # the proposal's own state and the call manager's allocation comment;
         # what stays private here is the reviewer's step-level reasoning.
+        # A decision held for the round's publication is still being made,
+        # as far as the applicant side can tell.
+        if instance.step == workflow_service.DECISION_STEP and self.context.get(
+            "decision_withheld"
+        ):
+            data["status"] = WorkflowStepInstanceStatuses.ACTIVE
+            data["outcome"] = None
+            data["outcome_reason"] = ""
+            data["rejection_reason"] = None
+            data["completed_at"] = None
+            data["completed_by"] = None
         if instance.step in self.REVIEW_STEPS and not self.context.get(
             "can_view_review_content"
         ):
@@ -5669,6 +6281,11 @@ class ProposalWorkflowStepInstanceSerializer(serializers.ModelSerializer):
             data["outcome_reason"] = ""
             data["rejection_reason"] = None
         return data
+
+    def _completed_by_applicant(self, obj) -> bool:
+        if obj.completed_by_id == obj.proposal.created_by_id:
+            return True
+        return self.get_responsible_role(obj) == ResponsibleRoles.APPLICANT
 
     def _get_call_step(self, obj):
         """Resolve the per-call ``CallWorkflowStep`` for this instance.
@@ -5859,6 +6476,32 @@ class RejectWorkflowStepSerializer(serializers.Serializer):
     )
 
 
+class ReopenDecisionSerializer(serializers.Serializer):
+    reason = serializers.CharField(
+        required=True,
+        help_text=(
+            "Why the held decision is taken back, e.g. the board changed the "
+            "outcome when adopting the list. Never sent to the applicant and "
+            "kept out of the proposal's event feed, which the applicant team "
+            "reads; recorded in the server log."
+        ),
+    )
+    deadline = serializers.DateTimeField(
+        required=False,
+        allow_null=True,
+        default=None,
+        help_text=(
+            "New deadline for the decision. Without one, a deadline that has "
+            "passed is cleared and one still ahead is kept."
+        ),
+    )
+
+    def validate_deadline(self, value):
+        if value is not None and value <= timezone.now():
+            raise serializers.ValidationError(_("The deadline must be in the future."))
+        return value
+
+
 class CompleteWorkflowStepResponseSerializer(serializers.Serializer):
     detail = serializers.CharField()
     proposal_state = serializers.CharField(
@@ -5922,3 +6565,109 @@ class DashboardSubmitterStatsSerializer(serializers.Serializer):
     accepted = serializers.IntegerField(read_only=True)
     rejected = serializers.IntegerField(read_only=True)
     canceled = serializers.IntegerField(read_only=True)
+
+
+class PublishRoundResultsSerializer(serializers.Serializer):
+    force = serializers.BooleanField(
+        default=False,
+        help_text="Publish although some proposals of the round have no decision.",
+    )
+    reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        help_text="Why results are published early. Required with force.",
+    )
+
+    def validate(self, attrs):
+        if attrs["force"] and not attrs["reason"].strip():
+            raise serializers.ValidationError(
+                {"reason": _("A reason is required to publish with force.")}
+            )
+        return attrs
+
+
+class PublishRoundResultsRefusalSerializer(serializers.Serializer):
+    detail = serializers.CharField(read_only=True)
+    undecided_count = serializers.IntegerField(
+        read_only=True,
+        help_text=(
+            "Proposals of the round without a decision. Present when publishing "
+            "is refused because of them; publish with force and a reason to go "
+            "ahead anyway."
+        ),
+    )
+
+
+class PublishRoundResultsFailureSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField(read_only=True)
+    name = serializers.CharField(read_only=True)
+
+
+class PublishRoundResultsResponseSerializer(ProtectedRoundSerializer):
+    failed_proposals = PublishRoundResultsFailureSerializer(
+        many=True,
+        read_only=True,
+        help_text=(
+            "Proposals whose held decision could not be carried out. They stay "
+            "held; publishing the round's results again retries them."
+        ),
+    )
+
+    class Meta(ProtectedRoundSerializer.Meta):
+        fields = ProtectedRoundSerializer.Meta.fields + ["failed_proposals"]
+
+
+class CompleteRoundRefusalSerializer(serializers.Serializer):
+    detail = serializers.CharField(read_only=True)
+    held_decisions_count = serializers.IntegerField(
+        read_only=True,
+        required=False,
+        help_text=(
+            "Decisions of the round whose release failed at publication and "
+            "that were never announced. Present when completing is refused "
+            "because of them; publish the results again to retry them."
+        ),
+    )
+    undecided_count = serializers.IntegerField(
+        read_only=True,
+        required=False,
+        help_text=(
+            "Proposals of the round without a decision. Present when "
+            "completing is refused because of them under the refuse rule."
+        ),
+    )
+
+
+class CompleteRoundResponseSerializer(ProtectedRoundSerializer):
+    rejected_proposals = PublishRoundResultsFailureSerializer(
+        many=True,
+        read_only=True,
+        help_text=("Proposals without a decision that completing the round rejected."),
+    )
+    failed_proposals = PublishRoundResultsFailureSerializer(
+        many=True,
+        read_only=True,
+        help_text=(
+            "Proposals without a decision whose rejection failed. The round "
+            "stays open; completing it again retries them."
+        ),
+    )
+
+    class Meta(ProtectedRoundSerializer.Meta):
+        fields = ProtectedRoundSerializer.Meta.fields + [
+            "rejected_proposals",
+            "failed_proposals",
+        ]
+
+
+class RoundAdoptionSerializer(serializers.ModelSerializer):
+    """The adoption of a round's results by the body entitled to adopt them."""
+
+    class Meta:
+        model = models.Round
+        fields = ["adopted_at", "adoption_note", "adoption_document"]
+        extra_kwargs = {
+            "adopted_at": {"required": True},
+            "adoption_document": {"validators": [DocumentValidator]},
+        }

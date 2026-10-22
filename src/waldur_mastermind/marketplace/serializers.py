@@ -1,9 +1,12 @@
+import dataclasses
 import datetime
+import functools
 import ipaddress
 import logging
 import math
 import re
 import uuid as uuid_lib
+from collections.abc import Callable
 from decimal import Decimal
 from typing import Literal, cast
 
@@ -21,7 +24,16 @@ from django.core.exceptions import (
 )
 from django.core.validators import DomainNameValidator
 from django.db import transaction
-from django.db.models import Count, Q, QuerySet, Sum
+from django.db.models import (
+    Count,
+    Exists,
+    Manager,
+    OuterRef,
+    Prefetch,
+    Q,
+    QuerySet,
+    Sum,
+)
 from django.urls import resolve
 from django.utils import timezone
 from django.utils.text import slugify
@@ -56,12 +68,15 @@ from waldur_core.core.models import (
 from waldur_core.core.validators import BackendURLValidator, validate_ssh_public_key
 from waldur_core.media.validators import ImageValidator
 from waldur_core.permissions import models as permission_models
+from waldur_core.permissions import serializers as permission_serializers
 from waldur_core.permissions.enums import TYPE_MAP, PermissionEnum
 from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import (
+    build_role_index,
     count_users,
     get_permissions,
     has_permission,
+    has_permission_on_any_source,
 )
 from waldur_core.quotas.serializers import QuotaSerializer
 from waldur_core.structure import models as structure_models
@@ -122,6 +137,7 @@ from waldur_mastermind.marketplace.enums import (
     OrderStatesType,
     OrderTypes,
     ResourceAction,
+    ResourceApiKeyActions,
     ResourceStates,
     ResourceStatesType,
     RobotAccountStates,
@@ -442,11 +458,25 @@ class LifecyclePluginOptionsSerializer(serializers.Serializer):
         required=False,
         help_text=(
             "Include this offering in outbound SCIM user entitlement sync. "
-            "When unset or false, SSH access endpoints on this offering "
-            "are not pushed to the remote SCIM service even if "
+            "Login hosts are read from scim_login_nodes. When unset or false, "
+            "this offering is not pushed to the remote SCIM service even if "
             "SCIM_MEMBERSHIP_SYNC_ENABLED is on."
         ),
     )
+    scim_login_nodes = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True,
+        help_text=(
+            "Bare hostnames of login nodes included in outbound SCIM "
+            "entitlements when enable_scim_entitlements is set. Each entry is "
+            "a DNS hostname only (for example login.example.org): stored "
+            "lowercased, with no ssh:// URL, user@host, or host:port. These "
+            "are not access links and do not appear in the resource access "
+            "dropdown."
+        ),
+    )
+    _scim_login_node_validator = DomainNameValidator()
     enable_resource_access_subnets = serializers.BooleanField(
         required=False,
         help_text="If set to True, an Access subnets tab is shown on resource "
@@ -598,6 +628,38 @@ class LifecyclePluginOptionsSerializer(serializers.Serializer):
 
     def validate_auto_approve_for_roles(self, value):
         return validate_project_or_customer_role_names(value)
+
+    def validate_scim_login_nodes(self, value):
+        """Store bare, lowercased hostnames. A colon would split the SCIM URN."""
+        normalized = []
+        seen = set()
+        for entry in value:
+            hostname = entry.strip().lower().rstrip(".")
+            if (
+                not hostname
+                or "://" in hostname
+                or any(char in hostname for char in "@:/")
+            ):
+                raise rf_exceptions.ValidationError(
+                    _(
+                        "Each login node must be a bare hostname, for example "
+                        "login.example.org."
+                    )
+                )
+            try:
+                self._scim_login_node_validator(hostname)
+            except ValidationError:
+                raise rf_exceptions.ValidationError(
+                    _(
+                        "Each login node must be a bare hostname, for example "
+                        "login.example.org."
+                    )
+                )
+            if hostname in seen:
+                continue
+            seen.add(hostname)
+            normalized.append(hostname)
+        return normalized
 
     def validate_latest_date_for_resource_termination(self, value):
         try:
@@ -971,6 +1033,15 @@ class AgentPluginOptionsSerializer(serializers.Serializer):
         "resource, but the agent does not touch SLURM QoS. The agent config "
         "may override this per deployment.",
     )
+    enable_api_key_provisioning = serializers.BooleanField(
+        required=False,
+        help_text="Declares that the site agent can govern resource API keys "
+        "one by one: request, assign, limit, pause, resume and delete them. "
+        "Without it a resource's keys can only be revealed and rotated. Nothing "
+        "checks the claim: turn it on only if the agent's backend supports "
+        "per-key commands (such as the Envoy AI Gateway); on one that does not "
+        "(such as Ceph S3) every such command errs.",
+    )
 
 
 class OfferingResourceDisplayOptionsSerializer(serializers.Serializer):
@@ -1008,6 +1079,10 @@ class OfferingResourceDisplayOptionsSerializer(serializers.Serializer):
         default=False,
         help_text="Show a warning about unrecoverable loss of the SSH "
         "private key on the OpenStack instance order form.",
+    )
+    hide_api_keys_tab = serializers.BooleanField(
+        required=False,
+        help_text="Hide the API keys tab on resources of this offering.",
     )
 
     def validate_disabled_resource_actions(self, value):
@@ -1471,7 +1546,9 @@ class OrderNotificationSecretOptionsSerializer(serializers.Serializer):
         allow_empty=True,
         max_length=MAX_ORDER_NOTIFICATION_EMAILS,
         help_text="Email addresses notified about every new order for this "
-        "offering, regardless of whether the order needs approval. Intended for "
+        "offering, once the consumer side has approved it, or when it is placed "
+        "if it needs no consumer approval. Provider approval is not awaited. "
+        "Intended for "
         "provider-side mailboxes which do not belong to a Waldur user, so these "
         "addresses are notified even if a user with the same address disabled "
         f"notifications. At most {MAX_ORDER_NOTIFICATION_EMAILS} addresses.",
@@ -1483,8 +1560,9 @@ class OrderNotificationSecretOptionsSerializer(serializers.Serializer):
         max_length=MAX_ORDER_NOTIFICATION_ROLES,
         help_text="List of organization or offering role names (e.g. "
         "'CUSTOMER.OWNER', 'OFFERING.MANAGER') whose holders are notified about "
-        "every new order for this offering, regardless of whether the order "
-        "needs approval. Names are resolved on the provider organization and on "
+        "every new order for this offering, once the consumer side has approved "
+        "it, or when it is placed if it needs no consumer approval. Provider "
+        "approval is not awaited. Names are resolved on the provider organization and on "
         "the offering itself. Users who disabled notifications in their profile "
         f"are skipped. At most {MAX_ORDER_NOTIFICATION_ROLES} names.",
     )
@@ -2014,8 +2092,13 @@ class OfferingGroupSerializer(
                 raise serializers.ValidationError(
                     {"customer": _("Customer should be a service provider.")}
                 )
-            if not has_permission(
-                self.context["request"], PermissionEnum.CREATE_OFFERING, customer
+            # A role on the organization's ServiceProvider counts as well, as it
+            # does for updating and deleting a group.
+            if not has_permission_on_any_source(
+                self.context["request"],
+                PermissionEnum.CREATE_OFFERING,
+                customer,
+                ["*", "serviceprovider"],
             ):
                 raise PermissionDenied()
         return attrs
@@ -5975,9 +6058,11 @@ def update_or_create_service_settings_for_offering(
         )
         offering.save()
 
+    # None leaves the certificate alone: the integration form edits one field
+    # at a time, and an edit of any other field used to clear it.
     if certificate:
         offering.scope.options["certificate"] = certificate
-    else:
+    elif certificate is not None:
         offering.scope.options.pop("certificate", None)
 
     offering.scope.save()
@@ -6059,7 +6144,27 @@ class OfferingIntegrationUpdateSerializer(serializers.ModelSerializer):
         self._joining_offerings = self._validate_account_scope_switch(
             attrs.get("plugin_options", {})
         )
+        self._move_certificate_to_secret_options(attrs)
         return attrs
+
+    def _move_certificate_to_secret_options(self, attrs):
+        """The OpenStack discovery wizard sends the API certificate with the
+        other service attributes; it belongs with the secret option, which is
+        validated and kept in step with the service settings."""
+        service_attributes = attrs.get("service_attributes") or {}
+        if "certificate" not in service_attributes:
+            return
+        certificate = service_attributes.pop("certificate") or ""
+        if certificate:
+            try:
+                core_validators.validate_x509_certificate(certificate)
+            except ValidationError as e:
+                raise rf_exceptions.ValidationError(
+                    {"service_attributes": {"certificate": e.messages}}
+                )
+        attrs.setdefault("secret_options", {}).setdefault(
+            "openstack_api_tls_certificate", certificate
+        )
 
     def _validate_account_scope_switch(self, plugin_options) -> list | None:
         """Refuse moving this offering into provider scope while usernames disagree.
@@ -6122,6 +6227,7 @@ class OfferingIntegrationUpdateSerializer(serializers.ModelSerializer):
 
     def _update_service_attributes(self, instance, validated_data):
         service_attributes = validated_data.pop("service_attributes", {})
+        # Only a request that names the certificate changes it; see validate().
         certificate = validated_data.get("secret_options", {}).get(
             "openstack_api_tls_certificate"
         )
@@ -6930,8 +7036,55 @@ class DashboardMyOrderSerializer(serializers.Serializer):
     created = serializers.DateTimeField(read_only=True)
 
 
+class OrderDetailsListSerializer(serializers.ListSerializer):
+    """Loads what a page of orders needs once, rather than once per order."""
+
+    def to_representation(self, data):
+        orders = list(data.all() if isinstance(data, Manager) else data)
+        OrderDetailsSerializer.load_page(orders)
+        return super().to_representation(orders)
+
+
 class OrderDetailsSerializer(BaseOrderSerializer):
+    # Apps that add a field to this serializer (see marketplace_support's
+    # issue) register here a function that loads what the field reads for a
+    # whole page of orders at once.
+    page_loaders: list[Callable[[list[models.Order]], None]] = []
+
+    @classmethod
+    def load_page(cls, orders: list[models.Order]) -> None:
+        for loader in cls.page_loaders:
+            loader(orders)
+
+    @staticmethod
+    def eager_load(queryset):
+        """The relations the fields of this serializer read."""
+        return queryset.select_related(
+            "resource",
+            "project",
+            "project__customer",
+            "offering",
+            "offering__customer",
+            "offering__category",
+            "plan",
+            "plan__offering",
+            "old_plan",
+            "old_plan__offering",
+            "created_by",
+            "consumer_reviewed_by",
+            "provider_reviewed_by",
+            "auto_approved_by_rule",
+        ).prefetch_related(
+            # old_plan_billing_mode / new_plan_billing_mode resolve each plan
+            # against its offering's components.
+            "plan__offering__components",
+            "old_plan__offering__components",
+            # fixed_price and activation_price sum the plan's components.
+            "plan__components__component",
+        )
+
     class Meta(BaseOrderSerializer.Meta):
+        list_serializer_class = OrderDetailsListSerializer
         fields = BaseOrderSerializer.Meta.fields + (
             "url",
             "consumer_reviewed_by",
@@ -7306,6 +7459,18 @@ class OrderCreateSerializer(
     # nothing downstream expects.
     type = NaturalChoiceField(choices=OrderTypes.CHOICES, read_only=True)
 
+    # The slug given on create names the new resource, not the order.
+    slug_create_permission = PermissionEnum.SET_RESOURCE_SLUG
+    slug_model = models.Resource
+    slug = serializers.SlugField(
+        required=False,
+        allow_blank=True,
+        max_length=50,
+        help_text="Slug of the new resource. Used when the caller is staff or "
+        "holds RESOURCE.SET_SLUG on the project, the offering or their "
+        "organizations; otherwise ignored.",
+    )
+
     class Meta:
         model = models.Order
         fields = BaseOrderSerializer.Meta.fields + (
@@ -7378,6 +7543,12 @@ class OrderCreateSerializer(
             project=validated_data["project"], offering=validated_data["offering"]
         ).generate_slug()
 
+    def get_slug_permission_scope(self, attrs):
+        return (
+            models.Resource(project=attrs["project"], offering=attrs["offering"]),
+            permissions.RESOURCE_SLUG_PERMISSION_SOURCES,
+        )
+
     def validate_project(
         self, project: structure_models.Project
     ) -> structure_models.Project:
@@ -7416,6 +7587,7 @@ class OrderCreateSerializer(
             limits=validated_data.get("limits") or {},
             attributes=attributes,
             name=attributes.get("name") or "",
+            slug=validated_data.get("slug") or "",
         )
         # Set end_date BEFORE init_cost so prepaid duration is included.
         # Use order start_date as offset base when it is in the future so
@@ -8032,6 +8204,31 @@ class AggregatedAccessSubnetsSerializer(serializers.Serializer):
     organization_subnets = OrganizationAccessSubnetRowSerializer(many=True)
 
 
+@dataclasses.dataclass
+class ResourcePage:
+    """What a page of resources needs about its viewer, loaded once for the page.
+
+    Attached to every resource of the page as ``serialization_page`` by
+    ``ResourceListSerializer``. Fields left as None are not loaded, and the
+    serializer falls back to its per-resource lookups for them.
+    """
+
+    scopes: "utils.ResourceViewerScopes | None" = None
+    role_index: dict | None = None
+    usernames: dict | None = None
+    requires_reconsent: dict | None = None
+    period_usages: dict | None = None
+
+
+class ResourceListSerializer(serializers.ListSerializer):
+    """Loads what a page of resources needs once, rather than once per row."""
+
+    def to_representation(self, data):
+        resources = list(data.all() if isinstance(data, Manager) else data)
+        self.child.load_page(resources)
+        return super().to_representation(resources)
+
+
 class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerializer):
     project_slug = serializers.ReadOnlyField(source="project.slug")
     customer_slug = serializers.ReadOnlyField(source="project.customer.slug")
@@ -8150,11 +8347,152 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
             "offering_components",
         )
         view_name = "marketplace-resource-detail"
+        list_serializer_class = ResourceListSerializer
         extra_kwargs = dict(
             **BaseItemSerializer.Meta.extra_kwargs,
             url={"lookup_field": "uuid"},
             end_date_requested_by={"lookup_field": "uuid", "view_name": "user-detail"},
         )
+
+    @staticmethod
+    def eager_load(queryset):
+        """The relations the fields of this serializer read, for a list."""
+        orders = OrderDetailsSerializer.eager_load(models.Order.objects.all())
+        return (
+            queryset.select_related(
+                "offering",
+                "offering__category",
+                "offering__customer__serviceprovider",
+                "offering__parent",
+                "project",
+                "project__customer",
+                "plan",
+                "plan__offering",
+                "parent",
+            )
+            .prefetch_related(
+                # offering_components and the billing mode behind
+                # is_usage_based, is_limit_based and renewal_date.
+                "offering__components",
+                "endpoints",
+                # creation_order and order_in_progress (see the model).
+                Prefetch(
+                    "order_set",
+                    queryset=orders.filter(type=OrderTypes.CREATE),
+                    to_attr="prefetched_create_orders",
+                ),
+                Prefetch(
+                    "order_set",
+                    queryset=orders.filter(state__in=OrderStates.PENDING_STATES),
+                    to_attr="prefetched_pending_orders",
+                ),
+            )
+            .annotate(
+                # One subquery rather than an api_keys.exists() per row.
+                has_api_keys_annotation=Exists(
+                    models.ResourceApiKey.objects.filter(resource=OuterRef("pk"))
+                )
+            )
+        )
+
+    def load_page(self, resources: list[models.Resource]) -> None:
+        """Answer the per-row viewer questions for a whole page at once."""
+        if not resources:
+            return
+        fields = self.fields
+        if "order_in_progress" in fields or "creation_order" in fields:
+            OrderDetailsSerializer.load_page(
+                [
+                    order
+                    for resource in resources
+                    for attr in (
+                        "prefetched_create_orders",
+                        "prefetched_pending_orders",
+                    )
+                    for order in getattr(resource, attr, None) or []
+                ]
+            )
+
+        page = ResourcePage()
+        if "limit_usage" in fields:
+            page.period_usages = utils.load_current_period_usages(resources)
+        for resource in resources:
+            resource.serialization_page = page
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if user is None or not user.is_authenticated:
+            return
+
+        offering_ids = {resource.offering_id for resource in resources}
+        if not (user.is_staff or user.is_support):
+            page.scopes = utils.ResourceViewerScopes(
+                user, [resource.id for resource in resources]
+            )
+            if "can_terminate" in fields:
+                page.role_index = build_role_index(
+                    user,
+                    [
+                        (PermissionEnum.TERMINATE_RESOURCE, scope)
+                        for resource in resources
+                        for scope in (
+                            resource.project,
+                            resource.project.customer,
+                            resource.offering.customer,
+                        )
+                    ],
+                )
+        if "username" in fields:
+            page.usernames = dict(
+                models.OfferingUser.objects.filter(
+                    user=user, offering_id__in=offering_ids
+                ).values_list("offering_id", "username")
+            )
+        if "user_requires_reconsent" in fields:
+            page.requires_reconsent = self._load_requires_reconsent(
+                user,
+                {resource.offering_id: resource.offering for resource in resources},
+            )
+
+    @staticmethod
+    def _load_requires_reconsent(user, offerings) -> dict:
+        """``get_user_requires_reconsent`` for many offerings, by offering id."""
+        if not config.ENFORCE_USER_CONSENT_FOR_OFFERINGS:
+            return {}
+        if user.is_staff or user.is_support:
+            return {}
+        candidates = [
+            offering_id
+            for offering_id, offering in offerings.items()
+            if offering.plugin_options.get(
+                "service_provider_can_create_offering_user", False
+            )
+        ]
+        active_tos = {
+            tos.offering_id: tos
+            for tos in models.OfferingTermsOfService.objects.filter(
+                offering_id__in=candidates, is_active=True
+            )
+        }
+        consents = {}
+        for consent in models.UserOfferingConsent.objects.filter(
+            user=user, offering_id__in=list(active_tos), revocation_date__isnull=True
+        ):
+            # The default ordering puts the consent .first() would pick first.
+            consents.setdefault(consent.offering_id, consent)
+        result = {}
+        for offering_id, tos in active_tos.items():
+            consent = consents.get(offering_id)
+            if consent is None:
+                result[offering_id] = True
+            else:
+                result[offering_id] = (
+                    tos.requires_reconsent and consent.version != tos.version
+                )
+        return result
+
+    def _page(self, resource) -> ResourcePage | None:
+        return getattr(resource, "serialization_page", None)
 
     state = serializers.SerializerMethodField()
     scope = core_serializers.GenericRelatedField(read_only=True)
@@ -8247,8 +8585,14 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
 
     def get_can_terminate(self, resource) -> bool:
         view = self.context["view"]
+        page = self._page(resource)
         try:
-            permissions.user_can_terminate_resource(view.request, view, resource)
+            permissions.user_can_terminate_resource(
+                view.request,
+                view,
+                resource,
+                role_index=page.role_index if page else None,
+            )
         except APIException:
             return False
         except ObjectDoesNotExist:
@@ -8269,6 +8613,9 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
         return not check_pending_order_exists(resource)
 
     def get_username(self, resource) -> str | None:
+        page = self._page(resource)
+        if page and page.usernames is not None:
+            return page.usernames.get(resource.offering_id)
         user = self.context["request"].user
         offering_user = models.OfferingUser.objects.filter(
             offering=resource.offering, user=user
@@ -8296,7 +8643,13 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
         if not resource.is_limit_based or not resource.plan:
             return {}
 
-        return utils.get_current_period_usage(resource)
+        page = self._page(resource)
+        usages = (
+            page.period_usages.get(resource.id)
+            if page and page.period_usages is not None
+            else None
+        )
+        return utils.get_current_period_usage(resource, usages=usages)
 
     def get_available_actions(self, resource: models.Resource) -> list[str]:
         return plugins.manager.get_available_resource_actions(resource)
@@ -8338,6 +8691,10 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
 
     def get_user_requires_reconsent(self, resource: models.Resource) -> bool:
         """Check if the current user needs to re-consent for this resource's offering."""
+        page = self._page(resource)
+        if page and page.requires_reconsent is not None:
+            return page.requires_reconsent.get(resource.offering_id, False)
+
         if not config.ENFORCE_USER_CONSENT_FOR_OFFERINGS:
             return False
 
@@ -8397,7 +8754,10 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
         request = self.context.get("request")
         if not request or getattr(request, "user", None) is None:
             return True
-        return utils.user_can_see_resource_order_workflow(request.user, resource)
+        page = self._page(resource)
+        return utils.user_can_see_resource_order_workflow(
+            request.user, resource, page.scopes if page else None
+        )
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -8405,8 +8765,9 @@ class ResourceSerializer(core_serializers.SlugSerializerMixin, BaseItemSerialize
             for hidden in ("project_description",):
                 data.pop(hidden, None)
         request = self.context.get("request")
+        page = self._page(instance)
         if request and utils.is_resource_project_only_viewer(
-            getattr(request, "user", None), instance
+            getattr(request, "user", None), instance, page.scopes if page else None
         ):
             for hidden in (
                 "limits",
@@ -8928,11 +9289,42 @@ class ResourceBackendMetadataSerializer(serializers.ModelSerializer):
 class ResourceApiKeyStatusSerializer(serializers.ModelSerializer):
     """Non-secret view of a resource API key — safe for listing/polling."""
 
+    # Per-key governance fields. On an offering whose backend does not support it
+    # they are always null, so the portal offers neither the fields nor the
+    # actions that set them. The assignee is not among them: reveal still honours
+    # an assignee set while governance was on, and unassigning stays possible, so
+    # the portal has to see it to offer the one and not the other.
+    MANAGED_FIELDS = (
+        "limits",
+        "allowed_models",
+        "current_usages",
+        "usage_period",
+        "paused_by_limit",
+    )
+
     resource_uuid = serializers.ReadOnlyField(source="resource.uuid")
     # The agent's reconciliation pass finds keys by listing, so unlike a command
     # it has nothing carrying the resource's backend id — and it needs one to talk
     # to the backend.
     resource_backend_id = serializers.ReadOnlyField(source="resource.backend_id")
+    user_uuid = serializers.ReadOnlyField(source="user.uuid", allow_null=True)
+    user_full_name = serializers.ReadOnlyField(source="user.full_name", allow_null=True)
+    pending_action = serializers.ChoiceField(
+        choices=ResourceApiKeyActions.CHOICES,
+        allow_blank=True,
+        read_only=True,
+    )
+    limits = serializers.DictField(
+        child=LimitValueField(), allow_null=True, read_only=True
+    )
+    allowed_models = serializers.ListField(
+        child=serializers.CharField(), allow_null=True, read_only=True
+    )
+    current_usages = serializers.DictField(
+        child=LimitValueField(), allow_null=True, read_only=True
+    )
+    usage_period = serializers.DateField(allow_null=True, read_only=True)
+    paused_by_limit = serializers.BooleanField(allow_null=True, read_only=True)
 
     class Meta:
         model = models.ResourceApiKey
@@ -8942,9 +9334,155 @@ class ResourceApiKeyStatusSerializer(serializers.ModelSerializer):
             "resource_backend_id",
             "client_id",
             "state",
+            "pending_action",
             "modified",
+            "issued_at",
             "error_message",
+            "user_uuid",
+            "user_full_name",
+            "limits",
+            "allowed_models",
+            "current_usages",
+            "usage_period",
+            "paused_by_limit",
         )
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not instance.is_managed:
+            for field in self.MANAGED_FIELDS:
+                data[field] = None
+        return data
+
+
+class ResourceApiKeySettingsSerializer(serializers.Serializer):
+    """The per-key settings shared by requesting and editing a key.
+
+    Every setting is optional. An empty limit map or model list is stored as null:
+    the key then follows the resource.
+    """
+
+    user = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=User.objects.all(),
+        required=False,
+        allow_null=True,
+        help_text="Assignee. When set, only this user can reveal the key.",
+    )
+    limits = serializers.DictField(
+        child=LimitValueField(min_value=0),
+        required=False,
+        allow_null=True,
+        help_text="Limits per component type; zero or absent means no limit.",
+    )
+    allowed_models = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_null=True,
+        help_text="Models the key may call; empty or absent allows every model.",
+    )
+
+    def get_resource(self, attrs) -> models.Resource:
+        raise NotImplementedError
+
+    def validate(self, attrs):
+        resource = self.get_resource(attrs)
+        errors = {}
+        user = attrs.get("user")
+        # A key is handed to someone working in the resource's project; an
+        # organization role alone does not make someone a user of the resource.
+        if user is not None and not resource.project.has_user(user):
+            errors["user"] = _(
+                "The assignee must be a member of the resource's project."
+            )
+        if "limits" in attrs:
+            attrs["limits"] = attrs["limits"] or None
+            component_types = set(
+                resource.offering.components.values_list("type", flat=True)
+            )
+            unknown = sorted(set(attrs["limits"] or {}) - component_types)
+            if unknown:
+                errors["limits"] = _("Unknown components: %s.") % ", ".join(unknown)
+        if "allowed_models" in attrs:
+            allowed_models = attrs["allowed_models"] or None
+            attrs["allowed_models"] = allowed_models
+            # When the offering lists its models, a key may only narrow that list.
+            choices = (
+                (resource.offering.resource_options or {})
+                .get("options", {})
+                .get("models", {})
+                .get("choices")
+            )
+            if allowed_models and len(set(allowed_models)) != len(allowed_models):
+                errors["allowed_models"] = _("Models must not repeat.")
+            elif allowed_models and isinstance(choices, list):
+                unknown = sorted(set(allowed_models) - set(choices))
+                if unknown:
+                    errors["allowed_models"] = _("Unknown models: %s.") % ", ".join(
+                        unknown
+                    )
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
+
+
+class ResourceApiKeyCreateSerializer(ResourceApiKeySettingsSerializer):
+    """Consumer request for a new key. Waldur mints nothing: the agent does."""
+
+    resource = serializers.SlugRelatedField(
+        slug_field="uuid", queryset=models.Resource.objects.all()
+    )
+
+    def get_resource(self, attrs):
+        return attrs["resource"]
+
+
+class ResourceApiKeyUpdateSerializer(ResourceApiKeySettingsSerializer):
+    """Edit a key's assignee, limits or model allowlist."""
+
+    def get_resource(self, attrs):
+        return self.instance.resource
+
+
+class ResourceApiKeyUsageSerializer(serializers.Serializer):
+    """Agent push: a key's usage per component type in one month."""
+
+    usages = serializers.DictField(
+        child=LimitValueField(min_value=0),
+        help_text="The key's usage so far in billing_period, per component type.",
+    )
+    billing_period = serializers.DateField(
+        required=False,
+        help_text="Any day of the month the usage belongs to; the current month "
+        "when omitted. Limits are monthly, so a later month starts them afresh.",
+    )
+
+    def validate_billing_period(self, value):
+        period = core_utils.month_start(value).date()
+        if period > models.ResourceApiKey.current_period():
+            raise serializers.ValidationError(_("Usage cannot be reported ahead."))
+        return period
+
+    def validate_usages(self, usages):
+        component_types = set(
+            self.context["api_key"].resource.offering.components.values_list(
+                "type", flat=True
+            )
+        )
+        unknown = sorted(set(usages) - component_types)
+        if unknown:
+            raise serializers.ValidationError(
+                _("Unknown components: %s.") % ", ".join(unknown)
+            )
+        return usages
+
+
+class ResourceApiKeyUsageTotalsSerializer(serializers.Serializer):
+    usages = serializers.DictField(
+        child=LimitValueField(),
+        help_text="Usage per component type in the current month, summed over "
+        "the resource's keys, deleted ones included.",
+    )
 
 
 class ResourceApiKeySerializer(ResourceApiKeyStatusSerializer):
@@ -9447,6 +9985,10 @@ class ResourceSlugSerializer(serializers.ModelSerializer):
         model = models.Resource
         fields = ("slug",)
 
+    def validate_slug(self, value):
+        core_serializers.validate_unique_slug(models.Resource, value, self.instance)
+        return value
+
 
 class ResourceDownscaledSerializer(serializers.ModelSerializer):
     class Meta:
@@ -9856,6 +10398,11 @@ class ComponentUserUsageSerializer(
 # so it is safe to accept, including when backfilling a past billing period.
 DISPLAY_ONLY_BILLING_TYPES = (BillingTypes.LIMIT, BillingTypes.ONE_TIME)
 
+# Who counts as the service provider when a usage report carries a date: the
+# owner holds the permission on the organization, a service provider manager
+# on its ServiceProvider record.
+PROVIDER_USAGE_SOURCES = ["customer", "customer.serviceprovider"]
+
 
 class ComponentUserUsageCreateSerializer(serializers.ModelSerializer):
     user = serializers.HyperlinkedRelatedField(
@@ -9882,10 +10429,11 @@ class ComponentUserUsageCreateSerializer(serializers.ModelSerializer):
         resource = component_usage.resource
 
         # Check if user is service provider for the resource's offering
-        if has_permission(
+        if has_permission_on_any_source(
             self.context["request"],
             PermissionEnum.SET_RESOURCE_USAGE,
-            resource.offering.customer,
+            resource.offering,
+            PROVIDER_USAGE_SOURCES,
         ):
             # Check if date is in the current billing period
             current_billing_period = core_utils.month_start(timezone.now())
@@ -10307,10 +10855,11 @@ class ComponentUsageCreateSerializer(serializers.Serializer):
 
         if date_value and not self.context["request"].user.is_staff:
             # Check if user is service provider for the resource's offering
-            if has_permission(
+            if has_permission_on_any_source(
                 self.context["request"],
                 PermissionEnum.SET_RESOURCE_USAGE,
-                resource.offering.customer,
+                resource.offering,
+                PROVIDER_USAGE_SOURCES,
             ):
                 # Check if date is in the current billing period
                 current_billing_period = core_utils.month_start(timezone.now())
@@ -10668,44 +11217,15 @@ class OfferingUserPosixUpdateResponseSerializer(serializers.Serializer):
     )
 
 
-class OfferingUserSerializer(
-    core_serializers.RestrictedSerializerMixin, serializers.HyperlinkedModelSerializer
-):
+class UserProfileAttributeFieldsMixin(serializers.Serializer):
     """
-    Serializer for OfferingUser that exposes user attributes based on
-    per-offering configuration (OfferingUserAttributeConfig).
+    Read-only ``user_<attr>`` fields for the personal-data attributes an
+    offering may expose to its service provider (OfferingUserAttributeConfig).
 
-    All user attribute fields are defined in the schema for SDK generation.
-    At runtime, fields are filtered based on the offering's configuration,
-    supporting GDPR compliance by exposing only declared personal data.
+    Sources are relative to an object with a ``user`` attribute, so the mixin
+    serves both offering users and user role grants. Username, full name and
+    email are declared by the serializers themselves.
     """
-
-    offering = serializers.HyperlinkedRelatedField(
-        queryset=models.Offering.objects.all(),
-        view_name="marketplace-provider-offering-detail",
-        lookup_field="uuid",
-        required=False,
-    )
-    offering_uuid = serializers.SlugRelatedField(
-        queryset=models.Offering.objects.all(), slug_field="uuid", required=False
-    )
-    offering_name = serializers.ReadOnlyField(source="offering.name")
-    user = serializers.HyperlinkedRelatedField(
-        queryset=User.objects.all(),
-        view_name="user-detail",
-        lookup_field="uuid",
-        required=False,
-    )
-    user_uuid = serializers.SlugRelatedField(
-        queryset=User.objects.all(), slug_field="uuid", required=False
-    )
-
-    # Core user attributes (controlled by OfferingUserAttributeConfig)
-    user_username = serializers.ReadOnlyField(source="user.username")
-    user_full_name = serializers.ReadOnlyField(source="user.full_name")
-    user_first_name = serializers.ReadOnlyField(source="user.first_name")
-    user_last_name = serializers.ReadOnlyField(source="user.last_name")
-    user_email = serializers.ReadOnlyField(source="user.email")
 
     # Extended profile attributes
     user_phone_number = serializers.ReadOnlyField(source="user.phone_number")
@@ -10771,6 +11291,48 @@ class OfferingUserSerializer(
         ),
     )
 
+
+class OfferingUserSerializer(
+    UserProfileAttributeFieldsMixin,
+    core_serializers.RestrictedSerializerMixin,
+    serializers.HyperlinkedModelSerializer,
+):
+    """
+    Serializer for OfferingUser that exposes user attributes based on
+    per-offering configuration (OfferingUserAttributeConfig).
+
+    All user attribute fields are defined in the schema for SDK generation.
+    At runtime, fields are filtered based on the offering's configuration,
+    supporting GDPR compliance by exposing only declared personal data.
+    """
+
+    offering = serializers.HyperlinkedRelatedField(
+        queryset=models.Offering.objects.all(),
+        view_name="marketplace-provider-offering-detail",
+        lookup_field="uuid",
+        required=False,
+    )
+    offering_uuid = serializers.SlugRelatedField(
+        queryset=models.Offering.objects.all(), slug_field="uuid", required=False
+    )
+    offering_name = serializers.ReadOnlyField(source="offering.name")
+    user = serializers.HyperlinkedRelatedField(
+        queryset=User.objects.all(),
+        view_name="user-detail",
+        lookup_field="uuid",
+        required=False,
+    )
+    user_uuid = serializers.SlugRelatedField(
+        queryset=User.objects.all(), slug_field="uuid", required=False
+    )
+
+    # Core user attributes (controlled by OfferingUserAttributeConfig)
+    user_username = serializers.ReadOnlyField(source="user.username")
+    user_full_name = serializers.ReadOnlyField(source="user.full_name")
+    user_first_name = serializers.ReadOnlyField(source="user.first_name")
+    user_last_name = serializers.ReadOnlyField(source="user.last_name")
+    user_email = serializers.ReadOnlyField(source="user.email")
+
     customer_uuid = serializers.UUIDField(
         read_only=True, source="offering.customer.uuid"
     )
@@ -10782,6 +11344,16 @@ class OfferingUserSerializer(
     )
     service_provider_comment = serializers.ReadOnlyField()
     service_provider_comment_url = serializers.ReadOnlyField()
+    # The provider account this one reads through, when the provider shares
+    # accounts across its offerings; null for a per-offering account. Facts
+    # about the account, not personal data, so never hidden by the offering's
+    # user attribute configuration.
+    service_provider_account_uuid = serializers.UUIDField(
+        source="service_provider_account.uuid", read_only=True, allow_null=True
+    )
+    service_provider_account_username = serializers.CharField(
+        source="service_provider_account.username", read_only=True, allow_null=True
+    )
     has_consent = serializers.SerializerMethodField()
     requires_reconsent = serializers.SerializerMethodField()
     offering_has_active_tos = serializers.SerializerMethodField()
@@ -10883,6 +11455,8 @@ class OfferingUserSerializer(
             "runtime_state",
             "service_provider_comment",
             "service_provider_comment_url",
+            "service_provider_account_uuid",
+            "service_provider_account_username",
             "has_consent",
             "requires_reconsent",
             "offering_has_active_tos",
@@ -11273,8 +11847,11 @@ class OfferingUserSerializer(
         request = self.context["request"]
         offering: models.Offering = validated_data["offering"]
 
-        if not has_permission(
-            request, PermissionEnum.CREATE_OFFERING_USER, offering.customer
+        if not has_permission_on_any_source(
+            request,
+            PermissionEnum.CREATE_OFFERING_USER,
+            offering,
+            ["customer", "customer.serviceprovider"],
         ):
             raise rf_exceptions.PermissionDenied()
 
@@ -11388,6 +11965,9 @@ class ServiceProviderProjectGroupSerializer(
     customer_name = serializers.CharField(
         source="project.customer.name", read_only=True, allow_null=True
     )
+    customer_slug = serializers.CharField(
+        source="project.customer.slug", read_only=True, allow_null=True
+    )
     in_use = serializers.SerializerMethodField(
         help_text=_(
             "The project has a non-terminated resource on an offering of the "
@@ -11421,6 +12001,7 @@ class ServiceProviderProjectGroupSerializer(
             "project_slug",
             "customer_uuid",
             "customer_name",
+            "customer_slug",
             "offerings",
             "members",
             "created",
@@ -11894,6 +12475,51 @@ class UserChecklistCompletionListSerializer(serializers.ListSerializer):
             for item in items:
                 item._offering_user_cache = offering_users_map.get(item.scope_object_id)
         return super().to_representation(items)
+
+
+class ProviderUserRoleDetailsSerializer(
+    UserProfileAttributeFieldsMixin, permission_serializers.UserRoleDetailsSerializer
+):
+    """
+    A user role grant as the offering's service provider sees it: the role
+    details plus the personal-data attributes the offering exposes.
+
+    Username, full name and email are returned as on every list_users. Each
+    other ``user_<attr>`` field is dropped unless the offering's
+    OfferingUserAttributeConfig exposes the attribute. The offering comes from
+    ``context["offering"]``; every row of a listing shares it.
+    """
+
+    # Profile field name -> the attribute name OfferingUserAttributeConfig uses.
+    GATED_FIELD_ATTRIBUTES = {
+        field_name: attr
+        for attr, field_name in OfferingUserSerializer.USER_ATTRIBUTE_FIELD_MAP.items()
+        if field_name in UserProfileAttributeFieldsMixin._declared_fields
+    }
+
+    class Meta(permission_serializers.UserRoleDetailsSerializer.Meta):
+        fields = permission_serializers.UserRoleDetailsSerializer.Meta.fields + tuple(
+            UserProfileAttributeFieldsMixin._declared_fields
+        )
+
+    @functools.cached_property
+    def _hidden_fields(self) -> set[str]:
+        exposed = set(
+            models.OfferingUserAttributeConfig.get_exposed_fields_for_offering(
+                self.context["offering"]
+            )
+        )
+        return {
+            field_name
+            for field_name, attr in self.GATED_FIELD_ATTRIBUTES.items()
+            if attr not in exposed
+        }
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        for field_name in self._hidden_fields:
+            data.pop(field_name, None)
+        return data
 
 
 class UserChecklistCompletionOfferingUserSerializer(serializers.ModelSerializer):
@@ -12586,38 +13212,6 @@ class ResourceTeamMemberSerializer(
         return NestedResourceProjectPermissionSerializer(
             grants, many=True, context=self.context
         ).data
-
-
-class OfferingUserGroupDetailsSerializer(
-    core_serializers.RestrictedSerializerMixin, serializers.HyperlinkedModelSerializer
-):
-    offering_uuid = serializers.UUIDField(read_only=True, source="offering.uuid")
-    offering_name = serializers.ReadOnlyField(source="offering.name")
-    projects = structure_serializers.ProjectSerializer(many=True, read_only=True)
-
-    class Meta:
-        model = models.OfferingUserGroup
-        fields = (
-            "offering",
-            "projects",
-            "offering_uuid",
-            "offering_name",
-            "created",
-            "modified",
-            "backend_metadata",
-        )
-        extra_kwargs = dict(
-            offering={
-                "lookup_field": "uuid",
-                "view_name": "marketplace-provider-offering-detail",
-            },
-        )
-
-
-class OfferingUserGroupSerializer(
-    core_serializers.RestrictedSerializerMixin, serializers.HyperlinkedModelSerializer
-):
-    projects = structure_serializers.ProjectSerializer(many=True)
 
 
 def validate_plan(plan: models.Plan):
@@ -14228,6 +14822,9 @@ class RobotAccountDetailsSerializer(
     user_keys = serializers.SerializerMethodField()
     resource_uuid = serializers.UUIDField(read_only=True, source="resource.uuid")
     resource_name = serializers.CharField(read_only=True, source="resource.name")
+    resource_backend_id = serializers.CharField(
+        read_only=True, source="resource.backend_id"
+    )
     project_uuid = serializers.UUIDField(read_only=True, source="resource.project.uuid")
     project_name = serializers.CharField(read_only=True, source="resource.project.name")
     customer_uuid = serializers.UUIDField(
@@ -14251,6 +14848,7 @@ class RobotAccountDetailsSerializer(
             "user_keys",
             "resource_name",
             "resource_uuid",
+            "resource_backend_id",
             "project_name",
             "project_uuid",
             "customer_uuid",
@@ -16157,6 +16755,14 @@ class OfferingSoftwareCatalogSerializer(serializers.ModelSerializer):
             "partition_name",
         )
 
+    def validate(self, attrs):
+        partition = attrs.get("partition")
+        if partition and partition.offering_id != attrs["offering"].id:
+            raise serializers.ValidationError(
+                {"partition": _("Partition does not belong to this offering.")}
+            )
+        return attrs
+
 
 class OfferingSoftwareCatalogUpdateSerializer(serializers.ModelSerializer):
     """Serializer for updating OfferingSoftwareCatalog model."""
@@ -16197,6 +16803,27 @@ class OfferingSoftwareCatalogUpdateSerializer(serializers.ModelSerializer):
             "enabled_cpu_microarchitectures",
             "partition",
         )
+
+    def validate_catalog(self, catalog):
+        already_linked = (
+            models.OfferingSoftwareCatalog.objects.filter(
+                offering_id=self.instance.offering_id, catalog=catalog
+            )
+            .exclude(pk=self.instance.pk)
+            .exists()
+        )
+        if already_linked:
+            raise serializers.ValidationError(
+                _("This software catalog is already linked to the offering.")
+            )
+        return catalog
+
+    def validate_partition(self, partition):
+        if partition and partition.offering_id != self.instance.offering_id:
+            raise serializers.ValidationError(
+                _("Partition does not belong to this offering.")
+            )
+        return partition
 
 
 class OfferingPartitionUpdateSerializer(serializers.ModelSerializer):
@@ -17326,6 +17953,14 @@ class ComponentStatsPerOfferingSerializer(serializers.Serializer):
     billing_type = serializers.CharField(read_only=True)
     usage = serializers.FloatField(read_only=True)
     limit_usage = serializers.FloatField(read_only=True)
+    usage_terminated = serializers.FloatField(
+        read_only=True,
+        help_text="Part of usage that came from terminated resources.",
+    )
+    limit_usage_terminated = serializers.FloatField(
+        read_only=True,
+        help_text="Part of limit_usage that came from terminated resources.",
+    )
     limit = serializers.FloatField(read_only=True, allow_null=True)
     offering_name = serializers.CharField(read_only=True)
     offering_uuid = serializers.UUIDField(read_only=True)
@@ -17342,6 +17977,10 @@ class ComponentsUsageStatsPerOfferingSerializer(serializers.Serializer):
 class UsageTimeseriesBucketSerializer(serializers.Serializer):
     billing_period = serializers.DateField(read_only=True)
     usage = serializers.FloatField(read_only=True)
+    usage_terminated = serializers.FloatField(
+        read_only=True,
+        help_text="Part of usage that came from terminated resources.",
+    )
 
 
 class OfferingUsageTimeseriesSerializer(serializers.Serializer):
@@ -17363,7 +18002,12 @@ class OfferingUsageTimeseriesSerializer(serializers.Serializer):
 class ProjectUsageEntrySerializer(serializers.Serializer):
     project_uuid = serializers.UUIDField(read_only=True)
     project_name = serializers.CharField(read_only=True)
+    is_removed = serializers.BooleanField(read_only=True)
     usage = serializers.FloatField(read_only=True)
+    usage_terminated = serializers.FloatField(
+        read_only=True,
+        help_text="Part of usage that came from terminated resources.",
+    )
     buckets = UsageTimeseriesBucketSerializer(many=True, read_only=True)
 
 

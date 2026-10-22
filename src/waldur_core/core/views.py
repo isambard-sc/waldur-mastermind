@@ -36,6 +36,7 @@ from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.reverse import reverse
+from rest_framework.utils.encoders import JSONEncoder
 from rest_framework.views import APIView
 from rest_framework.views import exception_handler as rf_exception_handler
 from reversion.models import Version
@@ -51,7 +52,7 @@ from waldur_core.changelog.utils import (
     get_latest_version,
     get_pending_versions,
 )
-from waldur_core.core import WaldurExtension, models, permissions
+from waldur_core.core import WaldurExtension, constance_backend, models, permissions
 from waldur_core.core.authentication import (
     OIDC_AUTHENTICATION_METHODS,
     AuthenticationMethod,
@@ -73,7 +74,11 @@ from waldur_core.core.metadata_schemas import (
 )
 from waldur_core.core.mixins import ensure_atomic_transaction
 from waldur_core.core.models import DailyTableSizeHistory, TokenExchangeCode
-from waldur_core.core.permissions import PATScopeAwareIsAdminUser
+from waldur_core.core.permissions import (
+    IsStaffWriterOrSupportReader,
+    PATScopeAwareIsAdminUser,
+    can_read_constance_secrets,
+)
 from waldur_core.core.serializers import (
     AuthTokenChallengeSerializer,
     AvailableBindingTargetSerializer,
@@ -598,6 +603,7 @@ def _safe_get_constance_values():
         return constance_get_values()
     except TypeError:
         prefix = constance_settings.DATABASE_PREFIX
+        secret_keys = constance_backend.secret_keys()
         values = {}
         for key, options in constance_settings.CONFIG.items():
             default_value = options[0]
@@ -605,7 +611,10 @@ def _safe_get_constance_values():
             try:
                 entry = Constance.objects.filter(key=prefixed_key).first()
                 if entry is not None:
-                    values[key] = constance_loads(entry.value)
+                    value = constance_loads(entry.value)
+                    if key in secret_keys:
+                        value = constance_backend.decrypt_secret(key, value)
+                    values[key] = value
                 else:
                     values[key] = default_value
             except (TypeError, ValueError):
@@ -801,14 +810,18 @@ def _parse_bracket_notation(data):
 @extend_schema(
     methods=["GET"],
     summary="Get all overridable settings",
-    description="Returns all settings that can be overridden in the database via the Constance backend. Requires admin permissions.",
+    description=(
+        "Returns all settings that can be overridden in the database via the "
+        "Constance backend. Staff receive every value. Support users receive "
+        "the same keys, with secret_field values blanked."
+    ),
     request=None,
     responses={status.HTTP_200_OK: ConstanceSettingsSerializer},
 )
 @extend_schema(
     methods=["POST"],
     summary="Update overridable settings",
-    description="Updates one or more settings in the database via the Constance backend. Requires admin permissions.",
+    description="Updates one or more settings in the database via the Constance backend. Requires staff permissions. Support users cannot update settings.",
     request=ConstanceSettingsSerializer,
     responses={status.HTTP_200_OK: None},
     examples=[
@@ -824,10 +837,13 @@ def _parse_bracket_notation(data):
     ],
 )
 @api_view(["POST", "GET"])
-@permission_classes((PATScopeAwareIsAdminUser,))
+@permission_classes((IsStaffWriterOrSupportReader,))
 def override_db_settings(request):
     if request.method == "GET":
-        return Response(_safe_get_constance_values())
+        values = _safe_get_constance_values()
+        if not can_read_constance_secrets(request):
+            values = constance_backend.redact_constance_secrets(values)
+        return Response(values)
 
     # Parse bracket notation keys for nested dict fields (e.g., multilingual images)
     data = _parse_bracket_notation(request.data)
@@ -1113,22 +1129,23 @@ class HistoryViewSetMixin:
         except (ValueError, TypeError):
             raise ValidationError({"timestamp": "Invalid timestamp format."})
 
-        content_type = self._get_content_type_for_model()
-        version = (
-            Version.objects.filter(
-                content_type=content_type,
-                object_id=str(obj.pk),
-                revision__date_created__lte=timestamp,
-            )
-            .select_related("revision", "revision__user")
-            .order_by("-revision__date_created")
-            .first()
-        )
+        versions = self._get_versions_queryset(obj)
+        version = versions.filter(revision__date_created__lte=timestamp).first()
 
         if not version:
-            return Response(
-                {"detail": "No version found before the specified timestamp."},
-                status=status.HTTP_404_NOT_FOUND,
+            first_version = versions.last()
+            if not first_version:
+                raise ValidationError(
+                    {"timestamp": "No version history exists for this object."}
+                )
+            first_version_date = JSONEncoder().default(
+                first_version.revision.date_created
+            )
+            raise ValidationError(
+                {
+                    "timestamp": "Timestamp predates the first recorded version "
+                    f"at {first_version_date}."
+                }
             )
 
         serializer_class = self._get_history_serializer_class()

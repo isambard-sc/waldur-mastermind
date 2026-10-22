@@ -12,6 +12,7 @@ To run:
 """
 
 import logging
+import time
 from uuid import uuid4
 
 import httpx
@@ -50,7 +51,7 @@ MATRIX_CONFIG = dict(
     MATRIX_APPSERVICE_AS_TOKEN=AS_TOKEN,
     MATRIX_APPSERVICE_HS_TOKEN=HS_TOKEN,
     MATRIX_APPSERVICE_SENDER_LOCALPART="waldur-bot",
-    MATRIX_LOGIN_METHOD="token",
+    MATRIX_EXTERNAL_LOGIN_METHOD="none",
     MATRIX_USER_REGISTRATION_SECRET="devsecret",
     MATRIX_USER_ID_FORMAT="username",
     MATRIX_HISTORY_EXPORT_ENABLED=False,
@@ -231,13 +232,6 @@ class MatrixClientUserProvisioningTest(TestCase):
         result = matrix_client.set_power_level(self._room_id, matrix_user_id, 50)
         self.assertTrue(result)
 
-    def test_get_access_token_for_user(self):
-        user = self._make_waldur_user()
-        matrix_client.ensure_user_exists(user)
-        token = matrix_client.get_access_token_for_user(user)
-        self.assertIsInstance(token, str)
-        self.assertTrue(len(token) > 0)
-
     def _device_ids(self, matrix_user_id):
         response = httpx.get(
             f"{HOMESERVER_URL}/_matrix/client/v3/devices",
@@ -280,135 +274,61 @@ class MatrixClientUserProvisioningTest(TestCase):
 
 
 @override_config(**MATRIX_CONFIG)
-class MatrixCredentialsEndpointIntegrationTest(test.APITestCase):
-    """
-    Integration test for the M_FORBIDDEN fix.
-
-    The credentials endpoint at GET /api/matrix/credentials/?room_uuid=...
-    must both invite AND join the user so that the returned access token
-    can immediately perform actions (like typing indicators) in the room.
-    """
+class MatrixRoomOpenIntegrationTest(test.APITestCase):
+    """A member who opens a room can act in it with a web session token."""
 
     def setUp(self):
         super().setUp()
         _ensure_bot()
-        self.fixture_project = structure_factories.ProjectFactory()
-        self.fixture_user = structure_factories.UserFactory(
-            username=_unique_name("creduser"),
-        )
+        self.project = structure_factories.ProjectFactory()
+        self.user = structure_factories.UserFactory(username=_unique_name("openuser"))
         from waldur_core.permissions.fixtures import ProjectRole
 
-        self.fixture_project.add_user(self.fixture_user, ProjectRole.ADMIN)
-
-    def _create_real_room_for_project(self, project):
-        """Create a real Matrix room and a corresponding DB record."""
-        room_name = _unique_name("credroom")
-        room_id, _ = matrix_client.create_room(room_name)
-        ct = ContentType.objects.get_for_model(project)
-        return models.MatrixRoom.objects.create(
+        self.project.add_user(self.user, ProjectRole.ADMIN)
+        room_id, _ = matrix_client.create_room(_unique_name("openroom"))
+        ct = ContentType.objects.get_for_model(self.project)
+        self.room = models.MatrixRoom.objects.create(
             room_id=room_id,
-            room_name=room_name,
+            room_name="open room",
             state=models.RoomStates.ACTIVE,
             content_type=ct,
-            object_id=project.id,
+            object_id=self.project.id,
         )
-
-    def _join_room(self, room, user):
-        """Register the user as a room member.
-
-        Rooms created directly in tests skip the project-member sync, so the
-        MatrixRoomMember row that gates conversation access must be added
-        explicitly.
-        """
-        return models.MatrixRoomMember.objects.create(
-            room=room,
-            user=user,
-            matrix_user_id=matrix_client.ensure_user_exists(user),
-            membership_state=models.MembershipStates.JOINED,
+        self.matrix_user_id = matrix_client.ensure_user_exists(self.user)
+        matrix_client.invite_user(room_id, self.matrix_user_id)
+        self.member = models.MatrixRoomMember.objects.create(
+            room=self.room,
+            user=self.user,
+            matrix_user_id=self.matrix_user_id,
+            membership_state=models.MembershipStates.INVITED,
         )
+        self.client.force_authenticate(self.user)
 
-    def test_credentials_with_room_uuid_invites_and_joins_user(self):
-        """
-        Regression test for M_FORBIDDEN bug.
+    def test_open_accepts_invite_and_session_token_can_type(self):
+        opened = self.client.post(f"/api/matrix/rooms/{self.room.uuid.hex}/open/")
+        session = self.client.post("/api/matrix/session/")
 
-        After calling GET /api/matrix/credentials/?room_uuid=<uuid>,
-        the returned access_token must be able to PUT a typing indicator
-        to the homeserver without getting M_FORBIDDEN.
-        """
-        room = self._create_real_room_for_project(self.fixture_project)
-        self._join_room(room, self.fixture_user)
-
-        self.client.force_authenticate(self.fixture_user)
-        response = self.client.get(
-            "/api/matrix/credentials/",
-            {"room_uuid": room.uuid.hex},
-        )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-
-        # The response must include room_id and access_token
-        self.assertIn("room_id", response.data)
-        self.assertIn("access_token", response.data)
-        self.assertEqual(response.data["room_id"], room.room_id)
-
-        access_token = response.data["access_token"]
-        room_id = response.data["room_id"]
-        matrix_user_id = response.data["matrix_user_id"]
-
-        # Use the returned token to send a typing indicator directly to the homeserver.
-        # This would fail with 403 M_FORBIDDEN if the user was only invited but not joined.
+        self.assertEqual(opened.status_code, status.HTTP_200_OK)
+        self.assertEqual(opened.data["room_id"], self.room.room_id)
+        self.member.refresh_from_db()
+        self.assertEqual(self.member.membership_state, models.MembershipStates.JOINED)
         typing_resp = httpx.put(
-            f"{HOMESERVER_URL}/_matrix/client/v3/rooms/{room_id}/typing/{matrix_user_id}",
+            f"{HOMESERVER_URL}/_matrix/client/v3/rooms/{self.room.room_id}"
+            f"/typing/{self.matrix_user_id}",
             json={"typing": True, "timeout": 5000},
-            headers={"Authorization": f"Bearer {access_token}"},
+            headers={"Authorization": f"Bearer {session.data['access_token']}"},
             timeout=5,
         )
-        self.assertEqual(
-            typing_resp.status_code,
-            200,
-            f"Typing indicator failed — user not joined? Response: {typing_resp.text}",
+        self.assertEqual(typing_resp.status_code, 200, typing_resp.text)
+
+    def test_credentials_hand_out_no_token(self):
+        response = self.client.get(
+            "/api/matrix/credentials/", {"room_uuid": self.room.uuid.hex}
         )
 
-    def test_credentials_multiple_users_same_room(self):
-        """Two different users should both be able to get credentials for the same room."""
-        room = self._create_real_room_for_project(self.fixture_project)
-
-        user2 = structure_factories.UserFactory(username=_unique_name("creduser2"))
-        from waldur_core.permissions.fixtures import ProjectRole
-
-        self.fixture_project.add_user(user2, ProjectRole.MANAGER)
-
-        self._join_room(room, self.fixture_user)
-        self._join_room(room, user2)
-
-        # First user
-        self.client.force_authenticate(self.fixture_user)
-        resp1 = self.client.get(
-            "/api/matrix/credentials/", {"room_uuid": room.uuid.hex}
-        )
-        self.assertEqual(resp1.status_code, status.HTTP_200_OK)
-        self.assertIn("access_token", resp1.data)
-
-        # Second user
-        self.client.force_authenticate(user2)
-        resp2 = self.client.get(
-            "/api/matrix/credentials/", {"room_uuid": room.uuid.hex}
-        )
-        self.assertEqual(resp2.status_code, status.HTTP_200_OK)
-        self.assertIn("access_token", resp2.data)
-
-        # Both tokens should be different
-        self.assertNotEqual(resp1.data["access_token"], resp2.data["access_token"])
-
-    def test_credentials_without_room_uuid_returns_no_room_id(self):
-        """Without room_uuid param, response should not include room_id or access_token."""
-        # Ensure user is provisioned
-        matrix_client.ensure_user_exists(self.fixture_user)
-
-        self.client.force_authenticate(self.fixture_user)
-        response = self.client.get("/api/matrix/credentials/")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertNotIn("room_id", response.data)
         self.assertNotIn("access_token", response.data)
+        self.assertNotIn("room_id", response.data)
 
 
 @override_config(**MATRIX_CONFIG)
@@ -687,7 +607,7 @@ class MatrixMessageFlowIntegrationTest(TestCase):
 
         matrix_client.invite_user(room_id, matrix_user_id)
         matrix_client.join_room_as_user(room_id, matrix_user_id)
-        token = matrix_client.get_access_token_for_user(user)
+        token = matrix_client.create_web_session(matrix_user_id)["access_token"]
 
         typing_resp = httpx.put(
             f"{HOMESERVER_URL}/_matrix/client/v3/rooms/{room_id}/typing/{matrix_user_id}",
@@ -700,3 +620,136 @@ class MatrixMessageFlowIntegrationTest(TestCase):
             200,
             f"Typing indicator failed: {typing_resp.text}",
         )
+
+
+@override_config(**MATRIX_CONFIG)
+class MatrixWebSessionIntegrationTest(TestCase):
+    """Web chat sessions and their devices against the real homeserver."""
+
+    def setUp(self):
+        super().setUp()
+        _ensure_bot()
+        self.user = structure_factories.UserFactory(username=_unique_name("webuser"))
+        self.matrix_user_id = matrix_client.ensure_user_exists(self.user)
+
+    def _device_ids(self):
+        return {d["device_id"] for d in matrix_client.list_devices(self.matrix_user_id)}
+
+    def test_registration_creates_no_device(self):
+        self.assertEqual(matrix_client.list_devices(self.matrix_user_id), [])
+
+    def test_each_session_has_its_own_refreshable_device(self):
+        first = matrix_client.create_web_session(self.matrix_user_id)
+        second = matrix_client.create_web_session(self.matrix_user_id)
+
+        self.assertNotEqual(first["device_id"], second["device_id"])
+        self.assertTrue(first["refresh_token"])
+        self.assertTrue(first["expires_in_ms"])
+        self.assertLessEqual(
+            {first["device_id"], second["device_id"]}, self._device_ids()
+        )
+
+    def test_logout_device_removes_it_and_its_tokens(self):
+        session = matrix_client.create_web_session(self.matrix_user_id)
+
+        matrix_client.logout_device(self.matrix_user_id, session["device_id"])
+
+        self.assertNotIn(session["device_id"], self._device_ids())
+        whoami = httpx.get(
+            f"{HOMESERVER_URL}/_matrix/client/v3/account/whoami",
+            headers={"Authorization": f"Bearer {session['access_token']}"},
+            timeout=5,
+        )
+        self.assertEqual(whoami.status_code, 401)
+
+    def test_using_a_session_marks_its_device_seen(self):
+        # The prune rules rely on last_seen_ts moving with use.
+        session = matrix_client.create_web_session(self.matrix_user_id)
+
+        def last_seen():
+            devices = matrix_client.list_devices(self.matrix_user_id)
+            return next(
+                d["last_seen_ts"]
+                for d in devices
+                if d["device_id"] == session["device_id"]
+            )
+
+        before = last_seen()
+        time.sleep(1.1)
+        httpx.get(
+            f"{HOMESERVER_URL}/_matrix/client/v3/sync",
+            params={"timeout": 0},
+            headers={"Authorization": f"Bearer {session['access_token']}"},
+            timeout=5,
+        )
+
+        self.assertGreater(last_seen(), before)
+
+    def test_prune_spares_devices_in_use(self):
+        # Every device here was seen seconds ago, so even above the cap none
+        # is signed out: live tabs must not evict each other.
+        sessions = [
+            matrix_client.create_web_session(self.matrix_user_id)
+            for _ in range(matrix_client.MAX_WEB_DEVICES + 1)
+        ]
+
+        tasks.prune_web_devices(self.matrix_user_id, sessions[-1]["device_id"])
+
+        web = {
+            d
+            for d in self._device_ids()
+            if d.startswith(matrix_client.WEB_DEVICE_PREFIX)
+        }
+        self.assertEqual(web, {s["device_id"] for s in sessions})
+
+    def test_deactivation_ends_every_session(self):
+        # Deactivation dispatches this task; it is called directly here because
+        # on_commit callbacks never run inside a TestCase.
+        sessions = [
+            matrix_client.create_web_session(self.matrix_user_id) for _ in range(2)
+        ]
+        external = httpx.post(
+            f"{HOMESERVER_URL}/_matrix/client/v3/login",
+            json={
+                "type": "m.login.application_service",
+                "identifier": {"type": "m.id.user", "user": self.matrix_user_id},
+                "device_id": "EXTERNAL_CLIENT",
+            },
+            headers={"Authorization": f"Bearer {AS_TOKEN}"},
+            timeout=5,
+        )
+        self.assertEqual(external.status_code, 200, external.text)
+        # The task leaves a user who is active again alone.
+        self.user.is_active = False
+        self.user.save()
+
+        tasks.end_matrix_access(self.user.uuid.hex)
+
+        # A bot that is a homeserver admin has also locked the account, which
+        # then refuses the listing itself. Unlocked, so that what follows shows
+        # the devices are gone, not just refused.
+        listing = httpx.get(
+            f"{HOMESERVER_URL}/_matrix/client/v3/devices",
+            params={"user_id": self.matrix_user_id},
+            headers={"Authorization": f"Bearer {AS_TOKEN}"},
+            timeout=5,
+        )
+        if listing.status_code != 200:
+            self.assertEqual(listing.json()["errcode"], "M_USER_LOCKED")
+            matrix_client.set_locked(self.matrix_user_id, False)
+
+        # External clients too: a deactivated user keeps no session at all.
+        self.assertEqual(self._device_ids(), set())
+        for session in sessions:
+            whoami = httpx.get(
+                f"{HOMESERVER_URL}/_matrix/client/v3/account/whoami",
+                headers={"Authorization": f"Bearer {session['access_token']}"},
+                timeout=5,
+            )
+            self.assertEqual(whoami.status_code, 401)
+            refresh = httpx.post(
+                f"{HOMESERVER_URL}/_matrix/client/v3/refresh",
+                json={"refresh_token": session["refresh_token"]},
+                timeout=5,
+            )
+            self.assertNotEqual(refresh.status_code, 200)

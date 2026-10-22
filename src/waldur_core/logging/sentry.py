@@ -20,6 +20,11 @@ Django models or anything that needs the app registry.
 import ast
 import re
 
+from sentry_sdk.scrubber import DEFAULT_DENYLIST, EventScrubber
+
+# A plain dict of declarations, importable before Django is set up.
+from waldur_core.server.constance_settings import CONSTANCE_CONFIG
+
 # Keys that may carry the human-readable message, in order of preference.
 # "event" is structlog's default; celery task failures land under "error".
 _MESSAGE_KEYS = ("event", "message", "error")
@@ -78,7 +83,12 @@ def normalize_for_fingerprint(message):
 
 
 def before_send(event, hint):
-    """Normalise structlog-rendered log events before they are sent to Sentry."""
+    """Normalise structlog-rendered log events and redact secrets before they
+    are sent to Sentry."""
+    return redact_secrets(_normalise_log_event(event, hint), hint)
+
+
+def _normalise_log_event(event, hint):
     record = hint.get("log_record")
     if record is None:
         return event
@@ -92,17 +102,183 @@ def before_send(event, hint):
     logentry = event.get("logentry")
     if isinstance(logentry, dict):
         logentry["message"] = message
-        # Params belong to the dict repr we just discarded.
+        # sentry-sdk formats the record as the dict repr we just discarded,
+        # context and secrets included. Params belong to it too.
+        logentry["formatted"] = message
         logentry.pop("params", None)
 
     if context:
-        extra = event.setdefault("extra", {})
-        if isinstance(extra, dict):
-            for key, value in context.items():
-                extra.setdefault(key, value)
+        _add_context(event.setdefault("extra", {}), context)
 
     event["fingerprint"] = [
         getattr(record, "name", "") or "",
         normalize_for_fingerprint(message),
     ]
     return event
+
+
+def before_breadcrumb(crumb, hint):
+    """Unwrap structlog-rendered log breadcrumbs as before_send does events.
+
+    Lines below the event level become breadcrumbs of the next event, and
+    sentry-sdk gives them the dict repr as their message, context included.
+    """
+    record = hint.get("log_record")
+    if record is None:
+        return crumb
+
+    parsed = parse_structlog_message(getattr(record, "msg", None))
+    if parsed is None:
+        return crumb
+
+    message, context = parsed
+    crumb["message"] = message
+    if context:
+        _add_context(crumb.setdefault("data", {}), context)
+    return crumb
+
+
+def _add_context(target, context):
+    if isinstance(target, dict):
+        for key, value in _filter_secret_names(context).items():
+            target.setdefault(key, value)
+
+
+# Names of locals and fields that hold Matrix and SSO secrets. Sentry's default
+# denylist matches whole names such as "token" and "secret", so these were sent
+# in frame locals, e.g. the appservice token in every homeserver call.
+_SECRET_NAMES = [
+    "access_token",
+    "openid_token",
+    "refresh_token",
+    "login_token",
+    "as_token",
+    "hs_token",
+    "registration_secret",
+    "registration_token",
+    "client_secret",
+    "api_secret",
+    "auth_token",
+    "raw_token",
+    # register_matrix_appservice: a homeserver admin's token, the bootstrap
+    # admin's password and open sessions, and the key that creates admins.
+    "admin_token",
+    "bootstrap_password",
+    "bootstrap_sessions",
+    "shared_secret",
+    # Matrix end-to-end encryption.
+    "recovery_key",
+    "pickle_key",
+    "session_key",
+    "temporary_password",
+    "lease",
+    "seed",
+    "seeds",
+    "cross_signing_seeds",
+    # Secret storage and key backup: the key a recovery key decodes to, what
+    # HKDF derives from it, and the backup's private key.
+    "secret_key",
+    "derived",
+    "private_key",
+    # Room history the bot decrypts for an export, and attachment keys.
+    "decrypted",
+    "plaintext",
+    "export_messages",
+    "export_message",
+    "export_event",
+    "export_page",
+    "export_data",
+    "json_content",
+    "export_record",
+    "export_line",
+    "prepared_export",
+    "spool_key",
+    "encrypted_file",
+    "encrypted_files",
+    "attachment_key",
+    "data_key",
+]
+
+
+# Constance settings that hold secrets travel in dicts keyed by their names,
+# such as the settings init_matrix_settings seeds from the environment. The
+# scrubber compares keys whole and lowercased, so each such name is listed:
+# every secret_field, and every name that says it is a secret.
+_SECRET_SETTING_SUFFIXES = ("_TOKEN", "_SECRET", "_KEY", "_PASSWORD")
+
+
+def is_secret_setting(key):
+    """Whether the Constance setting `key` holds a secret."""
+    options = CONSTANCE_CONFIG.get(key, ())
+    is_secret_field = len(options) > 2 and options[2] == "secret_field"
+    return is_secret_field or key.endswith(_SECRET_SETTING_SUFFIXES)
+
+
+def _secret_setting_names():
+    return [key.lower() for key in CONSTANCE_CONFIG if is_secret_setting(key)]
+
+
+def event_scrubber():
+    # Recursive: httpx and nio keep the Authorization header, and registration
+    # keeps passwords, inside dicts.
+    return EventScrubber(
+        denylist=DEFAULT_DENYLIST + _SECRET_NAMES + _secret_setting_names(),
+        recursive=True,
+    )
+
+
+_SECRET_KEYS = frozenset(event_scrubber().denylist)
+
+
+def _filter_secret_names(value):
+    """Filter by name what reaches the event after the scrubber has run.
+
+    Not with the scrubber itself: the event is serialized by then, and the
+    AnnotatedValue markers it leaves would make the send fail.
+    """
+    if isinstance(value, dict):
+        return {
+            key: (
+                "[Filtered]"
+                if isinstance(key, str) and key.lower() in _SECRET_KEYS
+                else _filter_secret_names(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_filter_secret_names(item) for item in value]
+    return value
+
+
+# Secrets inside values that no name gives away: nio puts the appservice token
+# into every request path, auth headers end up in plain strings, and the
+# appservice registration carries both tokens as YAML. The scheme names also
+# start ordinary text ("basic support backend", "Bearer token expired"), and
+# Sentry sends source lines such as "as_token: str", so after them only a
+# token-shaped value is taken: one with a digit, or longer than a word. String
+# locals arrive as their repr, newlines escaped, so a value ends at a backslash
+# and a YAML key has no word boundary before it ("\nas_token: …").
+_TOKEN_SHAPED = r"(?=[^\s&'\"\\]*\d|[^\s&'\"\\]{20})"
+_SECRET_VALUES = re.compile(
+    rf"((?:access_token=)|(?:\b(?:Bearer|Basic)\s+{_TOKEN_SHAPED})"
+    rf"|(?:(?:as|hs)_token:\s*{_TOKEN_SHAPED}))"
+    r"[^\s&'\"\\]+",
+    re.IGNORECASE,
+)
+
+
+def _redact(value):
+    if isinstance(value, str):
+        return _SECRET_VALUES.sub(r"\1[Filtered]", value)
+    if isinstance(value, dict):
+        return {key: _redact(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact(item) for item in value]
+    return value
+
+
+def redact_secrets(event, hint):
+    """Replace token-shaped values anywhere in the event, transactions too."""
+    if event is None:
+        return None
+    return _redact(event)
