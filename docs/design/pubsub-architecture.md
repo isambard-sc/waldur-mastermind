@@ -291,9 +291,10 @@ introducing `SUBSCRIBE_*` permissions that would have to be kept in sync.
 - **Envelope** — marketplace events do not carry `event_type` (only the core
   dispatcher stamps it); they do carry `object_type`, `offering_uuid` and
   `schema_version`.
-- **Round open/close** — rounds have no state of their own (open/closed is
-  derived from `start_time`/`cutoff_time`), so no `round` event is emitted when
-  a round opens or ends. The proposal cancellations a round's end causes *are*
+- **Round open/close** — open/closed is derived from `start_time`/`cutoff_time`,
+  so no `round` event is emitted when a round opens or ends. The stored
+  lifecycle after the cut-off (`evaluating`, `deciding`, `results_published`,
+  `closed`) is logged as `round_*` events but not yet published either. The proposal cancellations a round's end causes *are*
   published, as `proposal` events, on two paths:
   - at cutoff, the periodic `proposals_for_ended_rounds_should_be_cancelled`
     task cancels the round's `draft` proposals — `submitted` and `in_review`
@@ -302,7 +303,10 @@ introducing `SUBSCRIBE_*` permissions that would have to be kept in sync.
   - the manual `close_round` endpoint cancels only the drafts, in one bulk
     update announced as a single batch.
   A busy round therefore reaches consumers as a burst of cancellations at
-  cutoff.
+  cutoff. On both paths a call with `carry_over_drafts` first moves its drafts
+  to its next round; a move changes no state, so it publishes nothing (it is
+  logged as a `proposal_draft_carried_over` event instead), and only drafts
+  without a next round are cancelled.
 - **`AgentIdentity` retirement** — the site-agent model still exists alongside
   its consumer; collapsing it is only worthwhile once the legacy path is gone.
 

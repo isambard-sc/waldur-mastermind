@@ -82,6 +82,10 @@ INSTALLED_APPS = (
 )
 INSTALLED_APPS += ADMIN_INSTALLED_APPS  # noqa: F405
 
+# Paths any origin may POST to without credentials: the call token API that
+# Matrix clients on other origins (Element Web) use. See cors_middleware.
+PUBLIC_CORS_PATH_PREFIXES = ("/api/matrix/livekit/",)
+
 MIDDLEWARE = (
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "waldur_core.server.middleware.cors_middleware",
@@ -130,6 +134,27 @@ REST_FRAMEWORK = {
         "oauth_default": "60/s",
         "token_exchange": "60/min",
         "matrix_credentials": "1000/hour",
+        # Each call replaces the user's Matrix password.
+        "matrix_password": "30/hour",
+        # Each call is a homeserver login on a new device. The drawer calls it on
+        # connect and when a token refresh is rejected, a few times an hour.
+        "matrix_session": "120/hour",
+        "matrix_crypto": "30/hour",
+        # Each call reads the recovery key and checks it on the homeserver.
+        "matrix_recovery_key": "30/hour",
+        # History export downloads, per user: each is decrypted on the fly,
+        # and an export can be hundreds of megabytes.
+        "matrix_export_download": "120/hour",
+        # The call token API Matrix clients use, unauthenticated: per client
+        # address. A join takes one or two requests (Element Call falls back
+        # from /get_token to /sfu/get), so this allows a building behind one
+        # NAT to join calls, while capping homeserver lookups from one source.
+        "matrix_livekit_token": "600/hour",
+        # The same API per Matrix user, once their OpenID token checks out:
+        # each request may create a LiveKit room, from any address.
+        "matrix_livekit_token_user": "120/hour",
+        # The appservice endpoints, per client address, for calls without the
+        # homeserver token: the homeserver itself is not limited.
         "matrix_webhook": "10000/hour",
         # Passkey ceremonies. Sign-in is anonymous and unauthenticated, so it
         # is the tighter of the two. Deliberately not wired into django-axes:
@@ -141,6 +166,11 @@ REST_FRAMEWORK = {
         # third-party relay and the test send delivers a real message, so both
         # are cheap to abuse and rare in legitimate use.
         "email_diagnostics": "20/hour",
+        # Custom metric ingestion, native and OTLP together, per reporting
+        # user. A guard against a runaway reporter, not a storage budget: a
+        # request carries up to METRICS_MAX_POINTS_PER_REQUEST points, and a
+        # collector or site agent batching every minute stays far below this.
+        "metrics_ingest": "600/min",
     },
     "DEFAULT_PAGINATION_CLASS": "waldur_core.core.pagination.LinkHeaderPagination",
     "DEFAULT_SCHEMA_CLASS": "waldur_core.core.openapi_inspector.WaldurOpenApiInspector",
@@ -280,10 +310,13 @@ STORAGES = {
 
 import structlog
 
+from waldur_core.logging.log import scrub_request
+
 # Processors for stdlib loggers (foreign_pre_chain) - ExtraAdder merges record.extra
 _FOREIGN_PRE_CHAIN = [
     structlog.contextvars.merge_contextvars,
     structlog.stdlib.ExtraAdder(),
+    scrub_request,
     structlog.processors.TimeStamper(fmt="iso"),
     structlog.stdlib.add_logger_name,
     structlog.stdlib.add_log_level,
@@ -323,6 +356,11 @@ LOGGING = {
             "foreign_pre_chain": _FOREIGN_PRE_CHAIN,
         },
     },
+    "filters": {
+        "scrub_request_line": {
+            "()": "waldur_core.logging.log.ScrubRequestLine",
+        },
+    },
     "handlers": {
         "console": {
             "class": "logging.StreamHandler",
@@ -359,6 +397,7 @@ LOGGING = {
         "django.server": {
             "level": "INFO",
             "handlers": ["console"],
+            "filters": ["scrub_request_line"],
             "propagate": False,
         },
         "django_structlog": {

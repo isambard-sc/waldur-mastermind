@@ -1,13 +1,20 @@
 import json
+import re
 from io import StringIO
+from pathlib import Path
+from unittest import mock
 
 from cryptography.fernet import Fernet
 from django.core.management import call_command
 from django.db import connection
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.test.utils import override_settings
 
 from waldur_core.core import encryption
+from waldur_core.core.management.commands.reencrypt_fields import (
+    encrypted_json_fields,
+    encrypted_scalar_fields,
+)
 from waldur_core.structure.models import ServiceSettings
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.marketplace import models
@@ -185,3 +192,74 @@ class ReencryptServiceSettingsTest(TestCase):
             fresh = ServiceSettings.objects.get(pk=settings.pk)
             self.assertEqual(fresh.password, "s3kret")
             self.assertEqual(fresh.token, "t0ken")
+
+
+def _labels(fields):
+    return {f"{model._meta.label}.{field.name}" for model, field in fields}
+
+
+class EncryptedFieldDiscoveryTest(SimpleTestCase):
+    """The command finds encrypted columns by field class, not from a list."""
+
+    def test_finds_every_encrypted_column(self):
+        self.assertEqual(
+            _labels(encrypted_scalar_fields()),
+            {
+                "marketplace.ResourceApiKey.key_ciphertext",
+                "matrix_chat.MatrixBotIdentity.access_token",
+                "matrix_chat.MatrixBotIdentity.cross_signing_seeds",
+                "matrix_chat.MatrixBotIdentity.pickle_key",
+                "matrix_chat.MatrixHistoryExport.data_key",
+                "matrix_chat.MatrixUserProfile.recovery_key",
+                "structure.ServiceSettings.password",
+                "structure.ServiceSettings.token",
+            },
+        )
+        self.assertEqual(
+            _labels(encrypted_json_fields()),
+            {
+                "marketplace.Offering.secret_options",
+                "structure.ServiceSettings.options",
+            },
+        )
+
+    def test_docs_list_exactly_the_encrypted_columns(self):
+        """docs/field-encryption.md is the operator's list; it must not drift."""
+        docs = Path(__file__).resolve().parents[4] / "docs" / "field-encryption.md"
+        table = (
+            docs.read_text().split("## What is encrypted", 1)[1].split("\n## ", 1)[0]
+        )
+        documented = set(re.findall(r"^\| `([\w.]+)` \|", table, re.MULTILINE))
+        discovered = _labels(encrypted_scalar_fields()) | _labels(
+            encrypted_json_fields()
+        )
+        self.assertEqual(documented, discovered)
+
+
+class ReencryptDeletedRowTest(TestCase):
+    def test_a_row_deleted_mid_run_is_skipped(self):
+        resource = factories.ResourceFactory()
+        with override_settings(
+            FIELD_ENCRYPTION_KEY=OLD_KEY, FIELD_ENCRYPTION_KEY_FALLBACKS=[]
+        ):
+            ciphertext = encryption.encrypt_value("sk-secret")
+        api_key = models.ResourceApiKey.objects.create(
+            resource=resource,
+            client_id="cid-gone",
+            key_ciphertext=ciphertext,
+            state=models.ResourceApiKey.States.OK,
+        )
+        manager = models.ResourceApiKey._base_manager
+        original_filter = manager.filter
+
+        def deleted_meanwhile(*args, **kwargs):
+            models.ResourceApiKey.objects.filter(pk=api_key.pk).delete()
+            return original_filter(*args, **kwargs)
+
+        with override_settings(
+            FIELD_ENCRYPTION_KEY=NEW_KEY, FIELD_ENCRYPTION_KEY_FALLBACKS=[OLD_KEY]
+        ):
+            with mock.patch.object(manager, "filter", deleted_meanwhile):
+                output = run()  # must not raise
+
+        self.assertIn("re-encrypted", output)

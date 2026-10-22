@@ -247,15 +247,24 @@ class ServiceProviderManagerOrganizationVisibilityTest(test.APITestCase):
 
 
 class ProviderOfferingReportsAccessTest(test.APITestCase):
-    """Per-offering reports follow the provider permission behind each of them,
-    held on the offering's organization or on its ServiceProvider."""
+    """Per-offering provider reports follow the permissions behind each action,
+    held on the offering's organization or on its ServiceProvider.
 
+    State counters and component usage accept either provider statistics or
+    ORDER.LIST, the right to list that offering's orders.
+    """
+
+    STATISTICS_OR_ORDERS = {
+        PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS,
+        PermissionEnum.LIST_ORDERS,
+    }
+    # Each report, and the permissions any one of which lets it through.
     REPORTS = {
-        "state_counters": PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS,
-        "stats": PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS,
-        "component_stats": PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS,
-        "costs": PermissionEnum.GET_SERVICE_PROVIDER_REVENUE,
-        "customers": PermissionEnum.LIST_SERVICE_PROVIDER_CUSTOMERS,
+        "state_counters": STATISTICS_OR_ORDERS,
+        "stats": {PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS},
+        "component_stats": STATISTICS_OR_ORDERS,
+        "costs": {PermissionEnum.GET_SERVICE_PROVIDER_REVENUE},
+        "customers": {PermissionEnum.LIST_SERVICE_PROVIDER_CUSTOMERS},
     }
 
     def setUp(self):
@@ -264,7 +273,7 @@ class ProviderOfferingReportsAccessTest(test.APITestCase):
         self.offering = self.fixture.offering
 
     def grant(self, role):
-        for permission in set(self.REPORTS.values()):
+        for permission in set().union(*self.REPORTS.values()):
             role.add_permission(permission)
 
     def get_reports(self, user=None):
@@ -279,6 +288,18 @@ class ProviderOfferingReportsAccessTest(test.APITestCase):
 
     def assert_all(self, codes, expected):
         self.assertEqual(codes, {action: expected for action in self.REPORTS})
+
+    def assert_reached_with(self, codes, permission):
+        """Only the reports that `permission` alone lets through answer 200."""
+        self.assertEqual(
+            codes,
+            {
+                action: status.HTTP_200_OK
+                if permission in permissions
+                else status.HTTP_403_FORBIDDEN
+                for action, permissions in self.REPORTS.items()
+            },
+        )
 
     def test_organization_owner_gets_reports(self):
         self.grant(CustomerRole.OWNER)
@@ -298,14 +319,15 @@ class ProviderOfferingReportsAccessTest(test.APITestCase):
         ServiceProviderRole.MANAGER.add_permission(
             PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS
         )
-        codes = self.get_reports(manager)
-        for action, permission in self.REPORTS.items():
-            expected = (
-                status.HTTP_200_OK
-                if permission == PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS
-                else status.HTTP_403_FORBIDDEN
-            )
-            self.assertEqual(codes[action], expected, action)
+        self.assert_reached_with(
+            self.get_reports(manager), PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS
+        )
+
+    def test_order_list_alone_reaches_state_counters_and_component_stats(self):
+        manager = structure_factories.UserFactory()
+        self.service_provider.add_user(manager, ServiceProviderRole.MANAGER)
+        ServiceProviderRole.MANAGER.add_permission(PermissionEnum.LIST_ORDERS)
+        self.assert_reached_with(self.get_reports(manager), PermissionEnum.LIST_ORDERS)
 
     def test_provider_role_without_permission_is_denied(self):
         user = structure_factories.UserFactory()
@@ -342,7 +364,9 @@ class ProviderOfferingReportsAccessTest(test.APITestCase):
     @override_config(PAT_ENABLED=True)
     def test_token_with_report_scopes_gets_reports(self):
         self.grant(CustomerRole.OWNER)
-        scopes = [permission.value for permission in set(self.REPORTS.values())]
+        scopes = [
+            permission.value for permission in set().union(*self.REPORTS.values())
+        ]
         self.assert_all(
             self.get_reports_with_token(self.fixture.offering_owner, scopes),
             status.HTTP_200_OK,
@@ -355,7 +379,98 @@ class ProviderOfferingReportsAccessTest(test.APITestCase):
         self.grant(CustomerRole.OWNER)
         self.assert_all(
             self.get_reports_with_token(
-                self.fixture.offering_owner, [PermissionEnum.LIST_ORDERS.value]
+                self.fixture.offering_owner, [PermissionEnum.UPDATE_OFFERING.value]
             ),
             status.HTTP_403_FORBIDDEN,
         )
+
+    def assert_token_reaches(self, permission):
+        self.grant(CustomerRole.OWNER)
+        self.assert_reached_with(
+            self.get_reports_with_token(
+                self.fixture.offering_owner, [permission.value]
+            ),
+            permission,
+        )
+
+    # A token scoped to either statistics or ORDER.LIST keeps state counters
+    # and component usage; the other reports need their own scope.
+    @override_config(PAT_ENABLED=True)
+    def test_statistics_token_reaches_its_reports(self):
+        self.assert_token_reaches(PermissionEnum.GET_SERVICE_PROVIDER_STATISTICS)
+
+    @override_config(PAT_ENABLED=True)
+    def test_order_list_token_reaches_its_reports(self):
+        self.assert_token_reaches(PermissionEnum.LIST_ORDERS)
+
+
+class ServiceProviderManagerListsTest(test.APITestCase):
+    """Offering groups, campaigns and offering users a service provider manager
+    can create are also listed to them, for their own provider only."""
+
+    def setUp(self):
+        from waldur_mastermind.promotions.tests import (
+            factories as promotions_factories,
+        )
+
+        self.promotions_factories = promotions_factories
+        self.fixture = fixtures.MarketplaceFixture()
+        self.service_provider = self.fixture.service_provider
+        self.customer = self.service_provider.customer
+        self.other_provider = factories.ServiceProviderFactory()
+
+        self.manager = structure_factories.UserFactory()
+        self.service_provider.add_user(self.manager, ServiceProviderRole.MANAGER)
+        self.owner = structure_factories.UserFactory()
+        self.customer.add_user(self.owner, CustomerRole.OWNER)
+
+        self.rows = self._create_rows(self.service_provider)
+        self.other_rows = self._create_rows(self.other_provider)
+
+    def _create_rows(self, service_provider):
+        offering = factories.OfferingFactory(
+            customer=service_provider.customer,
+            plugin_options={"service_provider_can_create_offering_user": True},
+        )
+        return {
+            "groups": factories.OfferingGroupFactory(
+                customer=service_provider.customer
+            ).uuid.hex,
+            "campaigns": self.promotions_factories.CampaignFactory(
+                service_provider=service_provider
+            ).uuid.hex,
+            "offering_users": factories.OfferingUserFactory(offering=offering).uuid.hex,
+        }
+
+    def _list(self, user):
+        self.client.force_authenticate(user)
+        urls = {
+            "groups": factories.OfferingGroupFactory.get_list_url(),
+            "campaigns": self.promotions_factories.CampaignFactory.get_list_url(),
+            "offering_users": factories.OfferingUserFactory.get_list_url(),
+        }
+        result = {}
+        for key, url in urls.items():
+            response = self.client.get(url)
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            result[key] = {row["uuid"] for row in response.data}
+        return result
+
+    def test_manager_lists_own_provider_rows_only(self):
+        listed = self._list(self.manager)
+        for key, uuid in self.rows.items():
+            self.assertIn(uuid, listed[key], key)
+        for key, uuid in self.other_rows.items():
+            self.assertNotIn(uuid, listed[key], key)
+
+    def test_owner_lists_own_provider_rows_only(self):
+        listed = self._list(self.owner)
+        for key, uuid in self.rows.items():
+            self.assertIn(uuid, listed[key], key)
+        for key, uuid in self.other_rows.items():
+            self.assertNotIn(uuid, listed[key], key)
+
+    def test_user_without_role_lists_none(self):
+        listed = self._list(structure_factories.UserFactory())
+        for key in self.rows:
+            self.assertEqual(listed[key], set(), key)

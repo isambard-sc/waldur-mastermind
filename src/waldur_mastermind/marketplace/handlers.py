@@ -278,53 +278,43 @@ def notify_approvers_when_order_is_created(
             )
 
 
-def notify_recipients_when_order_is_created(
+def notify_recipients_when_order_needs_no_consumer_approval(
     sender, instance: Order, created=False, **kwargs
 ):
-    """Notify the recipients configured on the offering about a new order.
+    """Notify the offering's configured recipients about an order needing no consumer review.
 
-    Fires on creation regardless of the approval state, so that offerings which
-    auto-approve are covered too. The task re-reads the order after commit, so
-    state changes made later in the creating transaction are irrelevant.
+    The recipients are told about an order once the consumer side has cleared
+    it, because that is when the provider can act on it. An order which still
+    waits for consumer review is announced by
+    order_approval.transition_order_from_consumer_approval when it is approved,
+    and never if it is rejected. Every other order has nothing left to wait for
+    on the consumer side, so it is announced now: offerings which auto-approve
+    are covered too. The task re-reads the order after commit, so state changes
+    made later in the creating transaction are irrelevant.
 
-    Orders nobody placed are skipped, on three signals. Import commands and the
-    orphan-resource reconciliation sweep insert orders directly in a terminal
-    state, as audit records for work that already happened. Robots place orders
-    on their own initiative: the cost-policy sweep creates one termination order
-    per over-budget resource, and openportal mirrors remote activity. And an
-    order placed automatically names the person it is for, not somebody who
-    placed it: proposal allocation, and the termination sweeps when they carry
-    an allocated resource's author over. Announcing any of these as a new order
-    would be wrong, and all of them arrive in bulk.
+    Import commands and the orphan-resource reconciliation sweep insert orders
+    directly in a terminal state, as audit records for work that already
+    happened, so those are skipped as well. The remaining guards against orders
+    nobody placed live in tasks.order_is_announced_as_new.
     """
-    if get_skip_side_effects():
-        return
-
     if not created:
         return
 
     if instance.state in OrderStates.TERMINAL_STATES:
         return
 
-    if instance.created_by is None or core_utils.is_robot_user(instance.created_by):
+    # Rule out offerings without recipients before the consumer-review check
+    # below, which costs permission queries on every order creation.
+    if not tasks.order_is_announced_as_new(instance):
         return
 
-    # An order placed automatically records the person it is for, not somebody
-    # who placed it. Proposal allocation is the case in point: announcing one
-    # new order per granted resource on allocation day is exactly the bulk
-    # this guard exists to avoid. The end-date and cost-policy sweeps land here
-    # too when they name an allocated resource's author instead of the robot.
-    if instance.placed_automatically:
-        return
-
-    secret_options = instance.offering.secret_options or {}
-    if not secret_options.get("order_notification_emails") and not secret_options.get(
-        "order_notification_roles"
+    if (
+        instance.state == OrderStates.PENDING_CONSUMER
+        and not order_should_not_be_reviewed_by_consumer(instance)
     ):
         return
 
-    order_uuid = instance.uuid
-    transaction.on_commit(lambda: tasks.notify_about_new_order.delay(order_uuid))
+    tasks.notify_about_new_order_on_commit(instance)
 
 
 def maybe_auto_approve_order_for_project(
@@ -388,6 +378,25 @@ def close_customer_service_accounts_on_customer_deletion(
                 exc.response.text if isinstance(exc, httpx.HTTPStatusError) else exc,
             )
             continue
+
+
+def release_grace_pauses_when_project_end_date_changes(
+    sender, instance: structure_models.Project, created=False, **kwargs
+):
+    """Lift grace-period pauses once a project's end date moves it out of the grace period.
+
+    Only the end date can do that: a changed grace period length either keeps
+    the project in grace or lets it expire, and expired projects keep their
+    resources paused until they are terminated.
+    """
+    if created or not instance.tracker.has_changed("end_date"):
+        return
+    project_id = instance.pk
+    transaction.on_commit(
+        lambda: utils.release_project_grace_pauses(
+            models.Resource.objects.filter(project_id=project_id)
+        )
+    )
 
 
 def process_invitations_and_orders_when_project_start_date_is_unset(
@@ -3137,20 +3146,42 @@ def update_resource_scope_availability_on_offering_state_change(
     tasks.update_resource_scope_availability.delay(offering.uuid.hex, can_be_managed)
 
 
-def trigger_scim_sync_on_offering_endpoint_change(
-    sender, instance: models.OfferingAccessEndpoint, created=False, **kwargs
+def trigger_scim_sync_on_login_nodes_change(
+    sender, instance: Offering, created=False, **kwargs
 ):
-    """Trigger SCIM entitlements synchronization when offering SSH endpoints change."""
+    """Sync SCIM entitlements when an offering's login-node list changes.
+
+    ``plugin_options`` is tracked as a whole, so this compares
+    ``scim_login_nodes`` itself. Any other plugin-option edit leaves the
+    list alone and does not sync.
+    """
     if not config.SCIM_MEMBERSHIP_SYNC_ENABLED or not scim_tasks.is_scim_configured():
         return
 
-    if not scim_tasks.offering_enables_scim_entitlements(instance.offering):
+    if not scim_tasks.offering_enables_scim_entitlements(instance):
         return
 
-    if not instance.url or not instance.url.startswith("ssh://"):
+    update_fields = kwargs.get("update_fields")
+    if update_fields is not None and "plugin_options" not in update_fields:
         return
 
-    scim_tasks.sync_users_for_offering_endpoint.delay(instance.offering.uuid.hex)
+    current = scim_tasks.get_scim_login_nodes(instance)
+    if created:
+        if not current:
+            return
+    else:
+        if not instance.tracker.has_changed("plugin_options"):
+            return
+        previous = scim_tasks.get_scim_login_nodes(
+            instance, instance.tracker.previous("plugin_options") or {}
+        )
+        if previous == current:
+            return
+
+    offering_uuid = instance.uuid.hex
+    transaction.on_commit(
+        lambda: scim_tasks.sync_users_for_offering_endpoint.delay(offering_uuid)
+    )
 
 
 def trigger_scim_sync_on_offering_user_ok(
@@ -3480,6 +3511,78 @@ def create_provider_project_group_for_resource(
 def release_provider_project_group_gid(sender, instance, **kwargs):
     """Release a deleted project group's GID, never to be recycled."""
     posix_ids.release_project_group_gid(instance)
+
+
+def send_project_group_saved_message(
+    sender, instance: models.ServiceProviderProjectGroup, created=False, **kwargs
+):
+    """Announce a project group a directory can write, or a change to one.
+
+    A group without a GID is not announced: a directory cannot write it, and
+    the allocation that numbers it announces it then (see
+    ``project_groups.allocate_gid``, which numbers it without a save).
+    """
+    if instance.gid is None:
+        if not created and instance.tracker.previous("gid") is not None:
+            # A GID cleared by hand: the directory still carries the old one.
+            project_groups.publish_change(instance, "update", ["gid"])
+        return
+    if created or instance.tracker.previous("gid") is None:
+        project_groups.publish_change(instance, "create")
+        return
+    changed = [
+        field for field in ("name", "gid") if instance.tracker.has_changed(field)
+    ]
+    if changed:
+        project_groups.publish_change(instance, "update", changed)
+
+
+def send_project_group_deleted_message(
+    sender, instance: models.ServiceProviderProjectGroup, origin=None, **kwargs
+):
+    """Announce a deleted project group that a directory could have written.
+
+    Nothing is sent for a group that never had a GID (it was never announced),
+    nor for groups going with their provider or its organization in a cascade:
+    the provider's listing is then empty, and a directory writer leaves its
+    entries alone on an empty listing rather than acting on it.
+    """
+    if instance.gid is None:
+        return
+    deleting_group_itself = isinstance(origin, models.ServiceProviderProjectGroup) or (
+        isinstance(origin, QuerySet)
+        and origin.model is models.ServiceProviderProjectGroup
+    )
+    if not deleting_group_itself:
+        return
+    try:
+        service_provider = instance.service_provider
+    except models.ServiceProvider.DoesNotExist:
+        return
+    project_groups.publish(
+        service_provider, project_groups.change_payload(instance, "delete")
+    )
+
+
+def send_project_groups_switch_message(
+    sender, instance: models.ServiceProvider, created=False, **kwargs
+):
+    """Announce project groups being switched on or off for the provider.
+
+    A consumer reconciles every group then: switched on, the existing groups
+    become its to write; switched off, no new group is created.
+    """
+    enabled = instance.project_groups_enabled
+    if created:
+        if not enabled:
+            return
+    else:
+        previous = instance.tracker.previous("account_options") or {}
+        if bool(previous.get("project_groups_enabled")) == enabled:
+            return
+    project_groups.publish(
+        instance, {"action": "switch", "project_groups_enabled": enabled}
+    )
 
 
 def backfill_project_groups_when_enabled(

@@ -66,6 +66,34 @@ class LifecyclePluginOptionsPersistenceTest(test.APITestCase):
         )
         self.assertEqual(serializer.validated_data["enable_scim_entitlements"], True)
 
+    def test_scim_login_nodes_persist_as_bare_hostnames(self):
+        result = self._update(
+            {
+                "scim_login_nodes": [
+                    "Login.Example.ORG.",
+                    "login.example.org",
+                    "  other.example.org  ",
+                ]
+            }
+        )
+        self.assertEqual(
+            result["scim_login_nodes"],
+            ["login.example.org", "other.example.org"],
+        )
+
+    @data(
+        "ssh://login.example.org",
+        "user@login.example.org",
+        "login.example.org:22",
+        "not a hostname",
+    )
+    def test_scim_login_nodes_reject_non_hostnames(self, hostname):
+        serializer = serializers.MergedPluginOptionsSerializer(
+            data={"scim_login_nodes": [hostname]}
+        )
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("scim_login_nodes", serializer.errors)
+
     def test_invalid_limit_policy_rejected(self):
         serializer = serializers.MergedPluginOptionsSerializer(
             data={"resource_projects_limit_policy": "bogus"}
@@ -109,3 +137,42 @@ class LifecyclePluginOptionsPersistenceTest(test.APITestCase):
         )
         self.assertIs(result["uses_robot_accounts"], True)
         self.assertIs(result["service_provider_can_create_offering_user"], False)
+
+
+@ddt
+class ResourceApiKeyPluginOptionsPersistenceTest(test.APITestCase):
+    """The API key options are read from plugin_options by the backend and the
+    portal; an undeclared key would be dropped by update_integration with a 200."""
+
+    def setUp(self):
+        self.fixture = fixtures.ProjectFixture()
+        self.offering = factories.OfferingFactory(customer=self.fixture.customer)
+
+    @data(
+        ("enable_api_key_provisioning", True),
+        ("enable_api_key_provisioning", False),
+        ("hide_api_keys_tab", True),
+        ("hide_api_keys_tab", False),
+    )
+    @unpack
+    def test_option_persists(self, key, value):
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_url(self.offering, "update_integration")
+        response = self.client.post(url, {"plugin_options": {key: value}})
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.offering.refresh_from_db()
+        self.assertEqual(self.offering.plugin_options[key], value)
+
+    def test_another_option_update_keeps_the_capability(self):
+        # The field has no default, so an update that leaves it out must not
+        # reset it to False.
+        self.offering.plugin_options = {"enable_api_key_provisioning": True}
+        self.offering.save()
+        self.client.force_authenticate(self.fixture.staff)
+        url = factories.OfferingFactory.get_url(self.offering, "update_integration")
+        response = self.client.post(
+            url, {"plugin_options": {"hide_api_keys_tab": True}}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.offering.refresh_from_db()
+        self.assertTrue(self.offering.plugin_options["enable_api_key_provisioning"])

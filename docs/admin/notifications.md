@@ -967,7 +967,7 @@ Sent to users to notify them about their upcoming bookings.
 
 ### invoices.notification
 
-Sent to organization owners with a new invoice. Includes the invoice as an HTML attachment.
+Sent to organization owners with a new invoice. Includes the invoice as a PDF attachment.
 
 #### Templates
 
@@ -975,7 +975,7 @@ Sent to organization owners with a new invoice. Includes the invoice as an HTML 
 
 ```txt
 
-    {{ customer }}'s invoice for {{ month }}/{{ year }}
+    Invoice for {{ customer }}, {{ month }}/{{ year }}
 
 ```
 
@@ -983,9 +983,9 @@ Sent to organization owners with a new invoice. Includes the invoice as an HTML 
 
 ```txt
 
-    Hello,
+    Hi,
 
-    Please follow the link below to see {{ customer }}'s accounting information for {{ month }}/{{ year }}:
+    Here is the {{ month }}/{{ year }} invoice for {{ customer }}.{% if attached %} It is attached as a PDF, and you can also view it online:{% else %} You can view it online:{% endif %}
     {{ link }}
 
 ```
@@ -997,14 +997,15 @@ Sent to organization owners with a new invoice. Includes the invoice as an HTML 
     <html xmlns="http://www.w3.org/1999/html">
     <head lang="en">
         <meta charset="UTF-8">
-        <title>{{ customer }}'s invoice for {{ month }}/{{ year }}</title>
+        <title>Invoice for {{ customer }}, {{ month }}/{{ year }}</title>
     </head>
     <body>
     <p>
-        Dear Sir or Madam,
+        Hi,
     </p>
     <p>
-        Attached is invoice for services consumed by {{ customer }}'s during {{ month }}/{{ year }}.
+        Here is the {{ month }}/{{ year }} invoice for {{ customer }}.
+        {% if attached %}It is attached as a PDF, and you can also <a href="{{ link }}">view it online</a>.{% else %}You can <a href="{{ link }}">view it online</a>.{% endif %}
     </p>
     </body>
     </html>
@@ -2165,7 +2166,7 @@ A notification about usages. The recipients are organization owners.
 
 ### marketplace.notify_about_new_order
 
-Notifies the recipients configured on the offering about every new order for it, regardless of whether the order needs approval.
+Notifies the recipients configured on the offering about every new order for it, once the consumer side has approved the order or straight away if it needs no consumer approval.
 
 #### Templates
 
@@ -2905,7 +2906,7 @@ Notification about a new comment in the issue. The recipient is issue caller.
 
 ```txt
 
-    The issue you have created has a new comment
+    Your support request has a new comment
 
 ```
 
@@ -2915,7 +2916,11 @@ Notification about a new comment in the issue. The recipient is issue caller.
 
     Hello!
 
-    The issue you have created has a new comment. Please go to {{issue_url}} to see it.
+    {% if is_system_comment %}A new comment was added{% else %}{{ comment.author.name }} commented{% endif %} on your support request "{{ issue.summary }}":
+
+    {{ description }}
+
+    To reply, go to {{ issue_url }}.
 
 ```
 
@@ -2926,7 +2931,7 @@ Notification about a new comment in the issue. The recipient is issue caller.
     <html>
     <head lang="en">
         <meta charset="UTF-8">
-        <title>The issue you have created ({{ issue.key }}) has a new comment</title>
+        <title>Your support request ({{ issue.key }}) has a new comment</title>
     </head>
     <body>
     <p>
@@ -4055,6 +4060,67 @@ A notification to the reviewer about the proposal decision (approved/rejected) w
 
 ```
 
+### proposal.proposal_draft_carried_over
+
+Tells a proposal creator that their draft, still open when its round's cut-off passed, has moved on to the call's next round.
+
+#### Templates
+
+=== "proposal/proposal_draft_carried_over_subject.txt"
+
+```txt
+
+    Your draft proposal {{ proposal_name }} now targets the next cut-off of {{ call_name }}
+
+```
+
+=== "proposal/proposal_draft_carried_over_message.txt"
+
+```txt
+
+    Dear {{ proposal_creator_name }},
+
+    Your draft proposal "{{ proposal_name }}" in call "{{ call_name }}" was not submitted before the cut-off of {{ previous_round_name }}.
+
+    It has not been cancelled. It has moved on to the call's next round, with its content, team, documents and requested resources unchanged:
+    - Round: {{ round_name }}
+    - Opens for submissions: {{ round_start_date }}
+    - Submission deadline: {{ deadline_date }}
+
+    Your proposal is still in DRAFT state. Submit it before the new deadline to have it considered: {{ proposal_url }}
+
+    This is an automated message from the {{ site_name }}. Please do not reply to this email.
+
+```
+
+=== "proposal/proposal_draft_carried_over_message.html"
+
+```txt
+
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>Draft proposal moved to the next round</title>
+    </head>
+    <body>
+        <p>Dear {{ proposal_creator_name }},</p>
+
+        <p>Your draft proposal "{{ proposal_name }}" in call "{{ call_name }}" was not submitted before the cut-off of {{ previous_round_name }}.</p>
+
+        <p>It has not been cancelled. It has moved on to the call's next round, with its content, team, documents and requested resources unchanged:<br>
+            - Round: {{ round_name }}<br>
+            - Opens for submissions: {{ round_start_date }}<br>
+            - Submission deadline: {{ deadline_date }}
+        </p>
+
+        <p>Your proposal is still in <strong>DRAFT</strong> state. Submit it before the new deadline to have it considered: <a href="{{ proposal_url }}">{{ proposal_url }}</a></p>
+
+        <p>This is an automated message from the {{ site_name }}. Please do not reply to this email.</p>
+    </body>
+    </html>
+
+```
+
 ### proposal.proposal_state_changed
 
 A notification about the proposal state changes (submitted → in review → accepted/rejected). Deployments that hide calls from applicants (SERVICE_ACCESS_MODE = 'marketplace') send the access_request_* templates below instead, which say the same thing without naming a call or a round. One event, one switch, two sets of words — a deployment only ever sends one of them.
@@ -4430,7 +4496,7 @@ Reminds proposal creators to submit draft proposals during the last 3 days befor
 
     Complete and submit proposal: {{ proposal_url }}
 
-    Any proposals left in draft state after the deadline will be automatically canceled and will not be considered for resource allocation.
+    {% if draft_carries_over %}A proposal left in draft state after the deadline moves on to the call's next round and is considered only once it has been submitted there.{% else %}Any proposals left in draft state after the deadline will be automatically canceled and will not be considered for resource allocation.{% endif %}
 
     This is an automated message from the {{ site_name }}. Please do not reply to this email.
 
@@ -4462,7 +4528,7 @@ Reminds proposal creators to submit draft proposals during the last 3 days befor
 
         <p>Complete and submit proposal: <a href="{{ proposal_url }}">{{ proposal_url }}</a></p>
 
-        <p>Any proposals left in draft state after the deadline will be automatically canceled and will not be considered for resource allocation.</p>
+        <p>{% if draft_carries_over %}A proposal left in draft state after the deadline moves on to the call's next round and is considered only once it has been submitted there.{% else %}Any proposals left in draft state after the deadline will be automatically canceled and will not be considered for resource allocation.{% endif %}</p>
 
         <p>This is an automated message from the {{ site_name }}. Please do not reply to this email.</p>
     </body>

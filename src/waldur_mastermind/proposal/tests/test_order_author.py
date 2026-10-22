@@ -71,6 +71,7 @@ class OrderAuthorTest(test.APITestCase):
     def test_call_can_attribute_orders_to_the_project_manager(self):
         # The role mapping runs before the orders are placed, so the project
         # already has its people by the time the author is resolved.
+        self.call.proposalprojectrolemapping_set.all().delete()
         models.ProposalProjectRoleMapping.objects.create(
             call=self.call,
             proposal_role=ProposalRole.MEMBER,
@@ -201,6 +202,7 @@ class AllocatedOrderTicketTest(test.APITestCase):
         self.offering.save()
         self.member = structure_factories.UserFactory()
         self.proposal.add_user(self.member, ProposalRole.MEMBER)
+        self.fixture.call.proposalprojectrolemapping_set.all().delete()
         models.ProposalProjectRoleMapping.objects.create(
             call=self.fixture.call,
             proposal_role=ProposalRole.MEMBER,
@@ -338,7 +340,7 @@ class AllocatedOrderApprovalRecordTest(test.APITestCase):
     @mock.patch("waldur_mastermind.marketplace.tasks.notify_about_new_order")
     def test_allocated_orders_are_not_announced_as_new_orders(self, mock_notify):
         # One mail per granted resource on allocation day is exactly the bulk
-        # the guard in notify_recipients_when_order_is_created exists to avoid.
+        # the guard in order_is_announced_as_new exists to avoid.
         offering = self.fixture.offering
         offering.secret_options = {"order_notification_emails": ["ops@example.com"]}
         offering.save(update_fields=["secret_options"])

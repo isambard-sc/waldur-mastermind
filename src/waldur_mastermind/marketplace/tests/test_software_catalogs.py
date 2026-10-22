@@ -600,6 +600,131 @@ class OfferingSoftwareCatalogActionsTest(test.APITestCase):
             ).exists()
         )
 
+    def test_remove_software_catalog_of_another_offering_is_not_found(self):
+        foreign_link = factories.OfferingSoftwareCatalogFactory(catalog=self.catalog)
+        self.client.force_authenticate(self.fixture.owner)
+
+        response = self.client.post(
+            self.base_url + "remove_software_catalog/",
+            {"offering_catalog_uuid": foreign_link.uuid.hex},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertTrue(
+            models.OfferingSoftwareCatalog.objects.filter(pk=foreign_link.pk).exists()
+        )
+
+    def test_add_software_catalog_with_own_partition(self):
+        partition = factories.OfferingPartitionFactory(offering=self.offering)
+        self.client.force_authenticate(self.fixture.owner)
+
+        response = self.client.post(
+            self.base_url + "add_software_catalog/",
+            {"catalog": self.catalog.uuid.hex, "partition": partition.uuid.hex},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        link = models.OfferingSoftwareCatalog.objects.get(uuid=response.data["uuid"])
+        self.assertEqual(link.partition, partition)
+
+    def test_add_software_catalog_with_partition_of_another_offering_is_rejected(
+        self,
+    ):
+        foreign_partition = factories.OfferingPartitionFactory()
+        self.client.force_authenticate(self.fixture.owner)
+
+        response = self.client.post(
+            self.base_url + "add_software_catalog/",
+            {"catalog": self.catalog.uuid.hex, "partition": foreign_partition.uuid.hex},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("partition", response.data)
+        self.assertFalse(
+            models.OfferingSoftwareCatalog.objects.filter(
+                offering=self.offering
+            ).exists()
+        )
+
+    def test_update_software_catalog_with_partition_of_another_offering_is_rejected(
+        self,
+    ):
+        link = factories.OfferingSoftwareCatalogFactory(
+            offering=self.offering, catalog=self.catalog
+        )
+        foreign_partition = factories.OfferingPartitionFactory()
+        self.client.force_authenticate(self.fixture.owner)
+
+        response = self.client.patch(
+            self.base_url + "update_software_catalog/",
+            {
+                "offering_catalog_uuid": link.uuid.hex,
+                "partition": foreign_partition.uuid.hex,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("partition", response.data)
+        link.refresh_from_db()
+        self.assertIsNone(link.partition)
+
+    def test_update_software_catalog_with_own_partition(self):
+        link = factories.OfferingSoftwareCatalogFactory(
+            offering=self.offering, catalog=self.catalog
+        )
+        partition = factories.OfferingPartitionFactory(offering=self.offering)
+        self.client.force_authenticate(self.fixture.owner)
+
+        response = self.client.patch(
+            self.base_url + "update_software_catalog/",
+            {"offering_catalog_uuid": link.uuid.hex, "partition": partition.uuid.hex},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data["partition"], partition.uuid)
+        link.refresh_from_db()
+        self.assertEqual(link.partition, partition)
+
+    def test_update_software_catalog_to_already_linked_catalog_is_rejected(self):
+        link = factories.OfferingSoftwareCatalogFactory(
+            offering=self.offering, catalog=self.catalog
+        )
+        other_catalog = factories.SoftwareCatalogFactory()
+        factories.OfferingSoftwareCatalogFactory(
+            offering=self.offering, catalog=other_catalog
+        )
+        self.client.force_authenticate(self.fixture.owner)
+
+        response = self.client.patch(
+            self.base_url + "update_software_catalog/",
+            {"offering_catalog_uuid": link.uuid.hex, "catalog": other_catalog.uuid.hex},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("catalog", response.data)
+        link.refresh_from_db()
+        self.assertEqual(link.catalog, self.catalog)
+
+    def test_update_software_catalog_keeping_its_catalog(self):
+        link = factories.OfferingSoftwareCatalogFactory(
+            offering=self.offering, catalog=self.catalog
+        )
+        self.client.force_authenticate(self.fixture.owner)
+
+        response = self.client.patch(
+            self.base_url + "update_software_catalog/",
+            {
+                "offering_catalog_uuid": link.uuid.hex,
+                "catalog": self.catalog.uuid.hex,
+                "enabled_cpu_family": ["aarch64"],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        link.refresh_from_db()
+        self.assertEqual(link.enabled_cpu_family, ["aarch64"])
+
     def test_offering_detail_includes_software_catalogs(self):
         """Test that offering detail includes associated software catalogs."""
         # Create associations
@@ -1837,6 +1962,31 @@ class SoftwareCatalogDiscoverTest(test.APITestCase):
         self.assertEqual(eessi["existing_version"], "2024.01")
         self.assertTrue(eessi["update_available"])
 
+    @patch(
+        "waldur_mastermind.marketplace.views.detect_eessi_version",
+        return_value="2025.06",
+    )
+    @patch(
+        "waldur_mastermind.marketplace.views.detect_spack_version",
+        return_value="2026.01.15",
+    )
+    def test_discover_update_available_false_when_latest_already_stored(
+        self, mock_spack, mock_eessi
+    ):
+        factories.SoftwareCatalogFactory(
+            name="EESSI", version="2023.06", catalog_type="binary_runtime"
+        )
+        factories.SoftwareCatalogFactory(
+            name="EESSI", version="2025.06", catalog_type="binary_runtime"
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.get(self.url)
+
+        eessi = next(e for e in response.data if e["name"] == "EESSI")
+        self.assertTrue(eessi["existing"])
+        self.assertFalse(eessi["update_available"])
+
     @data("owner", "user", "customer_support", "admin", "manager")
     def test_non_staff_cannot_discover(self, user):
         user = getattr(self.fixture, user)
@@ -1881,25 +2031,59 @@ class SoftwareCatalogImportTest(test.APITestCase):
         self.fixture = fixtures.ProjectFixture()
         self.url = factories.SoftwareCatalogFactory.get_list_url() + "import_catalog/"
 
+    @patch(
+        "waldur_mastermind.marketplace.views.detect_eessi_version",
+        return_value="2026.06",
+    )
     @patch.object(tasks.import_software_catalog, "delay")
-    def test_staff_can_import_catalog(self, mock_delay):
+    def test_staff_can_import_catalog(self, mock_delay, mock_detect):
         self.client.force_authenticate(self.fixture.staff)
         response = self.client.post(self.url, {"name": "EESSI"})
 
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         self.assertEqual(response.data["status"], "importing")
         self.assertEqual(response.data["name"], "EESSI")
+        self.assertEqual(response.data["version"], "2026.06")
         mock_delay.assert_called_once_with("EESSI", "binary_runtime")
 
+    @patch(
+        "waldur_mastermind.marketplace.views.detect_eessi_version",
+        return_value="2026.06",
+    )
     @patch.object(tasks.import_software_catalog, "delay")
-    def test_import_duplicate_catalog_fails(self, mock_delay):
-        factories.SoftwareCatalogFactory(name="EESSI", catalog_type="binary_runtime")
+    def test_import_same_version_fails(self, mock_delay, mock_detect):
+        factories.SoftwareCatalogFactory(
+            name="EESSI", version="2026.06", catalog_type="binary_runtime"
+        )
 
         self.client.force_authenticate(self.fixture.staff)
         response = self.client.post(self.url, {"name": "EESSI"})
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("2026.06", str(response.data))
         mock_delay.assert_not_called()
+
+    @patch(
+        "waldur_mastermind.marketplace.views.detect_eessi_version",
+        return_value="2026.06",
+    )
+    @patch.object(tasks.import_software_catalog, "delay")
+    def test_import_new_version_allowed_when_other_versions_exist(
+        self, mock_delay, mock_detect
+    ):
+        factories.SoftwareCatalogFactory(
+            name="EESSI", version="2023.06", catalog_type="binary_runtime"
+        )
+        factories.SoftwareCatalogFactory(
+            name="EESSI", version="2025.06", catalog_type="binary_runtime"
+        )
+
+        self.client.force_authenticate(self.fixture.staff)
+        response = self.client.post(self.url, {"name": "EESSI"})
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED, response.data)
+        self.assertEqual(response.data["version"], "2026.06")
+        mock_delay.assert_called_once_with("EESSI", "binary_runtime")
 
     def test_import_unknown_catalog_fails(self):
         self.client.force_authenticate(self.fixture.staff)

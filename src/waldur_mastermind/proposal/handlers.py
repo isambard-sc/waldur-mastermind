@@ -1,10 +1,177 @@
 """Signal handlers for proposal application."""
 
+import logging
+
 from django.contrib.contenttypes.models import ContentType
+from django.db import transaction
+from rest_framework.exceptions import ValidationError
 
 from waldur_core.checklist import models as checklist_models
 from waldur_core.permissions.enums import RoleEnum
+from waldur_core.permissions.models import Role, UserRole
+from waldur_core.permissions.utils import RoleChange, RoleEventDetails
 from waldur_mastermind.proposal import enums, models
+from waldur_mastermind.proposal import permissions as proposal_permissions
+
+logger = logging.getLogger(__name__)
+
+TEAM_FROZEN_MESSAGE = (
+    "The proposal team cannot be changed once the proposal is submitted. "
+    "Ask a call manager to change it."
+)
+ONLY_MANAGERS_MESSAGE = (
+    "Only a proposal manager or a call manager may grant or revoke the "
+    "proposal manager and proposal administrator roles."
+)
+OWN_ROLE_MESSAGE = "Nobody can change their own role on a proposal."
+LAST_MANAGER_MESSAGE = (
+    "A proposal must keep at least one proposal manager. Grant the role to "
+    "someone else first."
+)
+
+
+# Roles that only the proposal's managers, those overseeing its call and staff
+# may grant or revoke: the manager role itself and the administrator role,
+# which edits the proposal.
+TEAM_ROLES_MANAGED_BY_MANAGERS = frozenset(
+    {RoleEnum.PROPOSAL_MANAGER, RoleEnum.PROPOSAL_ADMIN}
+)
+
+
+def _is_manager_role(role) -> bool:
+    return role.name == RoleEnum.PROPOSAL_MANAGER
+
+
+def _lock_proposal(proposal):
+    """Serialise concurrent revocations of a proposal's managers.
+
+    Two requests each revoking a different one of the last two managers
+    would otherwise both see the other still active.
+    """
+    if transaction.get_connection().in_atomic_block:
+        list(
+            models.Proposal.objects.select_for_update()
+            .filter(pk=proposal.pk)
+            .values_list("pk", flat=True)
+        )
+
+
+def _would_lose_last_manager(proposal, user) -> bool:
+    _lock_proposal(proposal)
+    return (
+        not UserRole.objects.filter(
+            scope=proposal, is_active=True, role__name=RoleEnum.PROPOSAL_MANAGER
+        )
+        .exclude(user=user)
+        .exists()
+    )
+
+
+def oversees_proposal_invitations(request, scope) -> bool:
+    """Call managers and organisers invite to the proposals of their call.
+
+    Which roles they may offer, and when, is up to
+    ``guard_proposal_team_change``, as for direct grants.
+    """
+    return isinstance(
+        scope, models.Proposal
+    ) and proposal_permissions.oversees_proposal_call(request, scope)
+
+
+def is_last_proposal_manager_role(user_role) -> bool:
+    """Expiration-sweep guard: a proposal keeps its last manager.
+
+    Expiry is not a decision anyone made, so instead of leaving the proposal
+    without anyone to manage it the grant stays and the lapse is logged.
+    """
+    scope = user_role.scope
+    if not isinstance(scope, models.Proposal) or not _is_manager_role(user_role.role):
+        return False
+    others = (
+        UserRole.objects.filter(
+            scope=scope, is_active=True, role__name=RoleEnum.PROPOSAL_MANAGER
+        )
+        .exclude(pk=user_role.pk)
+        .exists()
+    )
+    if others:
+        return False
+    logger.warning(
+        "Not expiring the role of %s as the last manager of proposal %s.",
+        user_role.user,
+        scope.uuid.hex,
+    )
+    return True
+
+
+def guard_proposal_team_change(scope, role, acting_user, change, user=None):
+    """Who may change a proposal's team, and when.
+
+    - Nobody changes their own proposal role, staff included.
+    - A proposal keeps at least one proposal manager: revoking the last one
+      is refused, whoever asks.
+    - The proposal manager and administrator roles are granted and revoked
+      by the proposal's managers and by whoever oversees its call (call
+      managers, call organisers), or staff. Other roles carrying the team
+      permissions may still manage the rest of the team.
+    - Once the proposal leaves draft, the team is part of what was submitted
+      and is frozen for the applicant: only staff and those overseeing the
+      call may change it. Each such change is
+      logged by the generic role event (see ``describe_proposal_role_event``).
+    """
+    if not isinstance(scope, models.Proposal):
+        return
+    # Unlike other scopes, where staff and organisation owners may, nobody
+    # changes their own proposal role: the team is part of the application.
+    # Creating a proposal makes its author a manager outside this path.
+    if acting_user is not None and user is not None and acting_user.pk == user.pk:
+        raise ValidationError(OWN_ROLE_MESSAGE)
+    if (
+        change == RoleChange.REVOKE
+        and _is_manager_role(role)
+        and user is not None
+        and _would_lose_last_manager(scope, user)
+    ):
+        raise ValidationError(LAST_MANAGER_MESSAGE)
+
+    if acting_user is not None and acting_user.is_staff:
+        return
+
+    managed_by_managers = role.name in TEAM_ROLES_MANAGED_BY_MANAGERS
+    oversees = proposal_permissions.oversees_proposal_call(acting_user, scope)
+    if scope.state != enums.ProposalStates.DRAFT:
+        if oversees:
+            return
+        raise ValidationError(TEAM_FROZEN_MESSAGE)
+
+    if (
+        managed_by_managers
+        and not oversees
+        and not proposal_permissions.is_active_proposal_manager(acting_user, scope)
+    ):
+        raise ValidationError(ONLY_MANAGERS_MESSAGE)
+
+
+def describe_proposal_role_event(user_role):
+    """Enrich the generic role event of a proposal team change.
+
+    A team change is logged once, as the generic role granted/updated/revoked
+    event; on a proposal it also records the proposal's state and whether the
+    change came after submission. Only staff and those overseeing the call get
+    past the freeze, so each post-submission change is an override. An
+    invitation or a permission request is attributed to the inviter or the
+    approver, on whose authority it was admitted.
+    """
+    proposal = user_role.scope
+    after_submission = proposal.state != enums.ProposalStates.DRAFT
+    return RoleEventDetails(
+        context={
+            "proposal_state": proposal.state,
+            "after_submission": after_submission,
+        },
+        role_label=user_role.role.description or user_role.role.name,
+        scope_note="(after submission)" if after_submission else "",
+    )
 
 
 def is_submitted_proposal_role(user_role) -> bool:
@@ -159,6 +326,39 @@ def seed_notification_rules(call_step):
             trigger=trigger,
             recipient=recipient,
             defaults={"days_before": days_before},
+        )
+
+
+# Proposal role -> project role a new call starts with: who the allocated
+# project's team is made of. A call manager edits them per call afterwards.
+DEFAULT_PROJECT_ROLE_MAPPINGS = (
+    (RoleEnum.PROPOSAL_MANAGER, RoleEnum.PROJECT_MANAGER),
+    (RoleEnum.PROPOSAL_ADMIN, RoleEnum.PROJECT_ADMIN),
+    (RoleEnum.PROPOSAL_MEMBER, RoleEnum.PROJECT_MEMBER),
+)
+
+
+def seed_project_role_mappings(sender, instance, created, **kwargs):
+    """Give a new call the default proposal-to-project role mappings.
+
+    Only at creation, so calls that exist already keep theirs. A duplicate
+    or an import that brings its own mappings replaces these.
+    """
+    if not created:
+        return
+    proposal_type = ContentType.objects.get_for_model(models.Proposal)
+    project_type = ContentType.objects.get_by_natural_key("structure", "project")
+    for proposal_role, project_role in DEFAULT_PROJECT_ROLE_MAPPINGS:
+        models.ProposalProjectRoleMapping.objects.get_or_create(
+            call=instance,
+            proposal_role=Role.objects.get_system_role(
+                proposal_role, content_type=proposal_type
+            ),
+            defaults={
+                "project_role": Role.objects.get_system_role(
+                    project_role, content_type=project_type
+                )
+            },
         )
 
 

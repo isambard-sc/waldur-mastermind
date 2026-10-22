@@ -30,6 +30,17 @@ from . import models, utils
 # them — cannot drift from the permission required to write.
 OFFERING_ADMIN_SOURCES = ["*", "customer", "customer.serviceprovider"]
 
+# Where RESOURCE.SET_SLUG may be held to set a resource's slug: on the consumer
+# side (project, organization) or the provider side (offering, its organization,
+# that organization's service provider). Shared by set_slug and order create.
+RESOURCE_SLUG_PERMISSION_SOURCES = [
+    "project",
+    "project.customer",
+    "offering",
+    "offering.customer",
+    "offering.customer.serviceprovider",
+]
+
 
 def can_register_service_provider(request, customer):
     if request.user.is_staff:
@@ -273,11 +284,9 @@ def user_can_list_importable_resources(
         raise exceptions.PermissionDenied()
 
 
-# Project manager/admin and customer owner are allowed to terminate resource.
-# Service provider is allowed to terminate resource too.
 user_can_terminate_resource = permission_factory(
     PermissionEnum.TERMINATE_RESOURCE,
-    ["project", "project.customer", "offering.customer"],
+    utils.TERMINATE_RESOURCE_SOURCES,
 )
 
 
@@ -378,12 +387,6 @@ def validate_resource_terminate_state(resource: models.Resource) -> None:
         )
         % {"ok_or_erred": ok_or_erred, "terminating": terminating_pending}
     )
-
-
-user_can_manage_offering_user_group = permission_factory(
-    PermissionEnum.MANAGE_OFFERING_USER_GROUP,
-    ["offering.customer"],
-)
 
 
 def user_can_set_end_date_by_provider(

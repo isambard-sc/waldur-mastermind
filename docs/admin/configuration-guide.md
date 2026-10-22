@@ -1823,7 +1823,7 @@ Toggler for support plugin.
 
 **Type:** choice_field
 
-**Default value:** atlassian
+**Default value:** basic
 
 Type of support backend. Possible values: basic, atlassian, zammad, smax.
 
@@ -3403,6 +3403,56 @@ Number of days to retain SLURM policy evaluation log entries before automatic cl
 
 Number of months to retain usage poll records before automatic cleanup.
 
+### Custom Metrics
+
+#### METRICS_LATE_DATA_DAYS
+
+**Type:** int
+
+**Default value:** 7
+
+How many days back a reported metric point may be timestamped.
+
+#### METRICS_MAX_SERIES_PER_RESOURCE_METRIC
+
+**Type:** int
+
+**Default value:** 500
+
+Most attribute combinations one resource may report for one metric.
+
+#### METRICS_MAX_POINTS_PER_REQUEST
+
+**Type:** int
+
+**Default value:** 10000
+
+Most metric points accepted in a single report request.
+
+#### METRICS_MAX_OTLP_BODY_BYTES
+
+**Type:** int
+
+**Default value:** 20971520
+
+Largest OTLP metrics body accepted, after decompression, in bytes.
+
+#### METRICS_DEFAULT_RETENTION_POLICY
+
+**Type:** str
+
+**Default value:** standard
+
+Name of the retention policy used by metric definitions that set none.
+
+#### METRICS_ARCHIVE_GRACE_DAYS
+
+**Type:** int
+
+**Default value:** 30
+
+Days an archived offering metric keeps its data before it is purged.
+
 ### Identity Bridge
 
 #### FEDERATED_IDENTITY_SYNC_ENABLED
@@ -3551,6 +3601,12 @@ Homeserver token for authenticating webhook requests.
 
 Localpart for the appservice bot user.
 
+#### MATRIX_TOKENS_MANAGED_BY
+
+**Type:** str
+
+Set to 'deployment' by the init_matrix_settings management command to record that the appservice tokens come from the deployment's own secret and are re-seeded on every sync. While it is set, the Setup wizard refuses to rotate them, because the rotation would be reverted at the next deploy while the homeserver kept the old registration. Blank means the deployment was configured by hand and the wizard owns the tokens. Clear it when the deployment stops seeding Matrix, so the wizard can rotate them again.
+
 #### MATRIX_HISTORY_EXPORT_ENABLED
 
 **Type:** bool
@@ -3563,11 +3619,19 @@ Enable periodic history export of Matrix rooms.
 
 Include media files when exporting Matrix room history.
 
+#### MATRIX_HISTORY_EXPORT_RETENTION_DAYS
+
+**Type:** int
+
+**Default value:** 90
+
+Days to keep Matrix room history exports, files included, before they are deleted. Each room's newest completed export is kept regardless of age. Set to 0 or less to keep them forever.
+
 #### MATRIX_USER_REGISTRATION_SECRET
 
 **Type:** secret_field
 
-Shared secret for Matrix user registration.
+Registration token the homeserver requires for sign-up (its registration_token). With zero-touch setup it is also the homeserver's registration_shared_secret, which can create homeserver admins. Protect it like the appservice tokens.
 
 #### MATRIX_USER_ID_FORMAT
 
@@ -3575,39 +3639,45 @@ Shared secret for Matrix user registration.
 
 **Default value:** username
 
-Format for generating Matrix user IDs: username, uuid, or email_local.
+Format for generating Matrix user IDs: username, uuid, or email_local. Applies only to users provisioned afterwards; existing users keep their Matrix ID.
 
-#### MATRIX_LOGIN_METHOD
+#### MATRIX_EXTERNAL_LOGIN_METHOD
+
+**Type:** choice_field
+
+**Default value:** none
+
+How users sign in to an external Matrix client such as Element: 'none' (Waldur offers no external sign-in), 'password' (for testing and sites without an identity provider: users generate a password in Waldur; needs the Waldur bot to be a homeserver admin), or 'oidc' (single sign-on configured on the homeserver; use this in production). Switching away from 'password' revokes no generated password and signs out no external client; to refuse password logins, set login_with_password = false on the homeserver.
+
+#### MATRIX_SSO_REGISTRATION_METHOD
 
 **Type:** str
 
-**Default value:** token
-
-Login method for Matrix credentials: password, token, or oidc.
-
-#### MATRIX_OIDC_PROVIDER_URL
-
-**Type:** url_field
-
-OIDC provider URL for Matrix SSO login.
+With MATRIX_EXTERNAL_LOGIN_METHOD 'oidc': the registration method of the Waldur users who sign in to Waldur through the identity provider the homeserver's single sign-on uses, i.e. that identity provider's name in Waldur, such as 'keycloak'. Waldur gives a Matrix account only to those users, because the homeserver signs in any subject of that provider to the account its claim names. While blank, no user is given a Matrix account.
 
 #### MATRIX_LIVEKIT_KEY
 
 **Type:** str
 
-LiveKit API key for the call SFU (Calls observability tab).
+LiveKit API key for the call SFU.
 
 #### MATRIX_LIVEKIT_SECRET
 
 **Type:** secret_field
 
-LiveKit API secret used to mint the admin token.
+LiveKit API secret used to mint admin and call tokens.
 
 #### MATRIX_LIVEKIT_URL
 
 **Type:** url_field
 
 Internal LiveKit base URL. Falls back to http://livekit:7880 when blank.
+
+#### MATRIX_LIVEKIT_PUBLIC_URL
+
+**Type:** str
+
+Public LiveKit signaling URL that browsers connect to for calls, e.g. wss://matrix.example.org. Waldur issues call tokens only when this and the LiveKit key and secret are set.
 
 ### Personal Access Tokens
 

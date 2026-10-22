@@ -16,6 +16,7 @@ from django.db.models import (
     F,
     Max,
     OuterRef,
+    Prefetch,
     ProtectedError,
     Q,
     Subquery,
@@ -50,7 +51,6 @@ from waldur_core.logging.enums import EventType
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CallRole, ProposalRole
-from waldur_core.permissions.models import UserRole
 from waldur_core.permissions.utils import (
     has_permission,
     permission_factory,
@@ -73,6 +73,7 @@ from waldur_mastermind.proposal import (
     filters,
     models,
     orcid_service,
+    round_lifecycle,
     serializers,
     tasks,
     utils,
@@ -114,6 +115,11 @@ from .models import Proposal
 from .serializers import ReviewSubmitSerializer
 
 logger = logging.getLogger(__name__)
+
+
+HELD_DECISION_DETAIL = (
+    "Decision recorded. It is announced when the round's results are published."
+)
 
 
 def validate_round_is_open(proposal):
@@ -240,6 +246,12 @@ def validate_purchase_orders_present(proposal):
             )
             % {"offerings": ", ".join(missing)}
         )
+
+
+def validate_proposal_manager_present(proposal):
+    """A proposal is submitted with at least one proposal manager."""
+    if not proposal.has_proposal_manager():
+        raise exceptions.ValidationError(models.MISSING_PROPOSAL_MANAGER_MESSAGE)
 
 
 def validate_requested_amounts_present(proposal):
@@ -1234,7 +1246,26 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                     serializer.data,
                     status=status.HTTP_201_CREATED,
                 )
-        queryset = call.round_set.all().order_by("-start_time")
+        queryset = (
+            call.round_set.all()
+            .select_related("results_published_by")
+            .prefetch_related(
+                # What ProtectedRoundSerializer.get_proposals reads per row.
+                Prefetch(
+                    "proposal_set",
+                    queryset=models.Proposal.objects.select_related(
+                        "round__call", "created_by", "approved_by"
+                    ),
+                )
+            )
+            .annotate(
+                held_decisions_count=Count(
+                    "proposal", filter=Q(proposal__decision_held=True)
+                ),
+                proposals_count=Count("proposal"),
+            )
+            .order_by("-start_time")
+        )
         page = self.paginate_queryset(queryset)
         if page is not None:
             serializer = self.get_serializer(
@@ -1291,13 +1322,13 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                 raise IncorrectStateException()
 
         def validate_existing_of_proposals(call_round):
-            if call_round.proposal_set.exclude(
-                state__in=[
-                    ProposalStates.CANCELED,
-                    ProposalStates.REJECTED,
-                ]
-            ).exists():
-                raise IncorrectStateException()
+            # Deleting a round deletes its proposals with it. Rejected and
+            # cancelled ones are outcomes of the round (a published rejection,
+            # a draft its closing cancelled), so they keep the round as well.
+            if call_round.proposal_set.exists():
+                raise IncorrectStateException(
+                    _("A round that has proposals cannot be deleted.")
+                )
 
         return self.action_detail_method(
             "round_set",
@@ -1338,7 +1369,10 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             call_round.cutoff_time = timezone.now()
             call_round.save(update_fields=["cutoff_time"])
 
-        utils.process_closed_round(call_round)
+        utils.process_closed_round(
+            call_round, announce=tasks.announce_carried_over_drafts
+        )
+        utils.start_round_evaluation(call_round)
 
         return response.Response(
             "Round has been closed.",
@@ -1350,6 +1384,148 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     close_round_permissions = [
         permission_factory(PermissionEnum.CLOSE_ROUNDS, CALL_PERMISSION_SOURCES)
     ]
+
+    def _get_round(self, obj_uuid):
+        call: models.Call = self.get_object()
+        call_round = get_object_or_404(call.round_set, uuid=obj_uuid)
+        if call.state != CallStates.ACTIVE:
+            raise exceptions.ValidationError(_("Call is not active."))
+        return call_round
+
+    def _round_response(self, call_round):
+        call_round.refresh_from_db()
+        return response.Response(
+            serializers.ProtectedRoundSerializer(
+                call_round, context=self.get_serializer_context()
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @extend_schema(
+        request=None,
+        responses={status.HTTP_200_OK: serializers.ProtectedRoundSerializer},
+        description=(
+            "Move an ended round from evaluating to deciding: its proposals "
+            "have been evaluated and go to the decision body."
+        ),
+    )
+    def start_deciding_round(self, request, uuid=None, obj_uuid=None):
+        call_round = round_lifecycle.start_deciding(self._get_round(obj_uuid))
+        return self._round_response(call_round)
+
+    @extend_schema(
+        request=serializers.PublishRoundResultsSerializer,
+        responses={
+            status.HTTP_200_OK: serializers.PublishRoundResultsResponseSerializer,
+            status.HTTP_400_BAD_REQUEST: serializers.PublishRoundResultsRefusalSerializer,
+        },
+        description=(
+            "Publish all allocation decisions of an ended round at once: "
+            "announce every held decision to its applicant and carry it out. "
+            "Refused while a proposal of the round has no decision, unless "
+            "forced with a reason; that refusal carries undecided_count. A "
+            "decision that cannot be carried out stays held and is listed in "
+            "failed_proposals; publishing again retries it."
+        ),
+    )
+    def publish_results_round(self, request, uuid=None, obj_uuid=None):
+        call_round = self._get_round(obj_uuid)
+        serializer = serializers.PublishRoundResultsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            call_round, failed = round_lifecycle.publish_results(
+                call_round,
+                request.user,
+                force=serializer.validated_data["force"],
+                reason=serializer.validated_data["reason"],
+            )
+        except round_lifecycle.UndecidedProposalsError as e:
+            return response.Response(
+                {"detail": e.detail[0], "undecided_count": e.undecided_count},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        call_round.refresh_from_db()
+        call_round.failed_proposals = failed
+        return response.Response(
+            serializers.PublishRoundResultsResponseSerializer(
+                call_round, context=self.get_serializer_context()
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @extend_schema(
+        request=None,
+        responses={
+            status.HTTP_200_OK: serializers.CompleteRoundResponseSerializer,
+            status.HTTP_400_BAD_REQUEST: serializers.CompleteRoundRefusalSerializer,
+        },
+        description=(
+            "Close a round whose results have been published. Refused while "
+            "a decision of the round is still held because its release "
+            "failed (the refusal carries held_decisions_count; publish the "
+            "results again to retry it). Every proposal "
+            "of the round must have a decision. What happens to those that "
+            "have none follows the round's undecided_at_round_completion, or "
+            "else the call's: refuse (the refusal carries undecided_count) or "
+            "reject each at its current step, listed in rejected_proposals. "
+            "A rejection that fails is listed in failed_proposals and the "
+            "round stays open; completing again retries it."
+        ),
+    )
+    def complete_round(self, request, uuid=None, obj_uuid=None):
+        try:
+            call_round, rejected, failed = round_lifecycle.complete(
+                self._get_round(obj_uuid), request.user
+            )
+        except round_lifecycle.UndecidedAtCompletionError as e:
+            return response.Response(
+                {"detail": e.detail[0], "undecided_count": e.undecided_count},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except round_lifecycle.HeldDecisionsAtCompletionError as e:
+            return response.Response(
+                {
+                    "detail": e.detail[0],
+                    "held_decisions_count": e.held_decisions_count,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        call_round.refresh_from_db()
+        call_round.rejected_proposals = rejected
+        call_round.failed_proposals = failed
+        return response.Response(
+            serializers.CompleteRoundResponseSerializer(
+                call_round, context=self.get_serializer_context()
+            ).data,
+            status=status.HTTP_200_OK,
+        )
+
+    @extend_schema(
+        request={"multipart/form-data": serializers.RoundAdoptionSerializer},
+        responses={status.HTTP_200_OK: serializers.ProtectedRoundSerializer},
+        description=(
+            "Record that the round's results were adopted: the date, a note "
+            "and optionally the adopting document."
+        ),
+    )
+    def record_adoption_round(self, request, uuid=None, obj_uuid=None):
+        call_round = self._get_round(obj_uuid)
+        if call_round.status != RoundStatuses.ENDED:
+            raise exceptions.ValidationError(
+                _("The round has not reached its cut-off yet.")
+            )
+        serializer = serializers.RoundAdoptionSerializer(call_round, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return self._round_response(call_round)
+
+    # The round's lifecycle is round management, like closing it.
+    start_deciding_round_permissions = close_round_permissions
+    publish_results_round_permissions = close_round_permissions
+    complete_round_permissions = close_round_permissions
+    record_adoption_round_permissions = close_round_permissions
+    record_adoption_round_serializer_class = serializers.RoundAdoptionSerializer
+    publish_results_round_serializer_class = serializers.PublishRoundResultsSerializer
 
     @extend_schema(
         request=serializers.CallAttachDocumentsSerializer,
@@ -3097,6 +3273,8 @@ class ProposalViewSet(
                     )
                 ),
                 _latest_step_status=Subquery(latest_step_status),
+                # Read by can_submit.
+                _has_proposal_manager=models.has_proposal_manager_expression(),
             )
             # ProposalSerializer.can_submit reads every requested resource, its
             # call entry and the offering's components. Prefetched here for the
@@ -3108,6 +3286,13 @@ class ProposalViewSet(
             )
             .order_by("created")
         )
+
+    def can_manage_role_by_oversight(self, scope, role, request):
+        # Those overseeing the call manage the proposal team as an
+        # organisation owner manages a project team, without a role on it.
+        # The proposal's state and the roles only its managers may hand out
+        # are decided by guard_proposal_team_change.
+        return proposal_permissions.oversees_proposal_call(request, scope)
 
     def can_view_scope_team(self, user, proposal):
         # Core walks the proposal's customer/project tree, which misses users
@@ -3170,6 +3355,14 @@ class ProposalViewSet(
             item.pop("expiration_time", None)
         return serializers.filter_team_member_fields(data, concealed)
 
+    def filter_checklist_response(self, data, obj, request):
+        # Each answer names its author, a member of the applicant team: an
+        # evaluator sees them only as far as the call's config exposes them.
+        concealed = serializers.get_concealed_applicant_attributes(request.user, obj)
+        if concealed:
+            serializers.filter_checklist_answer_fields(data["questions"], concealed)
+        return data
+
     # Both mixins use the default implementation (obj.checklist_completion)
     # UserChecklistMixin permissions - for proposal managers only
     # Checklist viewing: same permission as viewing proposal
@@ -3188,7 +3381,7 @@ class ProposalViewSet(
             return
 
         if permissions_utils.has_permission(
-            request, PermissionEnum.MANAGE_PROPOSAL, obj
+            request, PermissionEnum.UPDATE_PROPOSAL, obj
         ):
             return
 
@@ -3206,53 +3399,65 @@ class ProposalViewSet(
         if obj.round.call_id in get_connected_calls(user, CallRole.MANAGER):
             return
 
+        # A reviewer holding a live review of this proposal but no call role
+        # (an accepted assignment grants none) reads the answers the same way
+        # a call reviewer does. Read-only: answering stays behind
+        # UPDATE_PROPOSAL, and access ends once the review is rejected.
+        if holds_live_review(user, obj):
+            return
+
         raise exceptions.PermissionDenied(
             "You do not have permission to view proposal checklist."
         )
 
     checklist_permissions = [_checklist_view_permission]
-    completion_status_permissions = [permission_factory(PermissionEnum.MANAGE_PROPOSAL)]
-    # Only proposal managers can submit answers
-    submit_answers_permissions = [permission_factory(PermissionEnum.MANAGE_PROPOSAL)]
+    completion_status_permissions = [permission_factory(PermissionEnum.UPDATE_PROPOSAL)]
+    # Only those who may edit the proposal (managers, administrators) answer
+    # it, and only while it is a draft
+    submit_answers_permissions = [proposal_permissions.can_answer_proposal_checklist]
 
     # ReviewerChecklistMixin permissions - for proposal reviewers
     # Custom permission for compliance checklists (call managers only) or regular proposal review permissions
-    def _compliance_checklist_permission(self, request, view, obj=None):
-        """Custom permission that restricts compliance checklist access to call managers only."""
-        if not obj:
-            return False
-
-        completion = self.get_checklist_completion(obj)
-        if completion and completion.checklist:
-            if (
-                completion.checklist.checklist_type
-                == ChecklistTypes.PROPOSAL_COMPLIANCE
-            ):
-                # For compliance checklists, only call managers can access
-                return UserRole.objects.filter(
-                    user=request.user,
-                    role=CallRole.MANAGER,
-                    scope=obj.round.call,
-                    is_active=True,
-                ).exists()
-
-        # For non-compliance checklists, use regular proposal review permissions
-        return permissions_utils.has_permission(
-            request, PermissionEnum.MANAGE_PROPOSAL_REVIEW, obj.round.call
+    _compliance_review_check = staticmethod(
+        proposal_permissions.support_can_read(
+            permission_factory(PermissionEnum.UPDATE_CALL, CALL_PERMISSION_SOURCES)
         )
+    )
+
+    def _compliance_checklist_permission(request, view, obj=None):
+        """Restrict the review view of a checklist -- the answers that trigger
+        a review, the review triggers and notes -- to whoever manages the call
+        for compliance checklists (a call manager, or an organiser through the
+        managing organisation, as for compliance_overview; support may read),
+        and to MANAGE_PROPOSAL_REVIEW holders on the call otherwise.
+
+        Permission checks deny by raising: a returned value is ignored.
+        """
+        if not obj:
+            return
+
+        call = obj.round.call
+        completion = view.get_checklist_completion(obj)
+        if (
+            completion
+            and completion.checklist
+            and completion.checklist.checklist_type
+            == ChecklistTypes.PROPOSAL_COMPLIANCE
+        ):
+            # The same gate as compliance_overview, applied to the call.
+            ProposalViewSet._compliance_review_check(request, view, call)
+        elif not permissions_utils.has_permission(
+            request, PermissionEnum.MANAGE_PROPOSAL_REVIEW, call
+        ):
+            raise exceptions.PermissionDenied(
+                "You do not have permission to review proposal checklist."
+            )
 
     checklist_review_permissions = [_compliance_checklist_permission]
     completion_review_status_permissions = [_compliance_checklist_permission]
 
-    def is_creator(request, view, obj=None):
-        if not obj:
-            return
-        user = request.user
-        if obj.created_by == user or user.is_staff:
-            return
-        raise exceptions.PermissionDenied()
-
-    destroy_permissions = update_project_details_permissions = [is_creator]
+    destroy_permissions = [proposal_permissions.can_manage_proposal]
+    update_project_details_permissions = [proposal_permissions.can_update_proposal]
 
     destroy_validators = update_project_details_validators = [
         core_validators.StateValidator(ProposalStates.DRAFT)
@@ -3308,6 +3513,9 @@ class ProposalViewSet(
                 )
             proposal = locked
             previous_state = proposal.state
+            # Checked again under the lock: the round may have ended since the
+            # validators ran, and the draft moved on to a round not yet open.
+            validate_round_is_open(proposal)
 
             # A proposal must have a project team before it can be submitted.
             # (The creator is normally auto-added, so a solo-PI proposal passes;
@@ -3349,9 +3557,10 @@ class ProposalViewSet(
         validate_project_details_complete,
         validate_requested_amounts_present,
         validate_purchase_orders_present,
+        validate_proposal_manager_present,
     ]
 
-    submit_permissions = [is_creator]
+    submit_permissions = [proposal_permissions.can_manage_proposal]
 
     def perform_create(self, serializer):
         # Validate user eligibility against call restrictions before creating proposal
@@ -3387,6 +3596,7 @@ class ProposalViewSet(
         return self.action_list_method("requestedresource_set")(self, request, uuid)
 
     resources_serializer_class = serializers.RequestedResourceSerializer
+    resources_permissions = [proposal_permissions.can_update_proposal_attachments]
 
     @extend_schema(
         responses={status.HTTP_200_OK: serializers.RequestedResourceSerializer}
@@ -3405,6 +3615,7 @@ class ProposalViewSet(
         )(self, request, uuid, obj_uuid)
 
     resource_detail_serializer_class = serializers.RequestedResourceSerializer
+    resource_detail_permissions = [proposal_permissions.can_update_proposal_attachments]
 
     @extend_schema(
         methods=["post"],
@@ -3455,6 +3666,106 @@ class ProposalViewSet(
     resource_purchase_order_serializer_class = (
         serializers.RequestedResourcePurchaseOrderSerializer
     )
+    resource_purchase_order_permissions = [
+        proposal_permissions.can_update_proposal_attachments
+    ]
+
+    @staticmethod
+    def _allocation_decision_is_active(proposal) -> bool:
+        return proposal.workflow_step_instances.filter(
+            step=workflow_service.DECISION_STEP,
+            status=WorkflowStepInstanceStatuses.ACTIVE,
+        ).exists()
+
+    def _lock_open_award(self, proposal):
+        """Lock the proposal and confirm its award may still change.
+
+        Called inside a transaction: the decision completing concurrently must
+        not provision an award that is half-way through an edit. Completion
+        locks the proposal and then the step; expiry locks only the step. So
+        the step is re-read under a lock of its own, in the same order, and an
+        edit that gets it after the step expired or completed is refused
+        instead of committing to a closed award.
+        """
+        models.Proposal.objects.select_for_update().get(pk=proposal.pk)
+        decision = (
+            proposal.workflow_step_instances.select_for_update()
+            .filter(step=workflow_service.DECISION_STEP)
+            .order_by("-created")
+            .first()
+        )
+        if decision is None or decision.status != WorkflowStepInstanceStatuses.ACTIVE:
+            raise IncorrectStateException(
+                _(
+                    "The awarded resources can only be changed while the "
+                    "allocation decision is in progress."
+                )
+            )
+        # A proposal that reached the step without passing through its
+        # activation (seeded directly, or at the step before awards existed)
+        # starts from its request rather than from nothing.
+        utils.prefill_awarded_resources(proposal)
+
+    @extend_schema(
+        methods=["get"],
+        operation_id="proposal_proposals_awarded_resources_list",
+        request=None,
+        responses=serializers.AwardedResourceSerializer(many=True),
+        description=(
+            "List what the allocation decision awards the proposal. Staff, "
+            "support, the call's managers and organisers, and the managers of "
+            "the offerings involved see it at any time; the applicant team once "
+            "the decision is released."
+        ),
+        filters=False,
+    )
+    @extend_schema(
+        methods=["post"],
+        operation_id="proposal_proposals_awarded_resources_set",
+        request=serializers.AwardedResourceSerializer,
+        responses=serializers.AwardedResourceSerializer,
+        description=(
+            "Add an item to the award. Call managers only, while the allocation "
+            "decision is in progress."
+        ),
+    )
+    @decorators.action(detail=True, methods=["get", "post"])
+    def awarded_resources(self, request, uuid=None):
+        proposal = cast(models.Proposal, self.get_object())
+        if request.method == "POST":
+            with transaction.atomic():
+                self._lock_open_award(proposal)
+                return self.action_list_method("awarded_resources")(self, request, uuid)
+        if (
+            proposal.awarded_resources_prefilled_at is None
+            and self._allocation_decision_is_active(proposal)
+        ):
+            utils.prefill_awarded_resources(proposal)
+        return self.action_list_method("awarded_resources")(self, request, uuid)
+
+    awarded_resources_serializer_class = serializers.AwardedResourceSerializer
+    awarded_resources_permissions = [proposal_permissions.can_access_awarded_resources]
+
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.AwardedResourceSerializer},
+        description=(
+            "Read, change or remove an item of the award. Changes are for call "
+            "managers only, while the allocation decision is in progress."
+        ),
+    )
+    def awarded_resource_detail(self, request, uuid=None, obj_uuid=None):
+        proposal = cast(models.Proposal, self.get_object())
+        handler = self.action_detail_method("awarded_resources")
+        if request.method in rf_permissions.SAFE_METHODS:
+            return handler(self, request, uuid, obj_uuid)
+        with transaction.atomic():
+            self._lock_open_award(proposal)
+            return handler(self, request, uuid, obj_uuid)
+
+    awarded_resource_detail_serializer_class = serializers.AwardedResourceSerializer
+    awarded_resource_detail_permissions = [
+        proposal_permissions.can_access_awarded_resources
+    ]
 
     @extend_schema(
         description="Attach document to proposal.",
@@ -3480,6 +3791,7 @@ class ProposalViewSet(
         return response.Response(status=status.HTTP_200_OK)
 
     attach_document_serializer_class = serializers.ProposalDocumentationSerializer
+    attach_document_permissions = [proposal_permissions.can_update_proposal_attachments]
 
     # Workflow Step Endpoints
 
@@ -3544,6 +3856,23 @@ class ProposalViewSet(
                 "can_view_review_content": (
                     can_view_internal_notes
                     or proposal.round.call.reviews_visible_to_submitters
+                ),
+                # Only the call managers see a decision before the round's
+                # results are published; the rest of the call team learns it
+                # with the applicant.
+                "decision_withheld": (
+                    proposal.decision_held
+                    and not proposal_permissions.user_can_view_held_decision(
+                        request.user, proposal
+                    )
+                ),
+                # An evaluator passes the step actor gate as part of the call
+                # team, but sees an applicant-side completer only as far as
+                # the call's applicant visibility config exposes it.
+                "concealed_applicant_attributes": (
+                    serializers.get_concealed_applicant_attributes(
+                        request.user, proposal
+                    )
                 ),
             },
         )
@@ -3637,6 +3966,14 @@ class ProposalViewSet(
             # Re-introducing them requires a debounce/digest policy first.
 
         if next_instance is None:
+            proposal.refresh_from_db()
+            if proposal.decision_held:
+                return response.Response(
+                    serializers.CompleteWorkflowStepResponseSerializer(
+                        {"detail": HELD_DECISION_DETAIL}
+                    ).data,
+                    status=status.HTTP_200_OK,
+                )
             if workflow_service.is_awaiting_manual_advance(proposal):
                 response_serializer = (
                     serializers.CompleteWorkflowStepResponseSerializer(
@@ -3737,6 +4074,14 @@ class ProposalViewSet(
                 internal_notes=internal_notes,
             )
 
+        proposal.refresh_from_db()
+        if proposal.decision_held:
+            response_serializer = serializers.RejectWorkflowStepResponseSerializer(
+                {"detail": HELD_DECISION_DETAIL, "proposal_state": proposal.state}
+            )
+            return response.Response(
+                response_serializer.data, status=status.HTTP_200_OK
+            )
         response_serializer = serializers.RejectWorkflowStepResponseSerializer(
             {"detail": "Proposal rejected.", "proposal_state": ProposalStates.REJECTED}
         )
@@ -3840,6 +4185,53 @@ class ProposalViewSet(
     advance_workflow_step_permissions = [proposal_permissions.can_advance_workflow_step]
 
     @extend_schema(
+        description=(
+            "Reopen an allocation decision held for the round's publication: "
+            "the decision step becomes active again with its outcome cleared, "
+            "and the proposal counts as undecided until it is decided anew. "
+            "Only before the round's results are published. Nothing is sent "
+            "to the applicant. The reopen is logged on the proposal's event "
+            "feed, which the applicant team reads, so the event carries "
+            "neither the reason nor the outcome taken back."
+        ),
+        request=serializers.ReopenDecisionSerializer,
+        responses={
+            status.HTTP_200_OK: serializers.ProposalWorkflowStepInstanceSerializer,
+        },
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def reopen_decision(self, request, uuid=None):
+        proposal = self.get_object()
+        input_serializer = serializers.ReopenDecisionSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+
+        try:
+            instance = workflow_service.reopen_held_decision(
+                proposal,
+                request.user,
+                reason=input_serializer.validated_data["reason"],
+                deadline=input_serializer.validated_data["deadline"],
+            )
+        except workflow_service.DecisionNotReopenable as e:
+            return response.Response(
+                {"detail": str(e)}, status=status.HTTP_409_CONFLICT
+            )
+
+        # Only the call's managers get here, so the step is shown whole.
+        output = serializers.ProposalWorkflowStepInstanceSerializer(
+            instance,
+            context={
+                "can_view_internal_notes": True,
+                "can_view_step_actors": True,
+                "can_view_review_content": True,
+            },
+        )
+        return response.Response(output.data, status=status.HTTP_200_OK)
+
+    reopen_decision_serializer_class = serializers.ReopenDecisionSerializer
+    reopen_decision_permissions = [proposal_permissions.can_reopen_held_decision]
+
+    @extend_schema(
         request=serializers.ProposalDetachDocumentsSerializer,
         responses=None,
         description="Detach documents from proposal.",
@@ -3875,6 +4267,9 @@ class ProposalViewSet(
         )
 
     detach_documents_serializer_class = serializers.ProposalDetachDocumentsSerializer
+    detach_documents_permissions = [
+        proposal_permissions.can_update_proposal_attachments
+    ]
 
     # NOTE: the legacy one-click `approve`/`reject` actions were removed — every
     # proposal is now driven through the workflow engine (complete/advance/reject

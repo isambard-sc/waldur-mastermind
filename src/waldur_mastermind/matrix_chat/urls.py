@@ -23,9 +23,61 @@ urlpatterns = [
         name="matrix-credentials",
     ),
     path(
+        "api/matrix/credentials/password/",
+        views.MatrixPasswordView.as_view(),
+        name="matrix-credentials-password",
+    ),
+    path(
+        "api/matrix/credentials/recovery-key/",
+        views.MatrixRecoveryKeyView.as_view(),
+        name="matrix-credentials-recovery-key",
+    ),
+    path(
+        "api/matrix/session/",
+        views.MatrixSessionView.as_view(),
+        name="matrix-session",
+    ),
+    # The call token API Matrix clients use; its base, /api/matrix/livekit, is
+    # the livekit_service_url of the homeserver's .well-known RTC focus.
+    path(
+        "api/matrix/livekit/get_token",
+        views.LiveKitGetTokenView.as_view(),
+        name="matrix-livekit-get-token",
+    ),
+    path(
+        "api/matrix/livekit/sfu/get",
+        views.LiveKitLegacySfuView.as_view(),
+        name="matrix-livekit-sfu-get",
+    ),
+    path(
+        "api/matrix/livekit/delegate_delayed_leave",
+        views.LiveKitDelegateDelayedLeaveView.as_view(),
+        name="matrix-livekit-delegate-delayed-leave",
+    ),
+    path(
+        "api/matrix/crypto/lease/",
+        views.MatrixCryptoLeaseView.as_view(),
+        name="matrix-crypto-lease",
+    ),
+    path(
+        "api/matrix/crypto/lease/release/",
+        views.MatrixCryptoLeaseReleaseView.as_view(),
+        name="matrix-crypto-lease-release",
+    ),
+    path(
+        "api/matrix/crypto/escrow/",
+        views.MatrixCryptoEscrowView.as_view(),
+        name="matrix-crypto-escrow",
+    ),
+    path(
         "_matrix/app/v1/transactions/<str:txn_id>",
         views.MatrixAppserviceWebhookView.as_view(),
         name="matrix-appservice-transactions",
+    ),
+    path(
+        "_matrix/app/v1/ping",
+        views.MatrixAppservicePingView.as_view(),
+        name="matrix-appservice-ping",
     ),
     path(
         "api/admin/matrix-appservice/setup/",

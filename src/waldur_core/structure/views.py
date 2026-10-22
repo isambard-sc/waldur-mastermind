@@ -47,7 +47,11 @@ from waldur_core.core import views as core_views
 from waldur_core.core.db_template_cache import add_template_to_cache
 from waldur_core.core.enums import CoreStates, ReviewStates
 from waldur_core.core.permissions import PATScopeAwareIsAdminUser
-from waldur_core.core.serializers import DetailSerializer, ReviewCommentSerializer
+from waldur_core.core.serializers import (
+    DetailSerializer,
+    ReviewCommentSerializer,
+    StatusSerializer,
+)
 from waldur_core.core.user_attributes import get_profile_completeness_details
 from waldur_core.core.utils import get_ip_address, is_uuid_like
 from waldur_core.core.views import ActionsViewSet
@@ -91,6 +95,7 @@ from waldur_core.structure.serializers_data_access import (
 )
 from waldur_core.structure.utils import (
     get_components_usage_data_from_resources,
+    include_terminated_requested,
 )
 from waldur_core.structure.utils_data_access import bulk_log_user_data_access
 from waldur_core.user_actions import providers as user_action_providers
@@ -107,7 +112,7 @@ from waldur_core.users.scim import tasks as scim_tasks
 from waldur_core.users.utils import get_manageable_permission_requests
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import serializers as marketplace_serializers
-from waldur_mastermind.marketplace.enums import ResourceStates
+from waldur_mastermind.marketplace.enums import OrderTypes, ResourceStates
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +128,23 @@ PROJECT_UUID_PARAMETER = OpenApiParameter(
     type=OpenApiTypes.UUID,
     location=OpenApiParameter.PATH,
     description="UUID of the project",
+)
+FOR_CURRENT_MONTH_PARAMETER = OpenApiParameter(
+    name="for_current_month",
+    type=bool,
+    location=OpenApiParameter.QUERY,
+    description="If true, returns usage data for the current month only. Otherwise, returns total usage.",
+)
+STATS_INCLUDE_TERMINATED_PARAMETER = OpenApiParameter(
+    name="include_terminated",
+    type=bool,
+    location=OpenApiParameter.QUERY,
+    description=(
+        "If true, also counts terminated resources that reported usage in the "
+        "current month. Their share is returned as usage_terminated and "
+        "limit_usage_terminated; limit never includes them. Ignored unless "
+        "the dashboard.usage_include_terminated feature is enabled."
+    ),
 )
 
 
@@ -364,12 +386,8 @@ class CustomerViewSet(
         description="Provides statistics about the resource usage (e.g., CPU, RAM, storage) for all projects within a customer. Can be filtered to show usage for the current month only.",
         responses=serializers.ComponentsUsageStatsSerializer,
         parameters=[
-            OpenApiParameter(
-                name="for_current_month",
-                type=bool,
-                location=OpenApiParameter.QUERY,
-                description="If true, returns usage data for the current month only. Otherwise, returns total usage.",
-            ),
+            FOR_CURRENT_MONTH_PARAMETER,
+            STATS_INCLUDE_TERMINATED_PARAMETER,
         ],
     )
     @action(detail=True)
@@ -378,15 +396,18 @@ class CustomerViewSet(
 
         resources = marketplace_models.Resource.objects.filter(
             project__customer=customer
-        ).exclude(state=ResourceStates.TERMINATED)
+        )
         resources = filter_queryset_for_user(resources, request.user)
 
-        for_current_month = request.query_params.get("for_current_month", False)
-        if for_current_month in ["true", "True"]:
-            for_current_month = True
+        for_current_month = (
+            request.query_params.get("for_current_month", "").lower()
+            in rf_serializers.BooleanField.TRUE_VALUES
+        )
 
         components_data_list = get_components_usage_data_from_resources(
-            resources, for_current_month
+            resources,
+            for_current_month,
+            include_terminated=include_terminated_requested(request),
         )
 
         return Response(
@@ -1133,33 +1154,86 @@ class ProjectViewSet(
     ]
 
     @extend_schema(
+        summary="Set project slug",
+        description="Updates the slug of a project. Requires staff or the "
+        "PROJECT.SET_SLUG permission, which no role holds unless the deployment "
+        "grants it. Other than staff, a holder cannot change the slug once a "
+        "resource of the project is being provisioned or exists in the backend.",
+        request=serializers.ProjectSlugSerializer,
+        responses={200: StatusSerializer},
+    )
+    @action(detail=True, methods=["post"])
+    def set_slug(self, request, uuid=None):
+        project = self.get_object()
+        serializer = serializers.ProjectSlugSerializer(project, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        new_slug = serializer.validated_data["slug"]
+
+        with transaction.atomic():
+            project = models.Project.objects.select_for_update().get(pk=project.pk)
+            if new_slug == project.slug:
+                return Response({"status": _("Project slug is not changed.")})
+
+            if not request.user.is_staff:
+                live_resources = marketplace_models.Resource.objects.filter(
+                    project=project
+                ).exclude(state=marketplace_models.Resource.States.TERMINATED)
+                # Lock the resources and their creation orders, so an agent
+                # cannot set a backend_id or an order start executing between
+                # this check and the save.
+                list(live_resources.select_for_update().values_list("pk", flat=True))
+                list(
+                    marketplace_models.Order.objects.select_for_update()
+                    .filter(resource__in=live_resources, type=OrderTypes.CREATE)
+                    .values_list("pk", flat=True)
+                )
+                if live_resources.filter(marketplace_models.slug_locked_q()).exists():
+                    raise rf_serializers.ValidationError(
+                        {
+                            "slug": _(
+                                "The slug cannot be changed: a resource of this "
+                                "project is being or has been provisioned with a "
+                                "backend account named after it."
+                            )
+                        }
+                    )
+
+            # Recorded by the project_update_succeeded event; Project has no
+            # reversion history.
+            project.slug = new_slug
+            project.save()
+        return Response({"status": _("Project slug has been changed.")})
+
+    set_slug_serializer_class = serializers.ProjectSlugSerializer
+    set_slug_permissions = [
+        permission_factory(PermissionEnum.SET_PROJECT_SLUG, ["*", "customer"])
+    ]
+
+    @extend_schema(
         summary="Get project resource usage statistics",
         description="Provides statistics about the resource usage (e.g., CPU, RAM, storage) for all resources within a project. Can be filtered to show usage for the current month only.",
         responses=serializers.ComponentsUsageStatsSerializer,
         parameters=[
-            OpenApiParameter(
-                name="for_current_month",
-                type=bool,
-                location=OpenApiParameter.QUERY,
-                description="If true, returns usage data for the current month only. Otherwise, returns total usage.",
-            ),
+            FOR_CURRENT_MONTH_PARAMETER,
+            STATS_INCLUDE_TERMINATED_PARAMETER,
         ],
     )
     @action(detail=True)
     def stats(self, request, *args, **kwargs):
         project = self.get_object()
 
-        resources = marketplace_models.Resource.objects.filter(project=project).exclude(
-            state=ResourceStates.TERMINATED
-        )
+        resources = marketplace_models.Resource.objects.filter(project=project)
         resources = filter_queryset_for_user(resources, request.user)
 
-        for_current_month = request.query_params.get("for_current_month", False)
-        if for_current_month in ["true", "True"]:
-            for_current_month = True
+        for_current_month = (
+            request.query_params.get("for_current_month", "").lower()
+            in rf_serializers.BooleanField.TRUE_VALUES
+        )
 
         components_data_list = get_components_usage_data_from_resources(
-            resources, for_current_month
+            resources,
+            for_current_month,
+            include_terminated=include_terminated_requested(request),
         )
 
         return Response(

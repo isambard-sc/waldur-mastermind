@@ -352,6 +352,10 @@ class InvoiceNotificationContext(BaseModel):
     year: int = Field(description="The year of the invoice as an integer.")
     customer: str = Field(description="The name of the customer the invoice is for.")
     link: str = Field(description="A URL to view the invoice in the portal.")
+    attached: bool = Field(
+        default=True,
+        description="Whether the invoice PDF is attached; false if it failed to render.",
+    )
 
 
 class InvoiceSection(NotificationSection):
@@ -360,7 +364,7 @@ class InvoiceSection(NotificationSection):
 
     notification = Notification(
         key="notification",
-        description="Sent to organization owners with a new invoice. Includes the invoice as an HTML attachment.",
+        description="Sent to organization owners with a new invoice. Includes the invoice as a PDF attachment.",
         context_model=InvoiceNotificationContext,
     )
     upcoming_ends_notification = Notification(
@@ -629,7 +633,8 @@ class MarketplaceSection(NotificationSection):
     notify_about_new_order = Notification(
         key="notify_about_new_order",
         description="Notifies the recipients configured on the offering about every "
-        "new order for it, regardless of whether the order needs approval.",
+        "new order for it, once the consumer side has approved the order or "
+        "straight away if it needs no consumer approval.",
         context_model=NewOrderNotificationContext,
     )
     notify_consumer_about_pending_order = Notification(
@@ -1202,6 +1207,29 @@ class ProposalSubmissionDeadlineApproachingContext(BaseModel):
         description="Whole number of hours remaining after remaining days are excluded."
     )
     proposal_url: str = Field(description="A URL to the proposal details page.")
+    draft_carries_over: bool = Field(
+        default=False,
+        description=(
+            "True when a draft left at the cut-off moves on to the call's next "
+            "round rather than being cancelled."
+        ),
+    )
+
+
+class ProposalDraftCarriedOverContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    proposal_creator_name: str = Field(description="Full name of the proposal creator.")
+    proposal_name: str = Field(description="Name of the draft proposal.")
+    call_name: str = Field(description="Name of the call for proposals.")
+    previous_round_name: str = Field(
+        description="Name of the round whose cut-off the draft missed."
+    )
+    round_name: str = Field(description="Name of the round the draft now belongs to.")
+    round_start_date: Any = Field(
+        description="When the new round opens for submissions."
+    )
+    deadline_date: Any = Field(description="Submission deadline of the new round.")
+    proposal_url: str = Field(description="A URL to the proposal details page.")
 
 
 class ReviewsCompleteContext(BaseModel):
@@ -1379,6 +1407,14 @@ class ProposalSection(NotificationSection):
             )
             for suffix in ("subject.txt", "message.txt", "message.html")
         ],
+    )
+    proposal_draft_carried_over = Notification(
+        key="proposal_draft_carried_over",
+        description=(
+            "Tells a proposal creator that their draft, still open when its "
+            "round's cut-off passed, has moved on to the call's next round."
+        ),
+        context_model=ProposalDraftCarriedOverContext,
     )
     proposal_submission_deadline_approaching = Notification(
         key="proposal_submission_deadline_approaching",

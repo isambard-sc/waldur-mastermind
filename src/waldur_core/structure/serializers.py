@@ -262,6 +262,16 @@ class AffiliatedOrganizationSerializer(
             return 0
 
 
+class ProjectSlugSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.Project
+        fields = ("slug",)
+
+    def validate_slug(self, value):
+        core_serializers.validate_unique_slug(models.Project, value, self.instance)
+        return value
+
+
 class ProjectAffiliationUpdateSerializer(serializers.Serializer):
     affiliation = serializers.SlugRelatedField(
         slug_field="uuid",
@@ -401,6 +411,7 @@ class ProjectListSerializer(serializers.ListSerializer):
             "billing_estimates": {},
             "project_credits": {},
             "project_metadata": {},
+            "project_has_metrics": set(),
         }
 
         # 1. Bulk fetch resource counts
@@ -428,6 +439,14 @@ class ProjectListSerializer(serializers.ListSerializer):
             bulk_data["project_metadata"] = self._bulk_fetch_project_metadata(
                 project_ids
             )
+
+        # 6. Bulk fetch which projects use an offering that reports metrics
+        if not requested_fields or "has_metrics" in requested_fields:
+            from waldur_mastermind.marketplace_metrics.handlers import (
+                projects_with_metrics,
+            )
+
+            bulk_data["project_has_metrics"] = projects_with_metrics(project_ids)
 
         self.context["bulk_data"] = bulk_data
         return super().to_representation(data)
@@ -551,6 +570,15 @@ class ProjectSerializer(
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
 ):
+    slug_create_permission = PermissionEnum.SET_PROJECT_SLUG
+    slug = serializers.SlugField(
+        required=False,
+        allow_blank=True,
+        max_length=50,
+        help_text="URL-friendly identifier. Editable by staff; on create also by "
+        "holders of PROJECT.SET_SLUG on the organization, otherwise ignored.",
+    )
+
     resources_count = serializers.SerializerMethodField(
         help_text="Number of active resources in this project"
     )
@@ -872,6 +900,9 @@ class ProjectSerializer(
 
     def get_filtered_field_names(self):
         return ("customer",)
+
+    def get_slug_permission_scope(self, attrs):
+        return attrs.get("customer"), None
 
     def validate(self, attrs):
         customer = (
@@ -3771,6 +3802,14 @@ class ComponentStatsSerializer(serializers.Serializer):
     billing_type = serializers.CharField(read_only=True)
     usage = serializers.IntegerField(read_only=True)
     limit_usage = serializers.IntegerField(read_only=True)
+    usage_terminated = serializers.IntegerField(
+        read_only=True,
+        help_text="Part of usage that came from terminated resources.",
+    )
+    limit_usage_terminated = serializers.IntegerField(
+        read_only=True,
+        help_text="Part of limit_usage that came from terminated resources.",
+    )
     limit = serializers.IntegerField(read_only=True)
     offering_name = serializers.CharField(read_only=True)
     offering_uuid = serializers.UUIDField(read_only=True)
