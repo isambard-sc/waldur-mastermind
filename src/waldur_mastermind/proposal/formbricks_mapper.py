@@ -1,14 +1,14 @@
 """Applies a Formbricks step's answers to a Proposal.
 
-Only "project_details" has a mapper (see formbricks_flows.py) - it's the
-only step whose answers feed directly into Proposal/RequestedResource
-fields. Every other step is snapshotted (models.FormStepResponse) but never
-passed through a mapper.
+A step's mapper (FormbricksFlowStep.mapper, one of MAPPERS below) applies its
+field mappings and resource options to Proposal/RequestedResource fields.
+Steps without a mapper are snapshotted (models.FormStepResponse) but never
+passed through one.
 """
 
 import logging
 
-from waldur_mastermind.proposal import formbricks_flows
+from waldur_mastermind.proposal import enums, formbricks_flows
 from waldur_mastermind.proposal import models as proposal_models
 
 logger = logging.getLogger(__name__)
@@ -18,7 +18,7 @@ class FormbricksMappingError(Exception):
     """A configured question ID was missing from a webhook payload.
 
     Raised rather than silently defaulting, so a Formbricks survey edited
-    out of sync with formbricks_flows.py fails loudly instead of quietly
+    out of sync with its Waldur flow configuration fails loudly instead of quietly
     dropping applicant data.
     """
 
@@ -28,7 +28,7 @@ def _get_required(data, question_id, step_key):
         raise FormbricksMappingError(
             f"Question {question_id!r} missing from {step_key!r} response - "
             f"the Formbricks survey may have been edited without updating "
-            f"formbricks_flows.py."
+            f"the Waldur Formbricks flow."
         )
     return data[question_id]
 
@@ -44,7 +44,7 @@ def _coerce_bool(value, question_id, step_key):
             f"Question {question_id!r} in {step_key!r} response was "
             f"{value!r} - expected one of {sorted(_YES_NO)}. The question "
             f"type may have changed in Formbricks without updating "
-            f"formbricks_flows.py."
+            f"the Waldur Formbricks flow."
         )
 
 
@@ -77,26 +77,28 @@ def serialize_form_responses(proposal, step_keys=None):
     label/value pairs, for the Lead's and reviewers' read-only display.
 
     `step_keys`, if given, restricts which steps are included (reviewers
-    only ever see formbricks_flows.REVIEWER_VISIBLE_STEPS); omitted, every
+    only ever see the flow's reviewer-visible steps); omitted, every
     stored step is returned (the Lead's own data, or a staff viewer's).
     Returns None if the call doesn't use the Formbricks flow at all.
     """
-    flow_key = proposal.round.call.formbricks_flow_key
-    if not flow_key:
+    flow = proposal.round.call.formbricks_flow
+    if flow is None:
         return None
 
     steps = proposal.form_step_responses.all()
     if step_keys is not None:
         steps = steps.filter(step_key__in=step_keys)
 
-    # Order by the flow's own step sequence (project_details, team_details,
-    # compliance, assessment - see formbricks_flows.FORM_FLOWS), not by
+    # Order by the flow's own step sequence (e.g. project_details,
+    # team_details, compliance, assessment), not by
     # step_key alphabetically ("assessment" would sort first) or by
     # created/modified (which drifts out of submission order once any step
     # is edited later).
-    flow = formbricks_flows.get_flow(flow_key) or []
-    flow_order = {step["key"]: index for index, step in enumerate(flow)}
-    steps = sorted(steps, key=lambda step: flow_order.get(step.step_key, len(flow)))
+    flow_steps = formbricks_flows.get_steps(flow)
+    flow_order = {step.key: index for index, step in enumerate(flow_steps)}
+    steps = sorted(
+        steps, key=lambda step: flow_order.get(step.step_key, len(flow_steps))
+    )
 
     result = []
     for step in steps:
@@ -135,90 +137,83 @@ def serialize_form_responses(proposal, step_keys=None):
     return result
 
 
-def _resolve_requested_offering(call, offering_slug):
+def _resolve_requested_offering(call, offering):
     try:
         return proposal_models.RequestedOffering.objects.get(
-            call=call, offering__slug=offering_slug
+            call=call, offering=offering
         )
     except proposal_models.RequestedOffering.DoesNotExist:
         raise FormbricksMappingError(
-            f"Call {call} has no RequestedOffering for offering slug "
-            f"{offering_slug!r} - check formbricks_flows.py resource_options "
-            f"against this call's actual offerings."
+            f"Call {call} has no RequestedOffering for offering {offering} - "
+            f"check the Formbricks flow's resource options against this "
+            f"call's actual offerings."
         )
     except proposal_models.RequestedOffering.MultipleObjectsReturned:
         raise FormbricksMappingError(
             f"Call {call} has more than one RequestedOffering for offering "
-            f"slug {offering_slug!r} - this mapper can't tell which one is "
+            f"{offering} - this mapper can't tell which one is "
             f"authoritative. Remove or cancel the duplicate."
         )
 
 
+_COERCERS = {
+    enums.FormbricksValueTypes.TEXT: lambda value, question_id, step_key: value,
+    enums.FormbricksValueTypes.INTEGER: _coerce_int,
+    enums.FormbricksValueTypes.BOOLEAN: _coerce_bool,
+}
+
+
 def map_project_details(proposal, data, step):
-    """Apply the project_details step's answers to `proposal`.
+    """Apply a project-details step's answers to `proposal`.
 
     Does not save `proposal` - the caller (the webhook handler) does that
     once, after the mapper returns, so a single save covers every field
     this function sets.
 
-    `step` is the PROJECT_DETAILS_STEP dict from formbricks_flows.py.
+    `step` is a models.FormbricksFlowStep.
     """
-    for question_id, field_name in step["field_map"].items():
-        value = _get_required(data, question_id, step["key"])
-        setattr(proposal, field_name, value)
+    for mapping in step.field_mappings.all():
+        value = _get_required(data, mapping.question_id, step.key)
+        coerce = _COERCERS[mapping.value_type]
+        setattr(
+            proposal,
+            mapping.proposal_field,
+            coerce(value, mapping.question_id, step.key),
+        )
 
-    for question_id, field_name in step.get("integer_field_map", {}).items():
-        value = _get_required(data, question_id, step["key"])
-        setattr(proposal, field_name, _coerce_int(value, question_id, step["key"]))
-
-    for question_id, field_name in step.get("boolean_field_map", {}).items():
-        value = _get_required(data, question_id, step["key"])
-        setattr(proposal, field_name, _coerce_bool(value, question_id, step["key"]))
+    resource_options = list(step.resource_options.select_related("offering"))
+    if not resource_options:
+        return
 
     call = proposal.round.call
-    resource_options = step["resource_options"]
-    label_to_slug = step["resource_label_to_slug"]
+    options_by_label = {option.choice_label: option for option in resource_options}
 
-    selected_labels = _get_required(data, step["resource_question_id"], step["key"])
+    selected_labels = _get_required(data, step.resource_question_id, step.key)
     if isinstance(selected_labels, str):
         selected_labels = [selected_labels]
 
     selected_requested_offering_ids = []
     for label in selected_labels:
         # Formbricks records the choice's label text as the answer, not a
-        # stable id/slug - translate explicitly rather than deriving a slug
-        # from the label (e.g. lowercasing it), since offering slugs are
-        # free to diverge from Formbricks' label text over time.
-        slug = label_to_slug.get(label)
-        if slug is None:
-            logger.warning(
-                "Proposal %s selected resource option %r for call %s with no "
-                "resource_label_to_slug entry - skipping (offering may not "
-                "be wired up yet).",
-                proposal.uuid,
-                label,
-                call,
-            )
-            continue
-
-        option = resource_options.get(slug)
+        # stable id - translate explicitly through the configured options.
+        option = options_by_label.get(label)
         if option is None:
             logger.warning(
-                "Proposal %s selected resource option %r (slug %r) for call "
-                "%s with no matching resource_options entry - skipping.",
+                "Proposal %s selected resource option %r for call %s with no "
+                "matching resource option - skipping (offering may not be "
+                "wired up yet).",
                 proposal.uuid,
                 label,
-                slug,
                 call,
             )
             continue
 
-        requested_offering = _resolve_requested_offering(call, slug)
+        requested_offering = _resolve_requested_offering(call, option.offering)
         selected_requested_offering_ids.append(requested_offering.id)
 
-        attributes = dict(option.get("default_attributes", {}))
-        for question_id, attribute_key in option.get("attribute_field_map", {}).items():
-            attributes[attribute_key] = _get_required(data, question_id, step["key"])
+        attributes = dict(option.default_attributes)
+        for question_id, attribute_key in option.attribute_field_map.items():
+            attributes[attribute_key] = _get_required(data, question_id, step.key)
 
         proposal_models.RequestedResource.objects.update_or_create(
             proposal=proposal,
@@ -227,12 +222,18 @@ def map_project_details(proposal, data, step):
         )
 
     # Editing project_details replaces the resource selection wholesale: drop
-    # any previously-selected resource_options offering that is no longer
+    # any previously-selected resource option offering that is no longer
     # selected. Only offerings this step actually manages are touched - a
     # resource added independently by a call manager isn't affected.
     all_configured_requested_offering_ids = [
-        _resolve_requested_offering(call, slug).id for slug in resource_options
+        _resolve_requested_offering(call, option.offering).id
+        for option in resource_options
     ]
     proposal.requestedresource_set.filter(
         requested_offering_id__in=all_configured_requested_offering_ids
     ).exclude(requested_offering_id__in=selected_requested_offering_ids).delete()
+
+
+MAPPERS = {
+    enums.FormbricksStepMappers.PROJECT_DETAILS: map_project_details,
+}

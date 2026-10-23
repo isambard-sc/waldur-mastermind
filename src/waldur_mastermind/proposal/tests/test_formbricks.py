@@ -6,7 +6,8 @@ import time
 from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
-from django.conf import settings
+from constance import config
+from constance.test import override_config
 from django.urls import reverse
 from rest_framework import status, test
 
@@ -17,58 +18,65 @@ from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.marketplace.tests import factories as marketplace_factories
 from waldur_mastermind.proposal import (
     formbricks_client,
-    formbricks_flows,
     formbricks_mapper,
     models,
 )
-from waldur_mastermind.proposal.enums import ProposalStates, RequestedOfferingStates
+from waldur_mastermind.proposal.enums import (
+    FormbricksStepMappers,
+    ProposalStates,
+    RequestedOfferingStates,
+)
 from waldur_mastermind.proposal.tests import factories, fixtures
 
-TEST_FLOW_KEY = "test-flow"
+TEST_FLOW_NAME = "test-flow"
+TEST_WEBHOOK_SECRET = "whsec_" + base64.b64encode(b"test-webhook-secret").decode()
 
-PROJECT_DETAILS_STEP = {
-    "key": "project_details",
-    "survey_id": "survey-project-details",
-    "field_map": {
-        "q_name": "name",
-        "q_summary": "project_summary",
-    },
-    # No integer_field_map/boolean_field_map: duration/confidentiality/
-    # civilian-purpose questions are still asked (and still snapshotted in
-    # FormStepResponse for reviewers), but devel's rewrite removed their
-    # backing Proposal fields (duration is now call-level fixed_duration_in_days,
-    # set by the call manager; the other two were dropped as unused flags) -
-    # see test_project_details_step_leaves_unmapped_questions_in_snapshot_only.
-    "resource_question_id": "q_resources",
-    # Answers are Formbricks choice *labels*, not slugs - deliberately
-    # distinct from the "test-offering" slug key below, to exercise the
-    # translation step rather than have it pass by coincidence.
-    "resource_label_to_slug": {
-        "Test Offering": "test-offering",
-    },
-    "resource_options": {
-        "test-offering": {
-            # "allocation" (GPU-hours), not "num_gpus" - matches
-            # waldur_openportal's Resource.options["allocation"] key name.
-            # No default_attributes: storage isn't assigned by the resource.
-            "attribute_field_map": {"q_num_gpus": "allocation"},
-            "default_attributes": {},
-        },
-    },
-    "mapper": "map_project_details",
-}
+PROJECT_DETAILS_STEP = {"key": "project_details", "survey_id": "survey-project-details"}
 TEAM_DETAILS_STEP = {"key": "team_details", "survey_id": "survey-team-details"}
 COMPLIANCE_STEP = {"key": "compliance", "survey_id": "survey-compliance"}
 ASSESSMENT_STEP = {"key": "assessment", "survey_id": "survey-assessment"}
 
-TEST_FORM_FLOWS = {
-    TEST_FLOW_KEY: [
-        PROJECT_DETAILS_STEP,
-        TEAM_DETAILS_STEP,
-        COMPLIANCE_STEP,
-        ASSESSMENT_STEP,
-    ],
-}
+
+def create_test_flow(offering):
+    """A four-step flow like the real AIRR ones.
+
+    project_details maps q_name/q_summary into the proposal and the "Test
+    Offering" choice of q_resources onto `offering`. The choice label is
+    deliberately distinct from the offering's slug, so the translation is
+    exercised rather than passing by coincidence. Duration/confidentiality/
+    civilian-purpose questions are still asked by the survey but not mapped:
+    they only land in the FormStepResponse snapshot. Only project_details
+    and assessment are reviewer-visible.
+    """
+    flow = factories.FormbricksFlowFactory(name=TEST_FLOW_NAME)
+    project_details = factories.FormbricksFlowStepFactory(
+        flow=flow,
+        order=0,
+        mapper=FormbricksStepMappers.PROJECT_DETAILS,
+        is_reviewer_visible=True,
+        resource_question_id="q_resources",
+        **PROJECT_DETAILS_STEP,
+    )
+    models.FormbricksFieldMapping.objects.create(
+        step=project_details, question_id="q_name", proposal_field="name"
+    )
+    models.FormbricksFieldMapping.objects.create(
+        step=project_details, question_id="q_summary", proposal_field="project_summary"
+    )
+    models.FormbricksResourceOption.objects.create(
+        step=project_details,
+        choice_label="Test Offering",
+        offering=offering,
+        # "allocation" (GPU-hours), not "num_gpus" - matches
+        # waldur_openportal's Resource.options["allocation"] key name.
+        attribute_field_map={"q_num_gpus": "allocation"},
+    )
+    factories.FormbricksFlowStepFactory(flow=flow, order=1, **TEAM_DETAILS_STEP)
+    factories.FormbricksFlowStepFactory(flow=flow, order=2, **COMPLIANCE_STEP)
+    factories.FormbricksFlowStepFactory(
+        flow=flow, order=3, is_reviewer_visible=True, **ASSESSMENT_STEP
+    )
+    return flow
 
 
 def sign(body_bytes, webhook_id="msg_test", timestamp=None):
@@ -83,7 +91,7 @@ def sign(body_bytes, webhook_id="msg_test", timestamp=None):
     """
     if timestamp is None:
         timestamp = str(int(time.time()))
-    secret = settings.WALDUR_PROPOSAL["FORMBRICKS_WEBHOOK_SECRET"]
+    secret = config.FORMBRICKS_WEBHOOK_SECRET
     signed_content = f"{webhook_id}.{timestamp}.{body_bytes.decode()}"
     signature = base64.b64encode(
         hmac.new(
@@ -106,15 +114,18 @@ def build_payload(survey_id, response_id, data):
     }
 
 
+@override_config(
+    FORMBRICKS_BASE_URL="https://formbricks.example.com",
+    FORMBRICKS_MANAGEMENT_API_URL="http://formbricks:3000",
+    FORMBRICKS_WEBHOOK_SECRET=TEST_WEBHOOK_SECRET,
+    HOMEPORT_URL="https://homeport.example.com/",
+)
 class FormbricksTestCase(test.APITransactionTestCase):
-    """Base class wiring a small test-only FORM_FLOWS in place of the real,
-    placeholder-filled one in formbricks_flows.py."""
+    """Base class wiring a small test-only Formbricks flow onto the call."""
 
     def setUp(self):
         super().setUp()
         self.fixture = fixtures.ProposalFixture()
-        self.fixture.call.formbricks_flow_key = TEST_FLOW_KEY
-        self.fixture.call.save()
 
         # A dedicated offering/RequestedOffering, rather than repurposing
         # self.fixture.offering - that one already backs two RequestedOffering
@@ -128,15 +139,14 @@ class FormbricksTestCase(test.APITransactionTestCase):
             offering=self.test_offering,
             state=RequestedOfferingStates.REQUESTED,
         )
+        self.flow = create_test_flow(self.test_offering)
+        self.fixture.call.formbricks_flow = self.flow
+        self.fixture.call.save()
 
         # Not granted by any migration - every test suite that exercises
         # MANAGE_PROPOSAL-gated actions must grant this itself, same as
         # test_invitation.py does.
         ProposalRole.MANAGER.add_permission(PermissionEnum.MANAGE_PROPOSAL)
-
-        patcher = mock.patch.object(formbricks_flows, "FORM_FLOWS", TEST_FORM_FLOWS)
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
         self.webhook_url = reverse("proposal-formbricks-webhook-list")
 
@@ -451,8 +461,8 @@ class StartFormbricksFlowTest(FormbricksTestCase):
         self.assertEqual(params["lead_name"], self.lead.full_name)
         self.assertEqual(params["lead_email"], self.lead.email)
 
-    def test_rejects_call_without_formbricks_flow_key(self):
-        self.fixture.call.formbricks_flow_key = None
+    def test_rejects_call_without_formbricks_flow(self):
+        self.fixture.call.formbricks_flow = None
         self.fixture.call.save()
 
         self.client.force_authenticate(self.lead)
@@ -495,7 +505,8 @@ class FormbricksRedirectTest(FormbricksTestCase):
         # 'proposals/:proposal_uuid/', where the slash is part of the
         # static path segment, not just cosmetic; without it the SPA 404s.
         self.assertEqual(
-            response.url, f"https://localhost/proposals/{self.proposal.uuid}/"
+            response.url,
+            f"https://homeport.example.com/proposals/{self.proposal.uuid}/",
         )
 
     def test_unrelated_user_gets_404_not_403(self):
@@ -769,7 +780,7 @@ class FormbricksProgressTest(FormbricksTestCase):
 
 class ProposalFormResponsesTest(FormbricksTestCase):
     """Unlike ProposalReviewSerializer.form_responses (reviewer-restricted
-    to REVIEWER_VISIBLE_STEPS), ProposalSerializer.form_responses returns
+    to the flow's reviewer-visible steps), ProposalSerializer.form_responses returns
     every stored step - it's the Lead's own data (and, by the same
     visibility already enforced on ProposalViewSet.get_queryset, a staff
     viewer's)."""
@@ -870,12 +881,12 @@ class ProposalFormResponsesTest(FormbricksTestCase):
         )
 
 
-class PublicCallFormbricksFlowKeyTest(FormbricksTestCase):
-    def test_formbricks_flow_key_is_exposed_on_the_public_call(self):
+class PublicCallFormbricksFlowTest(FormbricksTestCase):
+    def test_formbricks_flow_is_exposed_on_the_public_call(self):
         url = factories.CallFactory.get_public_url(self.fixture.call)
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.data["formbricks_flow_key"], TEST_FLOW_KEY)
+        self.assertEqual(str(response.data["formbricks_flow"]), self.flow.uuid.hex)
 
 
 class ReviewerFormResponsesTest(FormbricksTestCase):

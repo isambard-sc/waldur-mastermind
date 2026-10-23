@@ -46,6 +46,15 @@ class CallResourceTemplateFilter(django_filters.FilterSet):
         fields = []
 
 
+class FormbricksFlowFilter(django_filters.FilterSet):
+    name = django_filters.CharFilter(lookup_expr="icontains")
+    o = django_filters.OrderingFilter(fields=("created", "name"))
+
+    class Meta:
+        model = models.FormbricksFlow
+        fields = []
+
+
 class CallManagingOrganisationFilter(django_filters.FilterSet):
     customer = core_filters.URLFilter(
         view_name="customer-detail", field_name="customer__uuid"

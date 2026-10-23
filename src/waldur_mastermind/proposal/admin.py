@@ -24,13 +24,49 @@ class RequestedResourceInline(admin.TabularInline):
     extra = 1
 
 
+class FormbricksFlowStepInline(admin.TabularInline):
+    model = models.FormbricksFlowStep
+    extra = 0
+    fields = (
+        "order",
+        "key",
+        "survey_id",
+        "mapper",
+        "is_reviewer_visible",
+        "resource_question_id",
+    )
+
+
+class FormbricksFlowAdmin(admin.ModelAdmin):
+    inlines = [FormbricksFlowStepInline]
+    list_display = ("name", "created")
+    search_fields = ("name",)
+
+
+class FormbricksFieldMappingInline(admin.TabularInline):
+    model = models.FormbricksFieldMapping
+    extra = 0
+
+
+class FormbricksResourceOptionInline(admin.TabularInline):
+    model = models.FormbricksResourceOption
+    extra = 0
+    raw_id_fields = ("offering",)
+
+
+class FormbricksFlowStepAdmin(admin.ModelAdmin):
+    inlines = [FormbricksFieldMappingInline, FormbricksResourceOptionInline]
+    list_display = ("flow", "order", "key", "survey_id", "mapper")
+    list_filter = ("flow",)
+
+
 class CallAdmin(admin.ModelAdmin):
     inlines = [RequestedOfferingInline, RoundInline, CallResourceTemplateInline]
     list_display = (
         "name",
         "state",
         "fixed_duration_in_days",
-        "formbricks_flow_key",
+        "formbricks_flow",
         "reviewer_identity_visible_to_submitters",
         "reviews_visible_to_submitters",
     )
@@ -59,11 +95,10 @@ class CallAdmin(admin.ModelAdmin):
         (
             "Formbricks-driven intake",
             {
-                "fields": ("formbricks_flow_key",),
-                "description": "Set to a key from FORM_FLOWS "
-                "(waldur_mastermind/proposal/formbricks_flows.py) to use the "
-                "Formbricks flow instead of the legacy Waldur-native proposal "
-                "form for this call. Leave blank for the legacy form.",
+                "fields": ("formbricks_flow",),
+                "description": "Pick a Formbricks flow to use instead of the "
+                "legacy Waldur-native proposal form for this call. Leave blank "
+                "for the legacy form.",
             },
         ),
         (
@@ -105,6 +140,8 @@ class FormStepResponseAdmin(admin.ModelAdmin):
 
 admin.site.register(models.CallManagingOrganisation)
 admin.site.register(models.Call, CallAdmin)
+admin.site.register(models.FormbricksFlow, FormbricksFlowAdmin)
+admin.site.register(models.FormbricksFlowStep, FormbricksFlowStepAdmin)
 admin.site.register(models.ProposalProjectRoleMapping, ProposalProjectRoleMappingAdmin)
 admin.site.register(models.CallResourceTemplate)
 admin.site.register(models.Round, RoundAdmin)

@@ -23,7 +23,7 @@ import time
 from urllib.parse import urlencode
 
 import requests
-from django.conf import settings
+from constance import config
 from django.core import signing
 
 logger = logging.getLogger(__name__)
@@ -91,25 +91,22 @@ WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = 5 * 60
 REQUEST_TIMEOUT_SECONDS = 10
 
 
-def _proposal_settings():
-    return settings.WALDUR_PROPOSAL
-
-
 def _base_url():
-    return _proposal_settings()["FORMBRICKS_BASE_URL"].rstrip("/")
+    return config.FORMBRICKS_BASE_URL.rstrip("/")
 
 
 def _management_api_base_url():
     # Deliberately distinct from _base_url(): this one needs to be reachable
     # from inside the waldur-mastermind containers (server-side Management
     # API calls), whereas _base_url() needs to be reachable from a Lead's
-    # browser (survey links). See the FORMBRICKS_MANAGEMENT_API_URL comment
-    # in extension.py for why these can't be the same value.
-    return _proposal_settings()["FORMBRICKS_MANAGEMENT_API_URL"].rstrip("/")
+    # browser (survey links). A public hostname such as
+    # "formbricks.localhost" can resolve to loopback inside the containers,
+    # so this is usually the internal docker-network address instead.
+    return config.FORMBRICKS_MANAGEMENT_API_URL.rstrip("/")
 
 
 def _api_headers():
-    return {"x-api-key": _proposal_settings()["FORMBRICKS_API_KEY"]}
+    return {"x-api-key": config.FORMBRICKS_API_KEY}
 
 
 def _signing_key(secret):
@@ -146,7 +143,12 @@ def verify_signature(request) -> bool:
     except ValueError:
         return False
 
-    secret = _proposal_settings()["FORMBRICKS_WEBHOOK_SECRET"]
+    secret = config.FORMBRICKS_WEBHOOK_SECRET
+    if not secret:
+        # An empty key makes the HMAC computable by anyone, so an
+        # unconfigured secret must reject every webhook.
+        logger.warning("FORMBRICKS_WEBHOOK_SECRET is not set; rejecting webhook.")
+        return False
     signed_content = f"{webhook_id}.{webhook_timestamp}.{request.body.decode()}"
     expected_signature = base64.b64encode(
         hmac.new(_signing_key(secret), signed_content.encode(), hashlib.sha256).digest()

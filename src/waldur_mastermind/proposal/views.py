@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 from typing import cast
 
 from constance import config
-from django.conf import settings as django_settings
 from django.contrib.auth import get_user_model
 from django.core import exceptions as django_exceptions
 from django.db import transaction
@@ -42,6 +41,7 @@ from waldur_core.checklist import models as checklist_models
 from waldur_core.checklist import serializers as checklist_serializers
 from waldur_core.checklist.enums import ChecklistTypes
 from waldur_core.checklist.mixins import ReviewerChecklistMixin, UserChecklistMixin
+from waldur_core.core import utils as core_utils
 from waldur_core.core import validators as core_validators
 from waldur_core.core.exceptions import IncorrectStateException
 from waldur_core.core.models import User
@@ -64,6 +64,7 @@ from waldur_core.permissions.utils import (
 )
 from waldur_core.permissions.views import UserRoleMixin
 from waldur_core.structure import filters as structure_filters
+from waldur_core.structure import permissions as structure_permissions
 from waldur_core.structure.managers import (
     filter_queryset_for_user,
     get_connected_customers,
@@ -128,14 +129,10 @@ logger = logging.getLogger(__name__)
 
 
 def _get_formbricks_flow_complete_url(proposal):
-    """Frontend URL a Lead lands on after finishing a Formbricks flow.
-
-    TODO(formbricks-setup): FRONTEND_FLOW_COMPLETE_URL_TEMPLATE in the
-    WALDUR_PROPOSAL setting is a placeholder - replace with the real
-    frontend base URL once known.
-    """
-    template = django_settings.WALDUR_PROPOSAL["FRONTEND_FLOW_COMPLETE_URL_TEMPLATE"]
-    return template.format(proposal_uuid=proposal.uuid)
+    """Frontend URL a Lead lands on after finishing a Formbricks flow."""
+    return core_utils.format_homeport_link(
+        "proposals/{proposal_uuid}/", proposal_uuid=proposal.uuid
+    )
 
 
 class FormbricksRedirectTokenAuthentication(rf_authentication.BaseAuthentication):
@@ -1798,28 +1795,6 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     # templates are non-sensitive and only actionable by call managers who can
     # already edit the step config.
     step_checklists_permissions = []
-
-    @extend_schema(
-        description=(
-            "List Formbricks flow keys valid on this deployment's FORM_FLOWS, "
-            "for the call-settings UI's flow picker."
-        ),
-        responses={
-            status.HTTP_200_OK: serializers.FormbricksFlowKeySerializer(many=True)
-        },
-    )
-    @decorators.action(detail=False, methods=["get"], url_path="formbricks-flow-keys")
-    def formbricks_flow_keys(self, request):
-        keys = sorted(formbricks_flows.FORM_FLOWS.keys())
-        serializer = serializers.FormbricksFlowKeySerializer(
-            [{"key": key} for key in keys], many=True
-        )
-        return response.Response(serializer.data, status=status.HTTP_200_OK)
-
-    # Non-sensitive catalogue data (flow key strings only, no survey IDs or
-    # question mappings); the field it configures is itself only writable by
-    # whoever already holds UPDATE_CALL (see ProtectedCallSerializer).
-    formbricks_flow_keys_permissions = []
 
     # Call Manager Compliance Endpoints
     compliance_overview_permissions = [
@@ -4454,17 +4429,17 @@ class ProposalViewSet(
         round_obj = serializer.validated_data["round"]
         call = round_obj.call
 
-        if not call.formbricks_flow_key:
+        if not call.formbricks_flow:
             raise exceptions.ValidationError(
                 "This call does not use the Formbricks flow."
             )
         if call.state != CallStates.ACTIVE:
             raise exceptions.ValidationError("Call is not active.")
 
-        flow = formbricks_flows.get_flow(call.formbricks_flow_key)
+        flow = formbricks_flows.get_steps(call.formbricks_flow)
         if not flow:
             raise exceptions.ValidationError(
-                f"No FORM_FLOWS entry configured for key {call.formbricks_flow_key!r}."
+                f"Formbricks flow {call.formbricks_flow.name!r} has no steps."
             )
 
         proposal = models.Proposal.objects.create(
@@ -4477,7 +4452,7 @@ class ProposalViewSet(
 
         first_step = flow[0]
         redirect_url = formbricks_client.build_survey_url(
-            first_step["survey_id"],
+            first_step.survey_id,
             proposal_uuid=str(proposal.uuid),
             call_uuid=str(call.uuid),
             round_uuid=str(round_obj.uuid),
@@ -4512,8 +4487,8 @@ class ProposalViewSet(
     def formbricks_redirect(self, request, uuid=None):
         proposal = self.get_object()
         call = proposal.round.call
-        flow_key = call.formbricks_flow_key
-        if not flow_key:
+        flow = call.formbricks_flow
+        if not flow:
             raise exceptions.ValidationError(
                 "This call does not use the Formbricks flow."
             )
@@ -4524,12 +4499,12 @@ class ProposalViewSet(
                 {"current_step": "This parameter is required."}
             )
 
-        next_step = formbricks_flows.get_next_step(flow_key, current_step)
+        next_step = formbricks_flows.get_next_step(flow, current_step)
         if next_step is None:
             return redirect(_get_formbricks_flow_complete_url(proposal))
 
         redirect_url = formbricks_client.build_survey_url(
-            next_step["survey_id"],
+            next_step.survey_id,
             proposal_uuid=str(proposal.uuid),
             call_uuid=str(call.uuid),
             round_uuid=str(proposal.round.uuid),
@@ -4558,29 +4533,28 @@ class ProposalViewSet(
     def formbricks_progress(self, request, uuid=None):
         proposal = self.get_object()
         call = proposal.round.call
-        flow_key = call.formbricks_flow_key
-        if not flow_key:
+        if not call.formbricks_flow:
             raise exceptions.ValidationError(
                 "This call does not use the Formbricks flow."
             )
 
-        flow = formbricks_flows.get_flow(flow_key)
+        flow = formbricks_flows.get_steps(call.formbricks_flow)
         if not flow:
             raise exceptions.ValidationError(
-                f"No FORM_FLOWS entry configured for key {flow_key!r}."
+                f"Formbricks flow {call.formbricks_flow.name!r} has no steps."
             )
 
         completed_step_keys = set(
             proposal.form_step_responses.values_list("step_key", flat=True)
         )
         next_step = next(
-            (step for step in flow if step["key"] not in completed_step_keys), None
+            (step for step in flow if step.key not in completed_step_keys), None
         )
 
         next_step_data = None
         if next_step is not None:
             redirect_url = formbricks_client.build_survey_url(
-                next_step["survey_id"],
+                next_step.survey_id,
                 proposal_uuid=str(proposal.uuid),
                 call_uuid=str(call.uuid),
                 round_uuid=str(proposal.round.uuid),
@@ -4592,12 +4566,12 @@ class ProposalViewSet(
                 ),
                 **formbricks_client.lead_hidden_fields(request.user),
             )
-            next_step_data = {"key": next_step["key"], "redirect_url": redirect_url}
+            next_step_data = {"key": next_step.key, "redirect_url": redirect_url}
 
         return response.Response(
             {
                 "completed_steps": [
-                    step["key"] for step in flow if step["key"] in completed_step_keys
+                    step.key for step in flow if step.key in completed_step_keys
                 ],
                 "next_step": next_step_data,
             }
@@ -4631,8 +4605,8 @@ class ProposalViewSet(
             )
 
         call = proposal.round.call
-        flow_key = call.formbricks_flow_key
-        if not flow_key:
+        flow = call.formbricks_flow
+        if not flow:
             raise exceptions.ValidationError(
                 "This call does not use the Formbricks flow."
             )
@@ -4641,7 +4615,7 @@ class ProposalViewSet(
         if not step_key:
             raise exceptions.ValidationError({"step": "This parameter is required."})
 
-        step = formbricks_flows.get_step(flow_key, step_key)
+        step = formbricks_flows.get_step(flow, step_key)
         if step is None:
             raise exceptions.NotFound(f"Unknown step {step_key!r} for this call.")
 
@@ -4651,10 +4625,10 @@ class ProposalViewSet(
             raise exceptions.NotFound("This step has not been submitted yet.")
 
         response_data = formbricks_client.get_response(
-            step["survey_id"], form_step_response.response_id
+            step.survey_id, form_step_response.response_id
         )
         redirect_url = formbricks_client.build_prefilled_url(
-            step["survey_id"],
+            step.survey_id,
             response_data,
             proposal_uuid=str(proposal.uuid),
             call_uuid=str(call.uuid),
@@ -4976,6 +4950,47 @@ class ProposalViewSet(
         return response.Response(serializer.data, status=status.HTTP_200_OK)
 
 
+@extend_schema(
+    description="Formbricks survey chains a call can route applicants "
+    "through. Readable by any authenticated user for the call-settings flow "
+    "picker; managed by staff."
+)
+class FormbricksFlowViewSet(ActionsViewSet):
+    lookup_field = "uuid"
+    queryset = models.FormbricksFlow.objects.all().prefetch_related(
+        "steps__field_mappings", "steps__resource_options__offering"
+    )
+    serializer_class = serializers.FormbricksFlowSerializer
+    filterset_class = filters.FormbricksFlowFilter
+    filter_backends = (DjangoFilterBackend,)
+    create_permissions = update_permissions = partial_update_permissions = (
+        destroy_permissions
+    ) = [structure_permissions.is_staff]
+
+    def perform_destroy(self, instance):
+        if instance.calls.exists():
+            raise exceptions.ValidationError(
+                _("Cannot delete a Formbricks flow that is used by a call.")
+            )
+        super().perform_destroy(instance)
+
+    @extend_schema(
+        description="Mappers, proposal fields and value types a flow step can use.",
+        responses={status.HTTP_200_OK: serializers.FormbricksFlowChoicesSerializer},
+    )
+    @no_count_action
+    @decorators.action(detail=False, methods=["get"], url_path="choices")
+    def choices(self, request):
+        serializer = serializers.FormbricksFlowChoicesSerializer(
+            {
+                "mappers": proposal_enums.FormbricksStepMappers.CHOICES,
+                "proposal_fields": proposal_enums.FormbricksProposalFields.CHOICES,
+                "value_types": proposal_enums.FormbricksValueTypes.CHOICES,
+            }
+        )
+        return response.Response(serializer.data, status=status.HTTP_200_OK)
+
+
 class FormbricksWebhookViewSet(viewsets.ViewSet):
     """Receives Formbricks 'responseFinished' webhook events.
 
@@ -5033,19 +5048,15 @@ class FormbricksWebhookViewSet(viewsets.ViewSet):
             return response.Response(status=status.HTTP_404_NOT_FOUND)
 
         call = proposal.round.call
-        flow_key = call.formbricks_flow_key
-        step = (
-            formbricks_flows.get_step_by_survey_id(flow_key, survey_id)
-            if flow_key
-            else None
-        )
+        flow = call.formbricks_flow
+        step = formbricks_flows.get_step_by_survey_id(flow, survey_id)
         if step is None:
             logger.warning(
                 "Formbricks webhook for proposal %s referenced unknown survey "
-                "%s (flow key %r).",
+                "%s (flow %r).",
                 proposal.uuid,
                 survey_id,
-                flow_key,
+                flow and flow.name,
             )
             return response.Response(status=status.HTTP_404_NOT_FOUND)
 
@@ -5071,7 +5082,7 @@ class FormbricksWebhookViewSet(viewsets.ViewSet):
 
         models.FormStepResponse.objects.update_or_create(
             proposal=proposal,
-            step_key=step["key"],
+            step_key=step.key,
             defaults={
                 "survey_id": survey_id,
                 "response_id": response_id,
@@ -5081,8 +5092,8 @@ class FormbricksWebhookViewSet(viewsets.ViewSet):
             },
         )
 
-        if "mapper" in step:
-            mapper = getattr(formbricks_mapper, step["mapper"])
+        if step.mapper:
+            mapper = formbricks_mapper.MAPPERS[step.mapper]
             mapper(proposal, answers, step)
             proposal.save()
 

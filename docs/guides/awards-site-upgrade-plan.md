@@ -593,11 +593,14 @@ only code to re-point at upstream's proposal app.
 **It moves to its own app.** Its couplings to the proposal app are just two
 model-level things:
 
-- `Call.formbricks_flow_key` — a column on the old `Call`;
+- `Call.formbricks_flow` — a FK on the old `Call` to a staff-managed
+  `FormbricksFlow`;
 - `FormStepResponse.proposal` — a FK to the old `Proposal`.
 
-In its own app the first becomes a `CallFormConfig` row (call uuid → flow key)
-and the second keeps a FK to upstream's `Proposal`. `formbricks_client.py`,
+In its own app the first becomes a `CallFormConfig` row (call uuid → flow)
+and the second keeps a FK to upstream's `Proposal`. The flows themselves
+(`FormbricksFlow` and its steps, field mappings and resource options) are
+already database models edited in HomePort, so they move as they are. `formbricks_client.py`,
 `formbricks_flows.py` and `formbricks_mapper.py` (557 lines) port unchanged;
 the work is in the ~380 lines of views, which have to be re-pointed at
 upstream's proposal states.
@@ -610,10 +613,11 @@ today — the branch carries
 `0054_call_formbricks_flow_key_formstepresponse`, the same number as the
 deployed `0054_round_fixed_review_end_date`.
 
-Its configuration lives in the `WALDUR_PROPOSAL` extension settings
-(`FORMBRICKS_BASE_URL`, `FORMBRICKS_MANAGEMENT_API_URL`,
-`FORMBRICKS_WEBHOOK_SECRET`, `FORMBRICKS_API_KEY`), all placeholders at
-present. They move with the app.
+Its connection settings are Constance settings in the "Formbricks
+integration settings" group (`FORMBRICKS_BASE_URL`,
+`FORMBRICKS_MANAGEMENT_API_URL`, `FORMBRICKS_WEBHOOK_SECRET`,
+`FORMBRICKS_API_KEY`), edited under Administration → Call management. Webhooks
+are rejected while the secret is empty. They move with the app.
 
 ### 7.1 The end-of-project survey is separate, and is in neither merge
 
@@ -677,7 +681,7 @@ switchable.
 
 ### 7.2 Three gates, not one
 
-As written, formbricks has exactly one switch: `Call.formbricks_flow_key`, null
+As written, formbricks has exactly one switch: `Call.formbricks_flow`, null
 meaning "use the legacy Waldur-native form". It is **not** behind a feature
 flag today, though it is often described as if it were.
 
@@ -691,7 +695,7 @@ own description that backend access is gated separately:
 |---|---|---|
 | `proposal.formbricks_forms` feature | Does this portal offer Formbricks forms at all? | `core/features.py`, new `ProposalSection` |
 | `FORMBRICKS_ENABLED` setting | May the backend talk to Formbricks and accept its webhooks? | the new app's extension settings |
-| `formbricks_flow_key` | Which survey chain does *this call* use? | per call, as now |
+| `formbricks_flow` | Which survey chain does *this call* use? | per call, as now |
 
 The feature flag is presentational, as core features are: HomePort reads it
 through `isFeatureVisible` to decide whether to offer a Formbricks form when

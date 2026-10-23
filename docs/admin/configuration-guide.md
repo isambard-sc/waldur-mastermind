@@ -2399,6 +2399,32 @@ ORCID OAuth Authorization URL. Use https://sandbox.orcid.org/oauth for testing.
 
 Use ORCID sandbox environment for testing. When enabled, uses sandbox URLs automatically.
 
+### Formbricks integration settings
+
+#### FORMBRICKS_BASE_URL
+
+**Type:** url_field
+
+Public base URL of the Formbricks instance, used to build the survey links applicants' browsers are sent to.
+
+#### FORMBRICKS_MANAGEMENT_API_URL
+
+**Type:** str
+
+Formbricks base URL reachable from the Waldur backend, used to fetch responses and survey schemas. Often an internal address such as http://formbricks:3000, distinct from the public base URL.
+
+#### FORMBRICKS_API_KEY
+
+**Type:** secret_field
+
+Formbricks Management API key.
+
+#### FORMBRICKS_WEBHOOK_SECRET
+
+**Type:** secret_field
+
+Signing secret configured on the Formbricks webhook. Webhooks are rejected while it is empty.
+
 ### Publication API settings
 
 #### SEMANTIC_SCHOLAR_API_KEY

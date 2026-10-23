@@ -415,6 +415,46 @@ class ExpertiseProficiencyLevels:
     )
 
 
+class FormbricksStepMappers:
+    """Code-side handlers a Formbricks flow step can route its answers through.
+
+    Values are function names in formbricks_mapper.py (see MAPPERS there). A
+    step without a mapper is only snapshotted as a FormStepResponse.
+    """
+
+    PROJECT_DETAILS = "map_project_details"
+
+    CHOICES = ((PROJECT_DETAILS, "Project details"),)
+
+
+class FormbricksProposalFields:
+    """Proposal fields a Formbricks answer may be written into."""
+
+    NAME = "name"
+    PROJECT_SUMMARY = "project_summary"
+    DESCRIPTION = "description"
+
+    CHOICES = (
+        (NAME, "Name"),
+        (PROJECT_SUMMARY, "Project summary"),
+        (DESCRIPTION, "Description"),
+    )
+
+
+class FormbricksValueTypes:
+    """How a Formbricks answer, always sent as a string, is coerced."""
+
+    TEXT = "text"
+    INTEGER = "integer"
+    BOOLEAN = "boolean"
+
+    CHOICES = (
+        (TEXT, "Text"),
+        (INTEGER, "Integer"),
+        (BOOLEAN, "Boolean (Yes/No)"),
+    )
+
+
 class PublicationVenueTypes:
     JOURNAL = "journal"
     CONFERENCE = "conference"

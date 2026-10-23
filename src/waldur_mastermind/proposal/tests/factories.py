@@ -56,6 +56,42 @@ class CallManagingOrganisationFactory(
         return url if action is None else url + action + "/"
 
 
+class FormbricksFlowFactory(
+    factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.FormbricksFlow]
+):
+    class Meta:
+        model = models.FormbricksFlow
+
+    name = factory.Sequence(lambda n: f"formbricks-flow-{n}")
+
+    @classmethod
+    def get_url(cls, flow=None, action=None):
+        if flow is None:
+            flow = FormbricksFlowFactory()
+        url = "http://testserver" + reverse(
+            "proposal-formbricks-flow-detail", kwargs={"uuid": flow.uuid.hex}
+        )
+        return url if action is None else url + action + "/"
+
+    @classmethod
+    def get_list_url(cls, action=None):
+        url = "http://testserver" + reverse("proposal-formbricks-flow-list")
+        return url if action is None else url + action + "/"
+
+
+class FormbricksFlowStepFactory(
+    factory.django.DjangoModelFactory,
+    metaclass=BaseMetaFactory[models.FormbricksFlowStep],
+):
+    class Meta:
+        model = models.FormbricksFlowStep
+
+    flow = factory.SubFactory(FormbricksFlowFactory)
+    order = factory.Sequence(lambda n: n)
+    key = factory.Sequence(lambda n: f"step_{n}")
+    survey_id = factory.Sequence(lambda n: f"survey-{n}")
+
+
 class CallFactory(
     factory.django.DjangoModelFactory, metaclass=BaseMetaFactory[models.Call]
 ):

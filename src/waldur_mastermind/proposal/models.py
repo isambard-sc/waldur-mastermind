@@ -88,8 +88,8 @@ PUBLISH_RESULTS_LOCKED_MESSAGE = _(
     "that have not been published yet."
 )
 
-FORMBRICKS_FLOW_KEY_LOCKED_MESSAGE = _(
-    "Cannot change the Formbricks flow key once the call has any proposals."
+FORMBRICKS_FLOW_LOCKED_MESSAGE = _(
+    "Cannot change the Formbricks flow once the call has any proposals."
 )
 
 
@@ -146,6 +146,154 @@ def filter_calls(user):
             user
         )
     )
+
+
+class FormbricksFlow(
+    TimeStampedModel,
+    core_models.UuidMixin,
+    core_models.NameMixin,
+    core_models.DescribableMixin,
+):
+    """Ordered chain of Formbricks surveys a call's applicants fill in.
+
+    Managed by staff in the UI and picked per call (Call.formbricks_flow).
+    Survey and question IDs belong to one Formbricks account, so they differ
+    between deployments and live here rather than in code.
+    """
+
+    class Meta:
+        ordering = ["name", "id"]
+        verbose_name = "Formbricks flow"
+        verbose_name_plural = "Formbricks flows"
+
+    def __str__(self):
+        return self.name
+
+    @classmethod
+    def get_url_name(cls):
+        return "proposal-formbricks-flow"
+
+
+class FormbricksFlowStep(TimeStampedModel, core_models.UuidMixin):
+    """One survey in a FormbricksFlow."""
+
+    flow = models.ForeignKey(
+        FormbricksFlow, on_delete=models.CASCADE, related_name="steps"
+    )
+    order = models.PositiveSmallIntegerField(default=0)
+    key = models.CharField(
+        max_length=100,
+        help_text="Stable identifier of the step within the flow, e.g. "
+        "project_details. Stored on FormStepResponse.step_key and used by the "
+        "survey's redirect ending (current_step).",
+    )
+    survey_id = models.CharField(max_length=100, help_text="Formbricks survey ID.")
+    mapper = models.CharField(
+        max_length=100,
+        blank=True,
+        choices=enums.FormbricksStepMappers.CHOICES,
+        help_text="Handler applying the answers to the proposal. Blank means "
+        "the answers are only stored as a snapshot.",
+    )
+    is_reviewer_visible = models.BooleanField(
+        default=False,
+        help_text="Whether reviewers can read this step's answers.",
+    )
+    resource_question_id = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Formbricks question ID of the resource multi-select. "
+        "Required when the step has resource options.",
+    )
+
+    class Meta:
+        ordering = ["flow", "order", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["flow", "key"], name="proposal_formbricks_step_unique_key"
+            ),
+            models.UniqueConstraint(
+                fields=["flow", "survey_id"],
+                name="proposal_formbricks_step_unique_survey",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.flow} / {self.key}"
+
+
+class FormbricksFieldMapping(models.Model):
+    """Copies one Formbricks answer into a Proposal field."""
+
+    step = models.ForeignKey(
+        FormbricksFlowStep, on_delete=models.CASCADE, related_name="field_mappings"
+    )
+    question_id = models.CharField(max_length=100)
+    proposal_field = models.CharField(
+        max_length=100, choices=enums.FormbricksProposalFields.CHOICES
+    )
+    value_type = models.CharField(
+        max_length=20,
+        choices=enums.FormbricksValueTypes.CHOICES,
+        default=enums.FormbricksValueTypes.TEXT,
+    )
+
+    class Meta:
+        ordering = ["step", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["step", "question_id"],
+                name="proposal_formbricks_mapping_unique_question",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.question_id} -> {self.proposal_field}"
+
+
+class FormbricksResourceOption(models.Model):
+    """Maps a choice of a step's resource multi-select onto an offering.
+
+    Formbricks records the selected choice's label text, so the label is
+    matched exactly. Selecting it creates a RequestedResource against the
+    call's RequestedOffering for this offering.
+    """
+
+    step = models.ForeignKey(
+        FormbricksFlowStep, on_delete=models.CASCADE, related_name="resource_options"
+    )
+    choice_label = models.CharField(
+        max_length=255, help_text="Choice label exactly as shown in Formbricks."
+    )
+    offering = models.ForeignKey(
+        marketplace_models.Offering, on_delete=models.PROTECT, related_name="+"
+    )
+    attribute_field_map = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Maps Formbricks question IDs to requested resource attribute keys.",
+    )
+    default_attributes = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Attributes set on the requested resource before mapped answers.",
+    )
+
+    class Meta:
+        ordering = ["step", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["step", "choice_label"],
+                name="proposal_formbricks_option_unique_label",
+            ),
+            models.UniqueConstraint(
+                fields=["step", "offering"],
+                name="proposal_formbricks_option_unique_offering",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.choice_label} -> {self.offering}"
 
 
 class Call(
@@ -219,15 +367,16 @@ class Call(
         help_text="Compliance checklist that proposals must complete before submission",
     )
 
-    # Formbricks-driven proposal intake. When set, applicants fill out the
-    # chain of Formbricks surveys defined under this key in
-    # proposal.formbricks_flows.FORM_FLOWS instead of the Waldur-native
+    # Formbricks-driven proposal intake. When set, applicants fill out this
+    # flow's chain of Formbricks surveys instead of the Waldur-native
     # proposal form. Null means this call still uses the legacy form.
-    formbricks_flow_key = models.CharField(
-        max_length=100,
+    formbricks_flow = models.ForeignKey(
+        FormbricksFlow,
+        on_delete=models.PROTECT,
         null=True,
         blank=True,
-        help_text="Key into FORM_FLOWS selecting this call's Formbricks survey chain. "
+        related_name="calls",
+        help_text="Formbricks survey chain applicants fill in. "
         "Leave blank to use the legacy Waldur-native proposal form.",
     )
 
@@ -401,9 +550,9 @@ class Call(
                 raise ValidationError(
                     "Cannot change proposal slug template when proposals exist"
                 )
-            if self.tracker.has_changed("formbricks_flow_key"):
+            if self.tracker.has_changed("formbricks_flow"):
                 raise ValidationError(
-                    {"formbricks_flow_key": FORMBRICKS_FLOW_KEY_LOCKED_MESSAGE}
+                    {"formbricks_flow": FORMBRICKS_FLOW_LOCKED_MESSAGE}
                 )
 
 

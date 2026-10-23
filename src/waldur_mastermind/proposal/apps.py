@@ -20,14 +20,11 @@ class ProposalConfig(AppConfig):
 
         from . import (
             event_publishing,
-            formbricks_flows,
             handlers,
             models,
             permissions,
             serializers,
         )
-
-        formbricks_flows.validate_form_flows(formbricks_flows.FORM_FLOWS)
 
         permission_signals.role_revoked.connect(
             handlers.clear_panel_chair_on_role_revoked,

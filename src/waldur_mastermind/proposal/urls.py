@@ -10,6 +10,11 @@ def register_in(router):
         basename="call-managing-organisation",
     )
     router.register(
+        r"proposal-formbricks-flows",
+        views.FormbricksFlowViewSet,
+        basename="proposal-formbricks-flow",
+    )
+    router.register(
         r"proposal-public-calls",
         views.PublicCallViewSet,
         basename="proposal-public-call",

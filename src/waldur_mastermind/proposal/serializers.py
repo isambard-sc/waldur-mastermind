@@ -778,7 +778,7 @@ class ProposalReviewSerializer(
         Returns None for calls not using the Formbricks flow. Reads
         entirely from the stored FormStepResponse snapshot - never calls
         Formbricks live - and only ever exposes the steps in
-        formbricks_flows.REVIEWER_VISIBLE_STEPS (never team_details or
+        the flow's reviewer-visible steps (e.g. never team_details or
         compliance).
         """
         proposal = obj.proposal
@@ -786,7 +786,10 @@ class ProposalReviewSerializer(
             return None
 
         return formbricks_mapper.serialize_form_responses(
-            proposal, step_keys=formbricks_flows.REVIEWER_VISIBLE_STEPS
+            proposal,
+            step_keys=formbricks_flows.get_reviewer_visible_step_keys(
+                proposal.round.call.formbricks_flow
+            ),
         )
 
     def get_fields(self):
@@ -1234,7 +1237,9 @@ class PublicCallSerializer(
         required=False, allow_blank=True, max_length=DESCRIPTION_LENGTH
     )
     has_eligibility_restrictions = serializers.SerializerMethodField()
-    formbricks_flow_key = serializers.ReadOnlyField()
+    formbricks_flow = serializers.SlugRelatedField(
+        slug_field="uuid", read_only=True, allow_null=True
+    )
 
     @extend_schema_field(serializers.IntegerField(allow_null=True))
     def get_max_prepaid_duration_months(self, call) -> int | None:
@@ -1269,7 +1274,7 @@ class PublicCallSerializer(
             "external_url",
             "reviewer_identity_visible_to_submitters",
             "reviews_visible_to_submitters",
-            "formbricks_flow_key",
+            "formbricks_flow",
             "has_eligibility_restrictions",
             "proposal_field_config",
             # Public so an applicant can be told their evaluation waits for
@@ -1932,15 +1937,17 @@ class ProtectedCallSerializer(PublicCallSerializer):
         help_text="Whether proposal applicants can see review comments and scores",
         required=False,
     )
-    formbricks_flow_key = serializers.CharField(
+    formbricks_flow = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.FormbricksFlow.objects.all(),
         required=False,
         allow_null=True,
-        allow_blank=True,
-        max_length=100,
-        help_text="Key into FORM_FLOWS selecting this call's Formbricks survey "
-        "chain. Leave blank/null to use the legacy Waldur-native proposal "
-        "form. See GET .../formbricks-flow-keys/ for the keys valid on this "
-        "deployment. Cannot be changed once the call has any proposals.",
+        help_text="Formbricks survey chain applicants fill in. Null uses the "
+        "legacy Waldur-native proposal form. Cannot be changed once the call "
+        "has any proposals.",
+    )
+    formbricks_flow_name = serializers.ReadOnlyField(
+        source="formbricks_flow.name", allow_null=True
     )
     compliance_checklist = serializers.SlugRelatedField(
         slug_field="uuid",
@@ -2109,6 +2116,7 @@ class ProtectedCallSerializer(PublicCallSerializer):
             "order_author_user_name",
             "carry_over_drafts",
             "undecided_at_round_completion",
+            "formbricks_flow_name",
         )
         view_name = "proposal-protected-call-detail"
         protected_fields = ("manager",)
@@ -2171,28 +2179,23 @@ class ProtectedCallSerializer(PublicCallSerializer):
             raise serializers.ValidationError(models.EVALUATION_START_LOCKED_MESSAGE)
         return value
 
-    def validate_formbricks_flow_key(self, value):
-        """Reject an unconfigured key, and refuse a switch once proposals exist.
+    def validate_formbricks_flow(self, value):
+        """Refuse a switch once proposals exist.
 
-        formbricks_flow_key both enables Formbricks for this call and selects
+        formbricks_flow both enables Formbricks for this call and selects
         which survey chain it uses - formbricks_progress/formbricks_redirect
         resolve that chain live on every request rather than snapshotting it
         onto the Proposal, so changing it (including clearing it, or flipping
         it on) after proposals already exist would scramble in-flight
         applicants' next-step resolution.
         """
-        value = value or None
-        if value and value not in formbricks_flows.FORM_FLOWS:
-            raise serializers.ValidationError(
-                f"{value!r} is not a configured Formbricks flow key."
-            )
         call = self.instance
         if (
             isinstance(call, models.Call)
-            and value != call.formbricks_flow_key
+            and value != call.formbricks_flow
             and call.has_proposals()
         ):
-            raise serializers.ValidationError(models.FORMBRICKS_FLOW_KEY_LOCKED_MESSAGE)
+            raise serializers.ValidationError(models.FORMBRICKS_FLOW_LOCKED_MESSAGE)
         return value
 
     def validate_publish_results(self, value):
@@ -3053,7 +3056,7 @@ class ProposalSerializer(
         """Every stored Formbricks step response for this proposal.
 
         Unlike ProposalReviewSerializer.form_responses (restricted to
-        formbricks_flows.REVIEWER_VISIBLE_STEPS), this returns all steps -
+        the flow's reviewer-visible steps), this returns all steps -
         it's the Lead's own submitted data, and visibility to other users
         is already correctly scoped by ProposalViewSet.get_queryset (staff
         see every proposal; everyone else only proposals tied to their own
@@ -3094,14 +3097,188 @@ class RoundReviewerSerializer(serializers.Serializer):
         return f"{obj.first_name} {obj.last_name}"
 
 
-class FormbricksFlowKeySerializer(serializers.Serializer):
-    """A single valid Call.formbricks_flow_key, for the call-settings UI's
-    flow picker (ProtectedCallViewSet.formbricks_flow_keys). FORM_FLOWS
-    entries carry no separate human-readable label today, so the key itself
-    is all there is to show.
-    """
+class FormbricksFieldMappingSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.FormbricksFieldMapping
+        fields = ("question_id", "proposal_field", "value_type")
 
-    key = serializers.CharField()
+
+class FormbricksResourceOptionSerializer(serializers.ModelSerializer):
+    offering = serializers.SlugRelatedField(
+        slug_field="uuid", queryset=marketplace_models.Offering.objects.all()
+    )
+    offering_name = serializers.ReadOnlyField(source="offering.name")
+    offering_slug = serializers.ReadOnlyField(source="offering.slug")
+    attribute_field_map = serializers.DictField(
+        child=serializers.CharField(),
+        required=False,
+        help_text="Maps Formbricks question IDs to requested resource attribute keys.",
+    )
+    default_attributes = serializers.DictField(
+        required=False,
+        help_text="Attributes set on the requested resource before mapped answers.",
+    )
+
+    class Meta:
+        model = models.FormbricksResourceOption
+        fields = (
+            "choice_label",
+            "offering",
+            "offering_name",
+            "offering_slug",
+            "attribute_field_map",
+            "default_attributes",
+        )
+
+
+class FormbricksFlowStepSerializer(serializers.ModelSerializer):
+    field_mappings = FormbricksFieldMappingSerializer(many=True, required=False)
+    resource_options = FormbricksResourceOptionSerializer(many=True, required=False)
+
+    class Meta:
+        model = models.FormbricksFlowStep
+        fields = (
+            "uuid",
+            "key",
+            "survey_id",
+            "mapper",
+            "is_reviewer_visible",
+            "resource_question_id",
+            "field_mappings",
+            "resource_options",
+        )
+        read_only_fields = ("uuid",)
+        # Uniqueness within a flow is checked by FormbricksFlowSerializer,
+        # which sees all of the flow's steps at once.
+        validators = []
+
+    def validate(self, attrs):
+        field_mappings = attrs.get("field_mappings", [])
+        resource_options = attrs.get("resource_options", [])
+
+        if (field_mappings or resource_options) and not attrs.get("mapper"):
+            raise serializers.ValidationError(
+                {
+                    "mapper": _(
+                        "A mapper is required to apply field mappings or "
+                        "resource options."
+                    )
+                }
+            )
+        if resource_options and not attrs.get("resource_question_id"):
+            raise serializers.ValidationError(
+                {
+                    "resource_question_id": _(
+                        "Required when the step has resource options."
+                    )
+                }
+            )
+
+        _check_unique(field_mappings, "question_id", "field_mappings")
+        _check_unique(resource_options, "choice_label", "resource_options")
+        _check_unique(resource_options, "offering", "resource_options")
+        return attrs
+
+
+def _check_unique(items, field, error_key):
+    seen = set()
+    for item in items:
+        value = item.get(field)
+        if value in seen:
+            raise serializers.ValidationError(
+                {
+                    error_key: _("Duplicate %(field)s: %(value)s.")
+                    % {"field": field, "value": value}
+                }
+            )
+        seen.add(value)
+
+
+class FormbricksFlowSerializer(
+    core_serializers.AugmentedSerializerMixin, serializers.HyperlinkedModelSerializer
+):
+    steps = FormbricksFlowStepSerializer(many=True)
+    calls_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.FormbricksFlow
+        fields = (
+            "url",
+            "uuid",
+            "name",
+            "description",
+            "created",
+            "modified",
+            "steps",
+            "calls_count",
+        )
+        read_only_fields = ("uuid", "created", "modified")
+        extra_kwargs = {
+            "url": {
+                "lookup_field": "uuid",
+                "view_name": "proposal-formbricks-flow-detail",
+            },
+        }
+
+    def get_calls_count(self, flow) -> int:
+        return flow.calls.count()
+
+    def validate_steps(self, steps):
+        if not steps:
+            raise serializers.ValidationError(_("A flow needs at least one step."))
+        # A duplicate key or survey would make every lookup silently reach
+        # only the first matching step.
+        _check_unique(steps, "key", "steps")
+        _check_unique(steps, "survey_id", "steps")
+        return steps
+
+    @transaction.atomic
+    def create(self, validated_data):
+        steps = validated_data.pop("steps")
+        flow = super().create(validated_data)
+        self._create_steps(flow, steps)
+        return flow
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        steps = validated_data.pop("steps", None)
+        flow = super().update(instance, validated_data)
+        if steps is not None:
+            # Steps are replaced wholesale: FormStepResponse refers to a step
+            # by key, not by row, so recreating them loses nothing.
+            flow.steps.all().delete()
+            self._create_steps(flow, steps)
+        return flow
+
+    def _create_steps(self, flow, steps):
+        for order, step_data in enumerate(steps):
+            step_data = dict(step_data)
+            field_mappings = step_data.pop("field_mappings", [])
+            resource_options = step_data.pop("resource_options", [])
+            step = models.FormbricksFlowStep.objects.create(
+                flow=flow, order=order, **step_data
+            )
+            for mapping in field_mappings:
+                models.FormbricksFieldMapping.objects.create(step=step, **mapping)
+            for option in resource_options:
+                models.FormbricksResourceOption.objects.create(step=step, **option)
+
+
+class FormbricksChoiceSerializer(serializers.Serializer):
+    value = serializers.CharField()
+    label = serializers.CharField()
+
+    def to_representation(self, instance):
+        value, label = instance
+        return {"value": value, "label": label}
+
+
+class FormbricksFlowChoicesSerializer(serializers.Serializer):
+    """Options a flow step can use, so the UI never hard-codes them."""
+
+    mappers = FormbricksChoiceSerializer(many=True)
+    proposal_fields = FormbricksChoiceSerializer(many=True)
+    value_types = FormbricksChoiceSerializer(many=True)
 
 
 class StartFormbricksFlowSerializer(serializers.Serializer):

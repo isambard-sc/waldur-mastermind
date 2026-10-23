@@ -4,37 +4,6 @@ from waldur_core.core import WaldurExtension
 
 
 class ProposalExtension(WaldurExtension):
-    class Settings:
-        # See formbricks_flows.py / formbricks_client.py for how these are
-        # used. TODO(formbricks-setup): every value here is a placeholder -
-        # see the "Formbricks setup checklist" produced at the end of this
-        # feature's implementation.
-        WALDUR_PROPOSAL = {
-            # Public base URL of the Formbricks instance, used to build the
-            # survey links a Lead's *browser* is sent to
-            # (build_survey_url/build_prefilled_url). No trailing slash.
-            "FORMBRICKS_BASE_URL": "https://formbricks.localhost",
-            # Formbricks base URL reachable *from inside the waldur-mastermind
-            # containers* - used only by get_response()/get_survey(), which run
-            # server-side. Deliberately separate from FORMBRICKS_BASE_URL:
-            # "formbricks.localhost" resolves to loopback inside every
-            # container (same class of problem the webhook URL had in the
-            # other direction), so this needs the actual docker-network
-            # address instead. Verified reachable as of 2026-08-26 - tied to
-            # this docker-compose project's container naming, so it'll need
-            # updating if that changes (e.g. a different COMPOSE_PROJECT_NAME).
-            "FORMBRICKS_MANAGEMENT_API_URL": "http://waldur-docker-compose-formbricks-1:3000",
-            # Shared secret configured on the Formbricks webhook itself;
-            # verifies inbound webhook signatures (formbricks_client.verify_signature).
-            "FORMBRICKS_WEBHOOK_SECRET": "",
-            # Formbricks Management API key; authenticates Waldur's outbound
-            # get_response()/get_survey() calls.
-            "FORMBRICKS_API_KEY": "",
-            # Waldur frontend URL a Lead lands on after finishing a Formbricks
-            # flow. {proposal_uuid} is substituted by views._get_formbricks_flow_complete_url.
-            "FRONTEND_FLOW_COMPLETE_URL_TEMPLATE": "https://localhost/proposals/{proposal_uuid}/",
-        }
-
     @staticmethod
     def django_app():
         return "waldur_mastermind.proposal"

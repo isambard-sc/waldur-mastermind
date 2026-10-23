@@ -987,6 +987,30 @@ CONSTANCE_CONFIG = {
         False,
         "Use ORCID sandbox environment for testing. When enabled, uses sandbox URLs automatically.",
     ),
+    # Formbricks integration settings
+    "FORMBRICKS_BASE_URL": (
+        "",
+        "Public base URL of the Formbricks instance, used to build the survey "
+        "links applicants' browsers are sent to.",
+        "url_field",
+    ),
+    "FORMBRICKS_MANAGEMENT_API_URL": (
+        "",
+        "Formbricks base URL reachable from the Waldur backend, used to fetch "
+        "responses and survey schemas. Often an internal address such as "
+        "http://formbricks:3000, distinct from the public base URL.",
+    ),
+    "FORMBRICKS_API_KEY": (
+        "",
+        "Formbricks Management API key.",
+        "secret_field",
+    ),
+    "FORMBRICKS_WEBHOOK_SECRET": (
+        "",
+        "Signing secret configured on the Formbricks webhook. Webhooks are "
+        "rejected while it is empty.",
+        "secret_field",
+    ),
     # External publication API settings
     "SEMANTIC_SCHOLAR_API_KEY": (
         "",
@@ -2191,6 +2215,12 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ORCID_API_URL",
         "ORCID_AUTH_URL",
         "ORCID_SANDBOX_MODE",
+    ),
+    "Formbricks integration settings": (
+        "FORMBRICKS_BASE_URL",
+        "FORMBRICKS_MANAGEMENT_API_URL",
+        "FORMBRICKS_API_KEY",
+        "FORMBRICKS_WEBHOOK_SECRET",
     ),
     "Publication API settings": (
         "SEMANTIC_SCHOLAR_API_KEY",
