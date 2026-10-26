@@ -25,6 +25,10 @@ portal comes from openportal.get_portal() rather than being hardcoded, and
 the run stops before writing anything if that cannot be resolved - renaming
 identifiers onto a guessed portal would be worse than leaving them wrong.
 
+scripts/resync_migrate.sh runs this, applying, as its step 10, so a resync
+deployment gets the repair without anyone remembering to. Production was
+upgraded before that step existed and had it run by hand.
+
 A rewrite is refused, and reported, where it would collide with another
 ManagedProject that already holds the corrected identifier: local_identifier
 is not unique in the schema, so the database would accept the duplicate and

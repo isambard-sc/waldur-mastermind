@@ -609,7 +609,10 @@ own data and are easy to lose track of, because most were found while
 debugging the sanitised copy and fixed there first.
 
 **`scripts/repair_managed_project_local_portal.py` must be run against
-production.** This is the one most easily missed. `OpenPortalBoard` minted
+production.** This is the one most easily missed -- and on the portal's
+production upgrade it was: the award usage cards read zero for every award
+minted since May until it was run by hand afterwards. `resync_migrate.sh` now
+runs it as step 10, so a resync using that script gets it automatically. `OpenPortalBoard` minted
 `ManagedProject.local_identifier` with the portal at the head of the board's
 destination -- the remote portal that raised the award -- so awards arriving
 through the AIRR gateway were stored as `u6dj.airr` where they should be

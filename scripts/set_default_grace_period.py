@@ -23,7 +23,7 @@ with no active resources is scheduled for deletion.
     # a different number of days
     docker compose exec -T -e GRACE_APPLY=1 -e GRACE_DAYS=14 ...
 
-scripts/resync_migrate.sh runs this as its step 5, so a resync deployment gets
+scripts/resync_migrate.sh runs this as its step 11, so a resync deployment gets
 the backfill without anyone remembering to. It lives here rather than as a
 migration under waldur_core/structure because that directory is upstream's,
 and a local migration sitting in it is one stray merge request away from being
