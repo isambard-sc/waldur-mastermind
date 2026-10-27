@@ -5,12 +5,15 @@ from waldur_mastermind.ai_reporting.models import ReportingMessage, ReportingSes
 
 
 class ReportingSessionModelTest(test.APITestCase):
-    def test_one_session_per_user(self):
+    def test_a_user_can_have_several_sessions(self):
+        """Unlike chat's ChatSession, this isn't a per-user singleton - a user
+        may have several independent AI-reporting conversations at once (e.g.
+        one per open browser tab)."""
         user = structure_factories.UserFactory()
         ReportingSession.objects.create(user=user)
+        ReportingSession.objects.create(user=user)
 
-        with self.assertRaises(Exception):  # IntegrityError, same as ChatSession
-            ReportingSession.objects.create(user=user)
+        self.assertEqual(ReportingSession.objects.filter(user=user).count(), 2)
 
     def test_str(self):
         user = structure_factories.UserFactory(username="tanya")

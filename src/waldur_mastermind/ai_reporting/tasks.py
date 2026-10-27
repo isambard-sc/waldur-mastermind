@@ -3,8 +3,9 @@ import logging
 import requests
 from celery import shared_task
 from django.conf import settings
+from django.core.files.base import ContentFile
 
-from waldur_mastermind.ai_reporting.models import ReportingMessage
+from waldur_mastermind.ai_reporting.models import ReportingFile, ReportingMessage
 
 logger = logging.getLogger(__name__)
 
@@ -13,9 +14,45 @@ logger = logging.getLogger(__name__)
 # call must not tie up a Celery worker slot forever.
 _HARNESS_REQUEST_TIMEOUT_SECONDS = 600
 
+# A single file fetch is just a read of bytes the harness already produced -
+# nowhere near as slow as a /query turn, but still bounded so one bad
+# download can't hold up the task indefinitely.
+_HARNESS_FILE_TIMEOUT_SECONDS = 60
+
+
+def _copy_files_from_harness(message: ReportingMessage, user, filenames: list[str]) -> None:
+    """Copy each file the harness reported into its own ReportingFile row.
+
+    Best-effort per file: one failing download is logged and skipped rather
+    than failing the whole message - the text answer is still good even if a
+    chart didn't copy across.
+    """
+    for filename in filenames:
+        try:
+            response = requests.get(
+                f"{settings.AI_REPORTING_HARNESS_URL}/files/{filename}",
+                # Same headers as the /query call above - the harness keys
+                # its conversation store on the user id alone today, but
+                # sending both keeps this call consistent with that one.
+                headers={
+                    "X-Waldur-User-Id": str(user.uuid),
+                    "X-Waldur-Session-Id": str(message.session.uuid),
+                },
+                timeout=_HARNESS_FILE_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            logger.exception(
+                "ask_harness: could not fetch file %r for message %s", filename, message.pk
+            )
+            continue
+        ReportingFile.objects.create(
+            message=message, name=filename, file=ContentFile(response.content, name=filename)
+        )
+
 
 @shared_task(name="waldur_mastermind.ai_reporting.ask_harness")
-def ask_harness(message_id: int, new_session: bool = False):
+def ask_harness(message_id: int):
     """Call the AI reporting harness for one ReportingMessage and record the result.
 
     Runs in a Celery worker, not a web request - this is what lets run() take
@@ -35,8 +72,17 @@ def ask_harness(message_id: int, new_session: bool = False):
     try:
         response = requests.post(
             f"{settings.AI_REPORTING_HARNESS_URL}/query",
-            headers={"X-Waldur-User-Id": str(user.uuid)},
-            json={"prompt": message.prompt, "new_session": new_session},
+            headers={
+                # Keys the harness's own conversation store - a user may have
+                # several sessions (one per browser tab) running concurrently,
+                # each with its own harness-side conversation. The user id is
+                # sent too, even though the harness doesn't act on it yet,
+                # since it's real identity (unlike the session uuid) and is
+                # useful in the harness's own logs.
+                "X-Waldur-User-Id": str(user.uuid),
+                "X-Waldur-Session-Id": str(message.session.uuid),
+            },
+            json={"prompt": message.prompt},
             timeout=_HARNESS_REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
@@ -65,3 +111,6 @@ def ask_harness(message_id: int, new_session: bool = False):
     message.save(
         update_fields=["status", "answer", "new_files", "modified"]
     )
+
+    if message.new_files:
+        _copy_files_from_harness(message, user, message.new_files)

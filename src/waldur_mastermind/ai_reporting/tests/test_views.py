@@ -62,7 +62,7 @@ class AskActionTest(test.APITestCase):
         self.assertEqual(response.data["status"], ReportingMessage.Status.PENDING)
         message = ReportingMessage.objects.get(uuid=response.data["uuid"])
         self.assertEqual(message.prompt, "How many projects?")
-        mock_delay.assert_called_once_with(message.pk, new_session=False)
+        mock_delay.assert_called_once_with(message.pk)
 
     @mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay")
     def test_ask_reuses_the_same_session_across_calls(self, mock_delay):
@@ -96,6 +96,42 @@ class AskActionTest(test.APITestCase):
 
         self.assertEqual(mock_delay.call_count, 2)
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+
+    @mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay")
+    def test_new_session_actually_creates_a_second_session_row(self, mock_delay):
+        """The whole point of many-per-user: new_session must mint a distinct
+        ReportingSession, not just reset something inside the existing one -
+        otherwise two browser tabs could never get independent, concurrently
+        runnable conversations."""
+        self.client.post(self.ask_url, {"prompt": "first"})
+        self.client.post(self.ask_url, {"prompt": "second", "new_session": True})
+
+        self.assertEqual(ReportingSession.objects.filter(user=self.staff).count(), 2)
+
+    @mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay")
+    def test_ask_can_target_a_specific_existing_session(self, mock_delay):
+        first_response = self.client.post(self.ask_url, {"prompt": "first"})
+        self.client.post(self.ask_url, {"prompt": "second", "new_session": True})
+        first_session = first_response.data["session"]
+
+        response = self.client.post(
+            self.ask_url, {"prompt": "back to the first one", "session": first_session}
+        )
+
+        self.assertEqual(response.data["session"], first_session)
+        self.assertEqual(ReportingSession.objects.filter(user=self.staff).count(), 2)
+
+    @mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay")
+    def test_ask_cannot_target_another_users_session(self, mock_delay):
+        other_user = structure_factories.UserFactory(is_staff=True)
+        other_session = ReportingSession.objects.create(user=other_user)
+
+        response = self.client.post(
+            self.ask_url, {"prompt": "hi", "session": other_session.uuid}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        mock_delay.assert_not_called()
 
 
 class ReportingMessageViewSetTest(test.APITestCase):

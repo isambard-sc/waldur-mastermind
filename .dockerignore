@@ -3,3 +3,5 @@
 docker_push.sh
 tests/
 Dockerfile
+.venv
+__pycache__
