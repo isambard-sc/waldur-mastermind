@@ -1702,8 +1702,10 @@ class OpenPortalBoard:
         # project, intersected with the requested range - not every day in
         # the requested range, which may include days spent attached to a
         # different award (or to no award at all).
+        # The report is built from this project's usage alone, so only the
+        # days the award was attached to this project count.
         attached_ranges = utils.get_managed_project_attached_date_ranges(
-            managed_project, date_range.start_date, date_range.end_date
+            managed_project, date_range.start_date, date_range.end_date, project
         )
 
         if not attached_ranges:
@@ -1862,8 +1864,10 @@ class OpenPortalBoard:
         # project, intersected with the requested range - not every day in
         # the requested range, which may include days spent attached to a
         # different award (or to no award at all).
+        # As for usage: the snapshots are this project's, so only the days
+        # the award was attached to this project count.
         attached_ranges = utils.get_managed_project_attached_date_ranges(
-            managed_project, date_range.start_date, date_range.end_date
+            managed_project, date_range.start_date, date_range.end_date, project
         )
 
         if not attached_ranges:

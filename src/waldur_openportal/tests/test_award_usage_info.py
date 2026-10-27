@@ -440,7 +440,7 @@ class GetAwardUsageInfoTest(TestCase):
     def test_no_project_template_returns_none_allocation(self):
         _make_managed_project(self.project, project_template=None)
 
-        with mock.patch.object(utils, "_sum_usage_over_windows", return_value=42.0):
+        with mock.patch.object(utils, "get_award_usage_hours", return_value=42.0):
             result = utils.get_award_usage_info(self.project)
 
         self.assertEqual(result, (None, 42.0))
@@ -456,7 +456,7 @@ class GetAwardUsageInfoTest(TestCase):
             mock.patch.object(
                 models.ManagedProject, "get_details", return_value=fake_details
             ),
-            mock.patch.object(utils, "_sum_usage_over_windows", return_value=10.0),
+            mock.patch.object(utils, "get_award_usage_hours", return_value=10.0),
         ):
             result = utils.get_award_usage_info(self.project)
 
@@ -477,17 +477,10 @@ class GetAwardUsageInfoTest(TestCase):
                 models.ManagedProject, "get_details", return_value=fake_details
             ),
             mock.patch.object(
-                utils, "_sum_usage_over_windows", return_value=250.0
-            ) as mock_sum,
+                utils, "get_award_usage_hours", return_value=250.0
+            ) as mock_hours,
         ):
             result = utils.get_award_usage_info(self.project)
 
         self.assertEqual(result, (1000.0, 250.0))
-        mock_sum.assert_called_once()
-        _, kwargs = mock_sum.call_args
-        self.assertEqual(kwargs["project_identifier"], managed_project.local_identifier)
-        # Deliberately NOT managed_project.destination. That is the remote
-        # portal managing the award; the reports' resource is the local
-        # cluster the usage ran on. Keying on it matched nothing, and this
-        # assertion used to pin that mistake in place.
-        self.assertNotIn("resource", kwargs)
+        mock_hours.assert_called_once_with(managed_project)

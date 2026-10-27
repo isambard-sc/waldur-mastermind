@@ -6,7 +6,7 @@ from waldur_core.core import filters as core_filters
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure import models as structure_models
 
-from . import config, models
+from . import models, utils
 
 
 class AllocationFilter(structure_filters.BaseResourceFilter):
@@ -81,32 +81,15 @@ class ProjectTemplateFilter(django_filters.FilterSet):
 def _identifiers_for_project_uuid(value):
     """Return the set of OpenPortal project_identifier strings for a project UUID.
 
-    Always combines two sources:
-    1. Allocation.backend_id — covers active projects with existing allocations.
-    2. {projectinfo.shortname}.{portal} — covers cases where the allocation
-       has been deleted (e.g. soft-deleted projects, or allocations removed).
+    See utils.get_project_usage_identifiers, which this delegates to so that
+    the filters, the board's usage reports and the award accounting all find
+    a project's usage the same way. Soft-deleted projects are included: their
+    usage history is still cached and still wanted.
     """
-    import openportal
-
-    if not config.ensure_config_loaded():
+    project = structure_models.Project.all_objects.filter(uuid=value).first()
+    if project is None:
         return set()
-
-    allocation_identifiers = set(
-        models.Allocation.objects.filter(project__uuid=value)
-        .exclude(backend_id="")
-        .values_list("backend_id", flat=True)
-    )
-    portal = str(openportal.get_portal())
-    shortnames = (
-        models.ProjectInfo.objects.filter(
-            project__uuid=value,
-            shortname__isnull=False,
-        )
-        .exclude(shortname="")
-        .values_list("shortname", flat=True)
-    )
-    shortname_identifiers = {f"{sn}.{portal}" for sn in shortnames}
-    return allocation_identifiers | shortname_identifiers
+    return utils.get_project_usage_identifiers(project)
 
 
 class CachedProjectUsageReportFilter(django_filters.FilterSet):

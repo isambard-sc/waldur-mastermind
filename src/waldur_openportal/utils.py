@@ -502,7 +502,7 @@ def infer_allocation_from_accounting(
 
     # get the current spend information
     (allocation_credits, total_spend) = get_project_spend_info(
-        project, silent=silent, include_current_month=False
+        project, silent=silent, include_current_month=False, award_only=True
     )
 
     # now get the project's starting month balance
@@ -549,10 +549,74 @@ def infer_allocation_from_accounting(
     return implied_size
 
 
+def _award_share_of_month(
+    windows: list[tuple[datetime.date, datetime.date | None]],
+    identifiers: set[str],
+    year: int,
+    month: int,
+) -> decimal.Decimal:
+    """
+    The fraction, 0 to 1, of a project's spend in the given month that falls
+    on days an award was attached to it, given that project's attachment
+    windows for the award.
+
+    A month wholly outside the windows is 0 and a month wholly inside is 1.
+    A month the award arrived or left partway through is split by the
+    project's daily usage reports - usage is rarely spread evenly across a
+    month, so a split by days would be wrong in either direction. Where there
+    is no usage to split by, the whole month counts: the award is then charged
+    for spend that may not be its own, which errs towards less credit rather
+    than more.
+    """
+    import openportal
+
+    month_start = datetime.date(year, month, 1)
+    month_end = get_last_day_of_month(month_start)
+
+    clipped = [
+        window
+        for window in (
+            _clip_window_to_range(start, end, month_start, month_end)
+            for start, end in windows
+        )
+        if window is not None
+    ]
+    if not clipped:
+        return decimal.Decimal(0)
+
+    covered_days = sum((end - start).days + 1 for start, end in clipped)
+    if covered_days >= (month_end - month_start).days + 1:
+        return decimal.Decimal(1)
+
+    total_hours = 0.0
+    attached_hours = 0.0
+    if identifiers:
+        for cached_report in models.CachedProjectUsageReport.objects.filter(
+            project_identifier__in=identifiers, year=year, month=month
+        ):
+            report = cached_report.get_report()
+            total_hours += float(
+                report.filter(
+                    openportal.DateRange(month_start, month_end)
+                ).total_usage.hours
+            )
+            for start, end in clipped:
+                attached_hours += float(
+                    report.filter(openportal.DateRange(start, end)).total_usage.hours
+                )
+
+    if total_hours <= 0:
+        return decimal.Decimal(1)
+
+    share = decimal.Decimal(str(attached_hours / total_hours))
+    return min(max(share, decimal.Decimal(0)), decimal.Decimal(1))
+
+
 def get_project_spend_info(
     project,
     include_current_month: bool = True,
     silent: bool = False,
+    award_only: bool = False,
 ) -> tuple[decimal.Decimal, decimal.Decimal]:
     """
     Return a tuple of the total credits and total spend for the passed project
@@ -561,9 +625,36 @@ def get_project_spend_info(
         project: The project to get spend info for
         include_current_month: If False, exclude current month's invoice items from spend calculation
         silent: If True, suppress logging
+        award_only: If True and an award (ManagedProject) is attached to the
+            project, count only what falls on the days that award has been
+            attached to it - see _award_share_of_month. A project can hold
+            one award after another, and the spend under an earlier award is
+            not the current award's: counting it took the new award's credit
+            to zero. Without an award, everything counts, as before.
     """
     if not isinstance(project, structure_models.Project):
         raise TypeError("project must be an instance of Project")
+
+    share_of_month = None
+    if award_only:
+        managed_project = models.ManagedProject.objects.filter(project=project).first()
+        if managed_project is not None:
+            windows = [
+                (start, end)
+                for _, start, end in _get_managed_project_attachment_windows(
+                    managed_project, project
+                )
+            ]
+            if windows:
+                identifiers = get_project_usage_identifiers(project)
+                shares = {}
+
+                def share_of_month(year, month):
+                    if (year, month) not in shares:
+                        shares[(year, month)] = _award_share_of_month(
+                            windows, identifiers, year, month
+                        )
+                    return shares[(year, month)]
 
     total_credits = decimal.Decimal(0.0)
     total_spend = decimal.Decimal(0.0)
@@ -577,7 +668,9 @@ def get_project_spend_info(
 
     # Get all the spend for the project
     try:
-        invoice_items = invoice_models.InvoiceItem.objects.filter(project=project)
+        invoice_items = invoice_models.InvoiceItem.objects.filter(
+            project=project
+        ).select_related("invoice")
 
         # Exclude current month if requested
         if not include_current_month:
@@ -594,6 +687,11 @@ def get_project_spend_info(
 
     for invoice_item in invoice_items:
         usage = decimal.Decimal(invoice_item.price)
+
+        if share_of_month is not None:
+            usage *= share_of_month(
+                invoice_item.invoice.year, invoice_item.invoice.month
+            )
 
         if usage < 0:
             # this is a credit, so add it to the total credits
@@ -622,7 +720,7 @@ def get_project_credits(project, silent: bool = False) -> decimal.Decimal:
         raise TypeError("project must be an instance of Project")
 
     (total_credits, total_spend) = get_project_spend_info(
-        project, include_current_month=False, silent=silent
+        project, include_current_month=False, silent=silent, award_only=True
     )
 
     return total_credits + total_spend
@@ -651,6 +749,93 @@ def _get_managed_project_windows(
     ]
 
     return _merge_adjacent_windows(windows)
+
+
+def _get_managed_project_attachment_windows(
+    managed_project: "models.ManagedProject",
+    project: structure_models.Project | None = None,
+) -> list[tuple[structure_models.Project, datetime.date, datetime.date | None]]:
+    """
+    Return (project, start_date, end_date) for every period the passed
+    ManagedProject was attached to a Waldur project, keeping each project's
+    periods separate. end_date is None for the current, still-open window.
+
+    _get_managed_project_windows() merges every attachment into one list of
+    dates, which loses WHICH project held the award when. That is fine for
+    asking "was the award attached on this day", but not for finding its
+    usage: an award accepted onto a new project, then moved to an existing
+    one, was on the first for some days and on the second after, and each
+    project's usage is filed under its own identifiers.
+
+    Windows of the same project that touch or overlap are merged, as in
+    _get_managed_project_windows(). An attachment whose project has since
+    been hard-deleted (project is NULL) is skipped: there is nothing left to
+    find its usage under. Pass project to keep only that project's windows.
+    """
+    by_project = {}
+
+    for attachment in (
+        managed_project.get_attachments()
+        .select_related("project")
+        .order_by("attached_at")
+    ):
+        if attachment.project is None:
+            continue
+        if project is not None and attachment.project_id != project.id:
+            continue
+        by_project.setdefault(attachment.project_id, (attachment.project, []))[
+            1
+        ].append(
+            (
+                attachment.attached_at.date(),
+                attachment.detached_at.date() if attachment.detached_at else None,
+            )
+        )
+
+    return [
+        (attached_project, start, end)
+        for attached_project, windows in by_project.values()
+        for start, end in _merge_adjacent_windows(windows)
+    ]
+
+
+def get_project_usage_identifiers(project: structure_models.Project) -> set[str]:
+    """
+    Return every OpenPortal project identifier the passed project's usage may
+    be cached under (CachedProjectUsageReport.project_identifier).
+
+    Combines two sources:
+    1. Allocation.backend_id - covers projects with existing allocations.
+    2. {ProjectInfo.shortname}.{portal} - covers cases where the allocation
+       has been deleted (e.g. soft-deleted projects, or allocations removed).
+
+    This, not ManagedProject.local_identifier, is how a project's usage is
+    found. local_identifier is minted once, for the project an award is first
+    accepted onto, and is not updated if the award is then moved to another
+    project - so keying on it found the first project's (empty) reports.
+
+    Returns an empty set if the OpenPortal config cannot be loaded.
+    """
+    import openportal
+
+    if not config.ensure_config_loaded():
+        return set()
+
+    allocation_identifiers = set(
+        models.Allocation.objects.filter(project=project)
+        .exclude(backend_id="")
+        .exclude(backend_id=None)
+        .values_list("backend_id", flat=True)
+    )
+    portal = str(openportal.get_portal())
+    shortnames = (
+        models.ProjectInfo.objects.filter(project=project, shortname__isnull=False)
+        .exclude(shortname="")
+        .values_list("shortname", flat=True)
+    )
+    return allocation_identifiers | {
+        f"{shortname}.{portal}" for shortname in shortnames
+    }
 
 
 def _merge_adjacent_windows(
@@ -702,6 +887,7 @@ def get_managed_project_attached_date_ranges(
     managed_project: "models.ManagedProject",
     range_start: datetime.date,
     range_end: datetime.date,
+    project: structure_models.Project | None = None,
 ) -> list[tuple[datetime.date, datetime.date]]:
     """
     Return the closed [start, end] date sub-ranges within
@@ -714,8 +900,22 @@ def get_managed_project_attached_date_ranges(
     award was actually connected, rather than every day in a requested
     range: report.filter() one DateRange per returned sub-range, then
     combine() the results back into a single report.
+
+    Pass project to keep only the days the award was attached to THAT
+    project. A report built from one project's usage must be trimmed to that
+    project's days: an award accepted onto one project and moved to another
+    was attached to the first for a while, and the second project's usage on
+    those days belonged to whatever it held then.
     """
-    windows = _get_managed_project_windows(managed_project)
+    if project is None:
+        windows = _get_managed_project_windows(managed_project)
+    else:
+        windows = [
+            (start, end)
+            for _, start, end in _get_managed_project_attachment_windows(
+                managed_project, project
+            )
+        ]
 
     clipped_ranges = []
     for start, end in windows:
@@ -728,7 +928,7 @@ def get_managed_project_attached_date_ranges(
 
 def _sum_usage_over_windows(
     windows: list[tuple[datetime.date, datetime.date | None]],
-    project_identifier: str | None,
+    project_identifier: str | set[str] | None,
     resource: str | None = None,
 ) -> float:
     """
@@ -737,7 +937,9 @@ def _sum_usage_over_windows(
     starts or ends partway through a month, the report is filtered down to
     the exact overlapping days before summing.
 
-    project_identifier is the key; resource narrows further and is optional.
+    project_identifier is the key, or a set of keys for a project whose usage
+    is cached under more than one (see get_project_usage_identifiers);
+    resource narrows further and is optional.
     Every other reader of these reports (board._get_cached_report_for_month,
     the two reconciliation sweeps below) keys on project_identifier alone,
     because that already scopes the reports to one project.
@@ -755,8 +957,11 @@ def _sum_usage_over_windows(
 
     total_hours = 0.0
 
+    if isinstance(project_identifier, str):
+        project_identifier = {project_identifier}
+
     cached_reports = models.CachedProjectUsageReport.objects.filter(
-        project_identifier=project_identifier
+        project_identifier__in=project_identifier
     )
     if resource:
         cached_reports = cached_reports.filter(resource=resource)
@@ -999,6 +1204,44 @@ def get_remote_project_total_hours(remote_project: "models.RemoteProject") -> fl
     return float(report.total_usage.hours) if report is not None else 0.0
 
 
+def get_award_usage_hours(
+    managed_project: "models.ManagedProject",
+    project: structure_models.Project | None = None,
+) -> float:
+    """
+    The node-hours of usage an award has had: for each project it has been
+    attached to, that project's cached usage on exactly the days the award was
+    attached to it, found under the project's own identifiers.
+
+    Not keyed on ManagedProject.local_identifier. That names the project the
+    award was first accepted onto and is not updated if the award is moved,
+    so an award accepted onto a new project, moved to an existing one, and
+    the new project then deleted, found nothing at all.
+
+    Nor is it keyed on the award's windows merged across projects: usage on
+    a project from before the award was attached to it - for example under
+    the award it held previously - is not this award's.
+
+    Pass project to count only the usage on that project.
+    """
+    windows_by_project = {}
+    for attached_project, start, end in _get_managed_project_attachment_windows(
+        managed_project, project
+    ):
+        windows_by_project.setdefault(attached_project.id, (attached_project, []))[
+            1
+        ].append((start, end))
+
+    total_hours = 0.0
+    for attached_project, windows in windows_by_project.values():
+        identifiers = get_project_usage_identifiers(attached_project)
+        if identifiers:
+            total_hours += _sum_usage_over_windows(
+                windows, project_identifier=identifiers
+            )
+    return total_hours
+
+
 def get_award_usage_info(project) -> tuple[float | None, float]:
     """
     Return (allocation_credits, usage_credits) for the award (ManagedProject)
@@ -1014,8 +1257,9 @@ def get_award_usage_info(project) -> tuple[float | None, float]:
     resolve one - not something a read-only report should risk triggering.
 
     usage_credits is the sum of cached usage report node-hours over exactly
-    the dates the award was connected to the project - see
-    _get_managed_project_windows for how those dates are determined.
+    the days the award was attached to each project it has been on, each
+    project's usage found under that project's own identifiers - see
+    get_award_usage_hours.
     """
     if not isinstance(project, structure_models.Project):
         raise TypeError("project must be an instance of Project")
@@ -1041,17 +1285,7 @@ def get_award_usage_info(project) -> tuple[float | None, float]:
         else:
             allocation_credits = project_template.convert_to_credits(details.allocation)
 
-    # Keyed on local_identifier alone. An earlier version also passed
-    # resource=managed_project.destination, which never matched: the reports'
-    # resource is the local cluster the usage happened on
-    # ("brics.aip2.clusters.shared"), while ManagedProject.destination is the
-    # remote portal that sends instructions about the award
-    # ("airr.brics.isambard-ai"). Both fields are called a destination and
-    # they are different endpoints, so every award reported zero usage.
-    usage_credits = _sum_usage_over_windows(
-        _get_managed_project_windows(managed_project),
-        project_identifier=managed_project.local_identifier,
-    )
+    usage_credits = get_award_usage_hours(managed_project)
 
     return (allocation_credits, usage_credits)
 
@@ -1082,9 +1316,10 @@ def set_project_credits(
     if credits < decimal.Decimal(0.0):
         credits = decimal.Decimal(0.0)
 
-    # Get spend info excluding current month (we want start-of-month balance)
+    # Get spend info excluding current month (we want start-of-month balance).
+    # Only the current award's spend: the credit is that award's allocation.
     (total_credits, total_spend) = get_project_spend_info(
-        project, include_current_month=False, silent=silent
+        project, include_current_month=False, silent=silent, award_only=True
     )
 
     # Calculate what the credit balance should be: allocation - historical_spend
