@@ -375,3 +375,80 @@ class AwardShareOfMonthTest(TestCase):
             )
 
         self.assertEqual(share, 1)
+
+
+class LocalIdentifierFollowsTheProjectTest(TestCase):
+    """
+    ManagedProject.local_identifier names the project the award is attached
+    to. It was minted once, for the first project, and kept naming that one
+    after the award moved - to u6vn, after u6vn had been deleted.
+    """
+
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.u6ll = self.fixture.project
+        self.u6vn = structure_factories.ProjectFactory(customer=self.fixture.customer)
+        models.ProjectInfo.objects.create(project=self.u6ll, shortname="u6ll")
+        models.ProjectInfo.objects.create(project=self.u6vn, shortname="u6vn")
+        self.award = models.ManagedProject.objects.create(
+            destination="airr.brics.isambard-ai",
+            identifier="award2.airr",
+            local_identifier=f"u6vn.{PORTAL}",
+            project=self.u6vn,
+        )
+        # set_project also rewrites the award's project link in its details,
+        # which needs a real AwardDetails; that is not what is under test.
+        for name, value in (
+            ("get_details", mock.Mock()),
+            ("set_details", None),
+            ("_get_project_link", None),
+        ):
+            patcher = mock.patch.object(models.ManagedProject, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_moving_the_award_renames_it_after_the_new_project(self):
+        with _fake_openportal({}):
+            self.award.set_project(None)
+            self.award.set_project(self.u6ll)
+
+        self.award.refresh_from_db()
+        self.assertEqual(self.award.local_identifier, f"u6ll.{PORTAL}")
+
+    def test_moving_straight_from_one_project_to_another(self):
+        with _fake_openportal({}):
+            self.award.set_project(self.u6ll)
+
+        self.award.refresh_from_db()
+        self.assertEqual(self.award.local_identifier, f"u6ll.{PORTAL}")
+
+    def test_detaching_keeps_the_last_identifier(self):
+        with _fake_openportal({}):
+            self.award.set_project(None)
+
+        self.award.refresh_from_db()
+        self.assertEqual(self.award.local_identifier, f"u6vn.{PORTAL}")
+
+    def test_moving_to_a_project_with_no_shortname_clears_it(self):
+        """
+        Left alone it would name the project the award has left; cleared,
+        the board mints the new project's when it next needs one.
+        """
+        no_shortname = structure_factories.ProjectFactory(
+            customer=self.fixture.customer
+        )
+
+        with _fake_openportal({}):
+            self.award.set_project(no_shortname)
+
+        self.award.refresh_from_db()
+        self.assertIsNone(self.award.local_identifier)
+
+    def test_same_project_without_the_config_keeps_its_identifier(self):
+        with mock.patch(
+            "waldur_openportal.config.ensure_config_loaded", return_value=False
+        ):
+            self.award.set_project(self.u6vn)
+
+        self.award.refresh_from_db()
+        self.assertEqual(self.award.local_identifier, f"u6vn.{PORTAL}")

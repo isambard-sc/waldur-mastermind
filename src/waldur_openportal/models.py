@@ -2342,12 +2342,45 @@ class ManagedProject(ReviewMixin, models.Model):
                 f"Project for managed project {self} is being changed from {self.project} to {project}."
             )
 
+        # Before self.project changes: it decides whether the old identifier
+        # still names this project.
+        self.local_identifier = self._local_identifier_for(project)
         self.project = project
-        self.save(update_fields=["project"])
+        self.save(update_fields=["project", "local_identifier"])
         existing_details = self.get_details()
         existing_details.project_link = self._get_project_link()
         self.set_details(existing_details)
         self._sync_attachment()
+
+    def _local_identifier_for(self, project: structure_models.Project) -> str | None:
+        """
+        The local_identifier this award should have while attached to project:
+        that project's own identifier, "{ProjectInfo shortname}.{this portal}".
+
+        It used to be minted once, for the project an award was first accepted
+        onto, and never touched again. An award accepted onto a new project
+        and then moved to the right one kept naming the first - often since
+        deleted - so anything keyed on it looked at the wrong project.
+
+        When it cannot be worked out here - the project has no shortname yet,
+        or the OpenPortal config is not loaded - this returns the current value
+        if the project is unchanged, and None if it has changed: an identifier
+        naming a project the award has left is worse than none, and the board
+        mints a missing one from the project when it next needs it
+        (OpenPortalBoard._get_local_identifier).
+        """
+        info = ProjectInfo.objects.filter(project=project).first()
+        if info is not None and info.has_shortname():
+            try:
+                return str(utils.get_local_project_identifier(project))
+            except (ValueError, RuntimeError) as e:
+                logger.warning(
+                    f"Cannot work out the local identifier of {project} for "
+                    f"managed project {self}: {e}"
+                )
+        if self.local_identifier and self.project_id == project.id:
+            return self.local_identifier
+        return None
 
     def _sync_attachment(self):
         """
