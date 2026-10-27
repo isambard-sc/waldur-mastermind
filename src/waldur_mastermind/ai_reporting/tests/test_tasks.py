@@ -32,9 +32,13 @@ class AskHarnessTaskTest(test.APITestCase):
         self.assertEqual(self.message.new_files, ["a.png"])
 
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
-    def test_identity_header_uses_the_authenticated_users_real_uuid(self, mock_post):
-        """Never derive the identity header from anything but the session's own
-        user - this is the whole IDOR protection for the harness call."""
+    def test_identity_headers_use_the_authenticated_users_and_sessions_real_uuids(
+        self, mock_post
+    ):
+        """Never derive these headers from anything but the message's own
+        session/user - this is the whole IDOR protection for the harness
+        call. The session uuid is what the harness actually keys its
+        conversation store on - see http_service.py."""
         mock_post.return_value = mock.Mock(
             status_code=200, json=lambda: {"answer": "ok", "new_files": []}
         )
@@ -44,6 +48,9 @@ class AskHarnessTaskTest(test.APITestCase):
 
         _, kwargs = mock_post.call_args
         self.assertEqual(kwargs["headers"]["X-Waldur-User-Id"], str(self.user.uuid))
+        self.assertEqual(
+            kwargs["headers"]["X-Waldur-Session-Id"], str(self.session.uuid)
+        )
 
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
     def test_network_failure_marks_failed_not_stuck_pending(self, mock_post):
