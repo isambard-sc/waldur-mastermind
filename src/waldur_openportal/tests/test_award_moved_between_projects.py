@@ -693,3 +693,48 @@ class BackfillManagedProjectAttachmentsTest(TestCase):
                 note=utils.LEGACY_ATTACHMENT_NOTE
             ).exists()
         )
+
+
+class SetProjectCreditsWritesOnlyOnChangeTest(TestCase):
+    """
+    A second run with nothing changed must not rewrite the credit: each write
+    logs a credit change, and the nightly reconciliation rewrote every project
+    its invoices had drawn on.
+    """
+
+    def setUp(self):
+        # The moved-award scenario, without re-running that class's own tests.
+        AwardMovedBetweenProjectsTest.setUp(self)
+        # Credit already drawn down by an invoice, as compensations record it.
+        invoice = invoice_models.Invoice.objects.get(
+            customer=self.fixture.customer, year=2025, month=9
+        )
+        invoice_factories.InvoiceItemFactory(
+            invoice=invoice,
+            project=self.u6ll,
+            unit_price=decimal.Decimal("-300"),
+            quantity=1,
+        )
+
+    def test_an_unchanged_credit_is_not_rewritten(self):
+        with _fake_openportal(self.hours):
+            utils.set_project_credits(self.u6ll, decimal.Decimal(1000))
+            with mock.patch.object(invoice_models.ProjectCredit, "save") as save:
+                utils.set_project_credits(self.u6ll, decimal.Decimal(1000))
+
+        save.assert_not_called()
+
+    def test_a_changed_allocation_is_still_written(self):
+        with _fake_openportal(self.hours):
+            utils.set_project_credits(self.u6ll, decimal.Decimal(1000))
+            utils.set_project_credits(self.u6ll, decimal.Decimal(1500))
+
+        credit = invoice_models.ProjectCredit.objects.get(project=self.u6ll)
+        self.assertAlmostEqual(float(credit.value), 1500 - self.award_2_hours, places=2)
+
+    def test_the_stored_value_has_the_fields_precision(self):
+        with _fake_openportal(self.hours):
+            utils.set_project_credits(self.u6ll, decimal.Decimal("1000.123456789"))
+
+        credit = invoice_models.ProjectCredit.objects.get(project=self.u6ll)
+        self.assertEqual(credit.value.as_tuple().exponent, -5)
