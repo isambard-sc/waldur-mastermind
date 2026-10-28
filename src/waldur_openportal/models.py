@@ -579,14 +579,63 @@ class RemoteAllocation(
             )
 
         remote_identifier = openportal.ProjectIdentifier(mapping.local_group)
+        old_identifier = self.get_remote_project_identifier()
 
-        if remote_identifier != self.get_remote_project_identifier():
-            logger.warning(
-                f"Changing remote project identifier from {self.get_remote_project_identifier()} to {remote_identifier} for {self}"
+        if remote_identifier != old_identifier:
+            self._change_remote_project_identifier(old_identifier, remote_identifier)
+
+    def _change_remote_project_identifier(
+        self,
+        old_identifier: openportal.ProjectIdentifier,
+        new_identifier: openportal.ProjectIdentifier,
+    ):
+        """
+        Follow the receiving portal to a corrected identifier for its project.
+
+        This used to call set_remote_project_identifier, which refuses any
+        change once one is set - so the change it logged never happened, and
+        every update for the award failed at this last step and left it
+        "Pending". That is what happened to every award to brics when brics
+        corrected the identifiers it had minted with the sender's portal name.
+
+        The identifier is also the key of the award record
+        (RemoteProject.identifier, looked up with destination). Moving only the
+        allocation would have the next sync miss the record and create a
+        duplicate award without its history, so both move together - and not
+        at all if another award record already holds the new identifier.
+        """
+        remote_project = getattr(self, "remote_project", None)
+
+        if remote_project is not None and remote_project.identifier is not None:
+            clash = (
+                RemoteProject.objects.filter(
+                    destination=remote_project.destination,
+                    identifier=str(new_identifier),
+                )
+                .exclude(pk=remote_project.pk)
+                .exists()
             )
+            if clash:
+                raise ValueError(
+                    f"Cannot change remote project identifier of {self} from "
+                    f"{old_identifier} to {new_identifier}: another award to "
+                    f"{remote_project.destination} already has it"
+                )
 
-            self.set_remote_project_identifier(remote_identifier)
-            self.save()
+        logger.warning(
+            f"Changing remote project identifier from {old_identifier} to {new_identifier} for {self}"
+        )
+
+        with transaction.atomic():
+            self.remote_project_identifier = str(new_identifier)
+            self.save(update_fields=["remote_project_identifier"])
+            if remote_project is not None and remote_project.identifier == str(
+                old_identifier
+            ):
+                RemoteProject.objects.filter(pk=remote_project.pk).update(
+                    identifier=str(new_identifier)
+                )
+                remote_project.identifier = str(new_identifier)
 
     @classmethod
     def get_backend_fields(cls):

@@ -1355,7 +1355,7 @@ def set_project_credits(
 
     # Get spend info excluding current month (we want start-of-month balance).
     # Only the current award's spend: the credit is that award's allocation.
-    (total_credits, total_spend) = get_project_spend_info(
+    (_, total_spend) = get_project_spend_info(
         project, include_current_month=False, silent=silent, award_only=True
     )
 
@@ -1371,13 +1371,30 @@ def set_project_credits(
         )
         desired_credit_balance = decimal.Decimal(0)
 
-    change_in_credits = desired_credit_balance - total_credits
+    # The change that matters is to the stored value. get_project_spend_info's
+    # total credits also count credit already drawn down by invoices, so measured against it the change
+    # was never zero for a project its invoices had drawn on - every run
+    # rewrote the credit and logged a credit change - and the customer-credit
+    # top-up below came out smaller than the real increase, so the save could
+    # fail validation. Rounded to the field's own precision: the balance is
+    # computed to many more places than are stored.
+    places = invoice_models.ProjectCredit._meta.get_field("value").decimal_places
+    desired_credit_balance = desired_credit_balance.quantize(
+        decimal.Decimal(1).scaleb(-places)
+    )
+    stored_value = (
+        invoice_models.ProjectCredit.objects.filter(project=project)
+        .values_list("value", flat=True)
+        .first()
+    ) or decimal.Decimal(0)
+
+    change_in_credits = desired_credit_balance - stored_value
 
     if abs(change_in_credits) < decimal.Decimal(0.01):
         # no change in credits, so nothing to do
         if not silent:
             logger.debug(
-                f"No change in credits for project {project}: {total_credits} -> {desired_credit_balance} "
+                f"No change in credits for project {project}: {stored_value} -> {desired_credit_balance} "
                 f"(allocation: {credits}, spend: {total_spend})"
             )
         return
@@ -1426,7 +1443,7 @@ def set_project_credits(
             project_credit.save(update_fields=["value"])
             if not silent:
                 logger.info(
-                    f"Project credits for project {project} set to {project_credit.value} (was {total_credits}, "
+                    f"Project credits for project {project} set to {project_credit.value} (was {stored_value}, "
                     f"allocation: {credits}, spend: {total_spend}, change: {change_in_credits})"
                 )
             return
