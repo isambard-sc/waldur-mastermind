@@ -26,11 +26,14 @@ Dates are in 2025, wholly in the past, so no month is the current one and
 
 import datetime
 import decimal
+import io
 from contextlib import contextmanager
 from unittest import mock
 
+from django.core.management import call_command
 from django.test import TestCase
 
+from waldur_core.structure import models as structure_models
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_core.structure.tests import fixtures as structure_fixtures
 from waldur_mastermind.invoices import models as invoice_models
@@ -452,3 +455,241 @@ class LocalIdentifierFollowsTheProjectTest(TestCase):
 
         self.award.refresh_from_db()
         self.assertEqual(self.award.local_identifier, f"u6vn.{PORTAL}")
+
+
+class AwardStartDateTest(AwardMovedBetweenProjectsTest):
+    """
+    An award counts from its own start_date when that is before it reached
+    this portal: a renewal approved on the awarding portal some days after it
+    started.
+    """
+
+    def _set_start(self, start):
+        models.ManagedProject.objects.filter(pk=self.award.pk).update(
+            details={"start_date": start}
+        )
+        self.award.refresh_from_db()
+
+    def test_spend_counts_from_an_earlier_award_start(self):
+        self._set_start(AWARD_ARRIVED.isoformat())
+
+        with _fake_openportal(self.hours):
+            _, spend = utils.get_project_spend_info(
+                self.u6ll, include_current_month=False, award_only=True
+            )
+
+        # u6ll from 21 August, not 27: six more days at award 1's rate.
+        expected = (
+            sum(
+                _u6ll_hours(day)
+                for day in _days(AWARD_ARRIVED, datetime.date(2025, 8, 31))
+            )
+            + _month_hours(2025, 9, _u6ll_hours)
+            + _month_hours(2025, 10, _u6ll_hours)
+        )
+        self.assertAlmostEqual(float(spend), expected, places=2)
+
+    def test_card_counts_from_an_earlier_award_start(self):
+        self._set_start(AWARD_ARRIVED.isoformat())
+
+        with _fake_openportal(self.hours):
+            hours = utils.get_award_usage_hours(self.award)
+
+        self.assertAlmostEqual(
+            hours,
+            self.award_2_hours
+            + sum(
+                _u6ll_hours(day)
+                for day in _days(AWARD_ARRIVED, MOVED_TO_U6LL - datetime.timedelta(1))
+            ),
+        )
+
+    def test_a_later_award_start_does_not_shorten_the_attachment(self):
+        self._set_start("2025-09-15")
+
+        with _fake_openportal(self.hours):
+            _, spend = utils.get_project_spend_info(
+                self.u6ll, include_current_month=False, award_only=True
+            )
+
+        self.assertAlmostEqual(float(spend), self.award_2_hours, places=2)
+
+    def test_reports_to_the_awarding_portal_still_follow_the_attachments(self):
+        self._set_start(AWARD_ARRIVED.isoformat())
+
+        with _fake_openportal(self.hours):
+            ranges = utils.get_managed_project_attached_date_ranges(
+                self.award,
+                datetime.date(2025, 8, 1),
+                datetime.date(2025, 8, 31),
+                self.u6ll,
+            )
+
+        self.assertEqual(ranges, [(MOVED_TO_U6LL, datetime.date(2025, 8, 31))])
+
+    def test_an_unreadable_start_date_is_ignored(self):
+        self._set_start("not a date")
+
+        with _fake_openportal(self.hours):
+            _, spend = utils.get_project_spend_info(
+                self.u6ll, include_current_month=False, award_only=True
+            )
+
+        self.assertAlmostEqual(float(spend), self.award_2_hours, places=2)
+
+
+class BackfillManagedProjectAttachmentsTest(TestCase):
+    """
+    Awards whose records predate the audit log are taken to have been on their
+    project since it started.
+    """
+
+    AUDIT_START = datetime.datetime(2026, 6, 4, 9, tzinfo=datetime.UTC)
+
+    def setUp(self):
+        self.fixture = structure_fixtures.ProjectFixture()
+        self.project = self.fixture.project
+        self.project.start_date = datetime.date(2025, 3, 1)
+        self.project.save(update_fields=["start_date"])
+
+        # The first audit entry anywhere marks when recording began.
+        self.other = models.ManagedProject.objects.create(
+            destination="d", identifier="other.airr", project=None
+        )
+        self._audit(self.other, self.AUDIT_START)
+
+        self.legacy = models.ManagedProject.objects.create(
+            destination="d", identifier="legacy.airr", project=self.project
+        )
+        self._created(self.legacy, datetime.datetime(2025, 10, 24, tzinfo=datetime.UTC))
+
+    def _audit(self, managed_project, when):
+        entry = models.ManagedProjectAuditEntry.objects.create(
+            identifier=managed_project.identifier,
+            destination=managed_project.destination,
+            managed_project=managed_project,
+            event_type=models.ManagedProjectAuditEventType.CREATED,
+        )
+        models.ManagedProjectAuditEntry.objects.filter(pk=entry.pk).update(
+            timestamp=when
+        )
+
+    def _created(self, managed_project, when):
+        models.ManagedProject.objects.filter(pk=managed_project.pk).update(created=when)
+        managed_project.refresh_from_db()
+
+    def _first_attached(self, managed_project):
+        return utils.timezone.localdate(
+            managed_project.get_attachments()
+            .order_by("attached_at")
+            .first()
+            .attached_at
+        )
+
+    def test_legacy_award_is_attached_from_its_project_start(self):
+        summary = utils.backfill_managed_project_attachments()
+
+        self.assertEqual(summary["first attachments backdated"], 1)
+        self.assertEqual(self._first_attached(self.legacy), datetime.date(2025, 3, 1))
+
+    def test_project_created_date_stands_in_for_a_missing_start_date(self):
+        self.project.start_date = None
+        self.project.save(update_fields=["start_date"])
+        structure_models.Project.objects.filter(pk=self.project.pk).update(
+            created=datetime.datetime(2025, 2, 11, 12, tzinfo=datetime.UTC)
+        )
+
+        utils.backfill_managed_project_attachments()
+
+        self.assertEqual(self._first_attached(self.legacy), datetime.date(2025, 2, 11))
+
+    def test_a_legacy_audit_entry_explains_it(self):
+        utils.backfill_managed_project_attachments()
+
+        entry = models.ManagedProjectAuditEntry.objects.get(
+            managed_project=self.legacy, note=utils.LEGACY_ATTACHMENT_NOTE
+        )
+        self.assertEqual(
+            entry.event_type, models.ManagedProjectAuditEventType.PROJECT_ATTACHED
+        )
+        self.assertEqual(entry.timestamp.date(), datetime.date(2025, 3, 1))
+
+    def test_award_created_after_the_audit_log_began_is_left_alone(self):
+        recent = models.ManagedProject.objects.create(
+            destination="d",
+            identifier="recent.airr",
+            project=structure_factories.ProjectFactory(customer=self.fixture.customer),
+        )
+        self._created(recent, datetime.datetime(2026, 9, 9, tzinfo=datetime.UTC))
+        before = self._first_attached(recent)
+
+        utils.backfill_managed_project_attachments()
+
+        self.assertEqual(self._first_attached(recent), before)
+        self.assertFalse(
+            models.ManagedProjectAuditEntry.objects.filter(
+                managed_project=recent, note=utils.LEGACY_ATTACHMENT_NOTE
+            ).exists()
+        )
+
+    def test_an_award_whose_first_attachment_is_elsewhere_is_left_alone(self):
+        elsewhere = structure_factories.ProjectFactory(customer=self.fixture.customer)
+        models.ManagedProjectAttachment.objects.create(
+            managed_project=self.legacy,
+            project=elsewhere,
+            attached_at=datetime.datetime(2025, 10, 24, tzinfo=datetime.UTC),
+            detached_at=datetime.datetime(2025, 11, 1, tzinfo=datetime.UTC),
+        )
+        models.ManagedProjectAttachment.objects.create(
+            managed_project=self.legacy,
+            project=self.project,
+            attached_at=datetime.datetime(2025, 11, 1, tzinfo=datetime.UTC),
+        )
+
+        summary = utils.backfill_managed_project_attachments()
+
+        self.assertEqual(summary["skipped: first attachment is to another project"], 1)
+        self.assertEqual(self._first_attached(self.legacy), datetime.date(2025, 10, 24))
+
+    def test_a_second_run_changes_nothing(self):
+        utils.backfill_managed_project_attachments()
+
+        summary = utils.backfill_managed_project_attachments()
+
+        self.assertEqual(summary["first attachments backdated"], 0)
+        self.assertEqual(summary["legacy audit entries recorded"], 0)
+        self.assertEqual(summary["awards predating the audit log"], 1)
+
+    def test_dry_run_writes_nothing(self):
+        self.legacy.get_attachments()  # the reconstruction a live read makes
+        before = self._first_attached(self.legacy)
+
+        summary = utils.backfill_managed_project_attachments(dry_run=True)
+
+        self.assertEqual(summary["first attachments backdated"], 1)
+        self.assertEqual(self._first_attached(self.legacy), before)
+        self.assertFalse(
+            models.ManagedProjectAuditEntry.objects.filter(
+                note=utils.LEGACY_ATTACHMENT_NOTE
+            ).exists()
+        )
+
+    def test_no_audit_log_at_all_changes_nothing(self):
+        models.ManagedProjectAuditEntry.objects.all().delete()
+
+        summary = utils.backfill_managed_project_attachments()
+
+        self.assertEqual(summary["first attachments backdated"], 0)
+
+    def test_command_dry_run_reports_and_rolls_back(self):
+        out = io.StringIO()
+
+        call_command("backfill_managed_project_attachments", "--dry-run", stdout=out)
+
+        self.assertIn("first attachments backdated", out.getvalue())
+        self.assertIn("Dry run: nothing changed.", out.getvalue())
+        self.assertFalse(
+            models.ManagedProjectAuditEntry.objects.filter(
+                note=utils.LEGACY_ATTACHMENT_NOTE
+            ).exists()
+        )

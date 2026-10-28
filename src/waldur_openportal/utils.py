@@ -642,7 +642,7 @@ def get_project_spend_info(
             windows = [
                 (start, end)
                 for _, start, end in _get_managed_project_attachment_windows(
-                    managed_project, project
+                    managed_project, project, from_award_start=True
                 )
             ]
             if windows:
@@ -751,9 +751,28 @@ def _get_managed_project_windows(
     return _merge_adjacent_windows(windows)
 
 
+def _get_award_start_date(
+    managed_project: "models.ManagedProject",
+) -> datetime.date | None:
+    """The award's own start_date, as sent by the awarding portal, or None."""
+    start_date = (managed_project.details or {}).get("start_date")
+    if not start_date:
+        return None
+    try:
+        return datetime.date.fromisoformat(str(start_date)[:10])
+    except ValueError:
+        logger.warning(
+            "Managed project %s has an unreadable start_date %r",
+            managed_project.pk,
+            start_date,
+        )
+        return None
+
+
 def _get_managed_project_attachment_windows(
     managed_project: "models.ManagedProject",
     project: structure_models.Project | None = None,
+    from_award_start: bool = False,
 ) -> list[tuple[structure_models.Project, datetime.date, datetime.date | None]]:
     """
     Return (project, start_date, end_date) for every period the passed
@@ -771,6 +790,14 @@ def _get_managed_project_attachment_windows(
     _get_managed_project_windows(). An attachment whose project has since
     been hard-deleted (project is NULL) is skipped: there is nothing left to
     find its usage under. Pass project to keep only that project's windows.
+
+    Pass from_award_start to start the first window on the award's current
+    project no later than the award's own start_date. An award can start
+    before it reaches this portal - a renewal approved on the awarding portal
+    some days after its start - and the project's usage from that date is the
+    award's. Only ever earlier: a start_date after the first attachment does
+    not shorten it. Not for the reports sent to the awarding portal, which
+    follow the attachments.
     """
     by_project = {}
 
@@ -792,11 +819,21 @@ def _get_managed_project_attachment_windows(
             )
         )
 
-    return [
-        (attached_project, start, end)
-        for attached_project, windows in by_project.values()
-        for start, end in _merge_adjacent_windows(windows)
-    ]
+    award_start = _get_award_start_date(managed_project) if from_award_start else None
+
+    result = []
+    for attached_project, windows in by_project.values():
+        windows = _merge_adjacent_windows(windows)
+        if (
+            award_start is not None
+            and attached_project.id == managed_project.project_id
+            and award_start < windows[0][0]
+        ):
+            windows = _merge_adjacent_windows(
+                [(award_start, windows[0][1])] + windows[1:]
+            )
+        result.extend((attached_project, start, end) for start, end in windows)
+    return result
 
 
 def get_project_usage_identifiers(project: structure_models.Project) -> set[str]:
@@ -1226,7 +1263,7 @@ def get_award_usage_hours(
     """
     windows_by_project = {}
     for attached_project, start, end in _get_managed_project_attachment_windows(
-        managed_project, project
+        managed_project, project, from_award_start=True
     ):
         windows_by_project.setdefault(attached_project.id, (attached_project, []))[
             1
@@ -3407,5 +3444,108 @@ def backfill_remote_project_attachments(dry_run: bool = False) -> dict:
                         f"{first.note}\n" if first.note else ""
                     ) + "attached_at backdated by backfill_remote_project_attachments."
                     first.save(update_fields=["attached_at", "note"])
+
+    return summary
+
+
+LEGACY_ATTACHMENT_NOTE = (
+    "Legacy: assumed attached from the project's start, as the award predates "
+    "the audit log (backfill_managed_project_attachments)."
+)
+
+
+def get_project_start_date(project: structure_models.Project) -> datetime.date:
+    """A project's start: its start_date, or the day it was created if unset."""
+    return project.start_date or timezone.localdate(project.created)
+
+
+def backfill_managed_project_attachments(dry_run: bool = False) -> dict:
+    """Give awards that predate the audit log a first attachment from their project's start.
+
+    The receiving-side counterpart of backfill_remote_project_attachments.
+
+    Before the ManagedProject audit log existed, nothing recorded when an award
+    was attached to its project. Their attachment history is therefore
+    reconstructed from the award record's creation (see
+    ManagedProject.get_attachments), which for awards brought into OpenPortal
+    for projects already running can be months after the project began - and
+    every day of usage before it would then not count as the award's.
+
+    A project can only use credit while connected to an award, so an award
+    whose record predates the audit log is taken to have been attached to its
+    project since the project started (start_date, else the day it was
+    created). Its first attachment is moved back to then, with a note, and a
+    PROJECT_ATTACHED audit entry is recorded at that time so the award's
+    history explains itself and any future reconstruction agrees.
+
+    Only the first attachment is moved, and only when it is to the project the
+    award holds now: an award that has moved is left alone, since nothing says
+    when it reached its first project. "Predates the audit log" is decided by
+    the earliest audit entry other than these legacy ones, so it is the data,
+    not a hard-coded date, that says when recording began. Idempotent.
+    """
+    summary = {
+        "awards": 0,
+        "awards predating the audit log": 0,
+        "first attachments backdated": 0,
+        "legacy audit entries recorded": 0,
+        "skipped: first attachment is to another project": 0,
+        "skipped: no attachment history": 0,
+    }
+
+    audit_start = (
+        models.ManagedProjectAuditEntry.objects.exclude(note=LEGACY_ATTACHMENT_NOTE)
+        .order_by("timestamp")
+        .values_list("timestamp", flat=True)
+        .first()
+    )
+    if audit_start is None:
+        return summary
+
+    for managed_project in models.ManagedProject.objects.exclude(
+        project=None
+    ).select_related("project"):
+        summary["awards"] += 1
+        if managed_project.created >= audit_start:
+            continue
+        summary["awards predating the audit log"] += 1
+
+        first = managed_project.get_attachments().order_by("attached_at", "id").first()
+        if first is None:
+            summary["skipped: no attachment history"] += 1
+            continue
+        if first.project_id != managed_project.project_id:
+            summary["skipped: first attachment is to another project"] += 1
+            continue
+
+        project_start = get_project_start_date(managed_project.project)
+        started = timezone.make_aware(
+            datetime.datetime.combine(project_start, datetime.time.min)
+        )
+
+        # Compared by date, as windows are whole days.
+        if project_start < timezone.localdate(first.attached_at):
+            summary["first attachments backdated"] += 1
+            if not dry_run:
+                first.attached_at = started
+                first.note = (
+                    f"{first.note}\n" if first.note else ""
+                ) + LEGACY_ATTACHMENT_NOTE
+                first.save(update_fields=["attached_at", "note"])
+
+        if not models.ManagedProjectAuditEntry.objects.filter(
+            managed_project=managed_project, note=LEGACY_ATTACHMENT_NOTE
+        ).exists():
+            summary["legacy audit entries recorded"] += 1
+            if not dry_run:
+                entry = models.ManagedProjectAuditEntry.record(
+                    managed_project,
+                    models.ManagedProjectAuditEventType.PROJECT_ATTACHED,
+                    note=LEGACY_ATTACHMENT_NOTE,
+                )
+                # timestamp is auto_now_add, so it is set after creation.
+                models.ManagedProjectAuditEntry.objects.filter(pk=entry.pk).update(
+                    timestamp=min(started, first.attached_at)
+                )
 
     return summary

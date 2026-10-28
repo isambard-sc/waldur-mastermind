@@ -3,13 +3,20 @@
 An award's project credit is its allocation less the spend excluding the
 current month. That spend used to be every invoice the project had ever had;
 it is now only the share falling on the days the CURRENT award has been
-attached to the project (utils.get_project_spend_info(..., award_only=True)).
-A project that held an earlier award, or that had spend before its award
-arrived, therefore gets credit back the next time set_project_credits runs -
-on an allocation change, or in the nightly fix_total_allocation.
+attached to the project, or since its own start_date if that is earlier
+(utils.get_project_spend_info(..., award_only=True)). A project that held an
+earlier award therefore gets credit back the next time set_project_credits
+runs - on an allocation change, or in the nightly fix_total_allocation.
 
-Run this with the NEW code deployed but before that reconciliation runs, to
-see what it will do. Writes nothing:
+Awards that predate the audit log have no attachment history of their own,
+so run the backfill first or they will look as if they started when their
+record was made:
+
+    waldur backfill_managed_project_attachments --dry-run
+    waldur backfill_managed_project_attachments
+
+Then run this, with the NEW code deployed but before the nightly
+reconciliation, to see what it will do. Writes nothing:
 
     waldur shell < scripts/dryrun_award_only_credit.py
 
