@@ -4,6 +4,8 @@ from unittest import mock
 
 from django.test import TestCase, override_settings
 
+from waldur_core.structure.tests import fixtures as structure_fixtures
+from waldur_openportal import models
 from waldur_openportal.filters import _identifiers_for_project_uuid
 
 
@@ -30,10 +32,35 @@ class IdentifiersForProjectUuidTest(TestCase):
     def test_calls_get_portal_when_config_loaded(
         self, mock_ensure_loaded, mock_get_portal
     ):
-        identifiers = _identifiers_for_project_uuid(self.project_uuid)
+        project = structure_fixtures.ProjectFixture().project
+
+        identifiers = _identifiers_for_project_uuid(project.uuid.hex)
 
         self.assertEqual(identifiers, set())
         mock_get_portal.assert_called_once()
+
+    @override_settings(WALDUR_OPENPORTAL={"ENABLED": True})
+    @mock.patch("openportal.get_portal", return_value="example.portal")
+    @mock.patch("waldur_openportal.config.ensure_config_loaded", return_value=True)
+    def test_unknown_project_has_no_identifiers(
+        self, mock_ensure_loaded, mock_get_portal
+    ):
+        self.assertEqual(_identifiers_for_project_uuid(self.project_uuid), set())
+
+    @override_settings(WALDUR_OPENPORTAL={"ENABLED": True})
+    @mock.patch("openportal.get_portal", return_value="example.portal")
+    @mock.patch("waldur_openportal.config.ensure_config_loaded", return_value=True)
+    def test_soft_deleted_project_keeps_its_identifiers(
+        self, mock_ensure_loaded, mock_get_portal
+    ):
+        """Its usage history is still cached, and the reports still want it."""
+        project = structure_fixtures.ProjectFixture().project
+        models.ProjectInfo.objects.create(project=project, shortname="u6vn")
+        project.delete()
+
+        self.assertEqual(
+            _identifiers_for_project_uuid(project.uuid.hex), {"u6vn.example.portal"}
+        )
 
     @override_settings(WALDUR_OPENPORTAL={"ENABLED": False})
     @mock.patch("openportal.get_portal")
