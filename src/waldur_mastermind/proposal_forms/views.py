@@ -36,7 +36,7 @@ def _api_url(request, name, **kwargs):
 
 
 def _require_active():
-    if not client.connection().is_active:
+    if not client.is_available():
         raise exceptions.ValidationError(
             _("Applying through Formbricks is not enabled on this site.")
         )
@@ -339,7 +339,7 @@ class ProposalFormViewSet(viewsets.GenericViewSet):
         )
         can_fill_in = form_permissions.can_fill_in(user, proposal)
         next_step = None
-        if can_fill_in and client.connection().is_active:
+        if can_fill_in and client.is_available():
             pending = [s for s in flow.steps if s["key"] not in answered]
             if pending:
                 next_step = _survey_link(user, proposal, pending[0])
@@ -473,7 +473,7 @@ class ProposalFormRedirectView(views.APIView):
         if not form_permissions.can_fill_in(request.user, proposal):
             return http_redirect(_completion_url(proposal))
         flow = serializers.get_call_form_flow(proposal.round.call)
-        if flow is None or not client.connection().is_active:
+        if flow is None or not client.is_available():
             return http_redirect(_completion_url(proposal))
 
         # The webhook for the step just finished may not have arrived yet,
@@ -511,6 +511,11 @@ class ProposalFormWebhookView(views.APIView):
 
     @extend_schema(exclude=True)
     def post(self, request):
+        if not client.is_available():
+            # Not an error Formbricks should retry into: the site has
+            # switched applying through Formbricks off.
+            logger.warning("Formbricks webhook ignored: Formbricks forms are off.")
+            return response.Response(status=status.HTTP_503_SERVICE_UNAVAILABLE)
         if not client.verify_signature(request):
             raise exceptions.PermissionDenied(_("Invalid webhook signature."))
 

@@ -258,6 +258,13 @@ class CallFormFlowSerializer(serializers.Serializer):
             raise serializers.ValidationError(
                 "The call already has proposals, so its form can no longer change."
             )
+        if flow is not None and not client.is_available():
+            raise serializers.ValidationError(
+                {
+                    "flow": "Formbricks forms are not enabled on this site, so a "
+                    "call cannot use a form flow."
+                }
+            )
         if flow is not None:
             problems = mapper.call_offering_problems(call, flow.steps)
             if problems:
@@ -359,6 +366,13 @@ class CallFormFlowSummarySerializer(serializers.Serializer):
 
 @extend_schema_field(CallFormFlowSummarySerializer(allow_null=True))
 def _get_form_flow(serializer, call):
+    # Null while Formbricks forms are off, so the frontend offers Waldur's own
+    # form. Checked once per response, not once per call in a list.
+    context = serializer.context
+    if "formbricks_available" not in context:
+        context["formbricks_available"] = client.is_available()
+    if not context["formbricks_available"]:
+        return None
     flow = get_call_form_flow(call)
     if flow is None:
         return None

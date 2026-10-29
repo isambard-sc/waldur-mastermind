@@ -25,6 +25,8 @@ from urllib.parse import urlencode
 import requests
 from django.core import signing
 
+from waldur_core.core.models import is_feature_enabled
+
 from . import models
 
 logger = logging.getLogger(__name__)
@@ -55,8 +57,18 @@ class FormbricksError(Exception):
     """Formbricks could not be reached, or answered with something unusable."""
 
 
+# The site-wide switch: HomePort hides everything Formbricks while it is off.
+FEATURE = "proposal.formbricks_forms"
+
+
 def connection() -> models.FormbricksConnection:
     return models.FormbricksConnection.get()
+
+
+def is_available() -> bool:
+    """Whether calls may take applications through Formbricks now: the
+    feature is on, and the connection is configured and enabled."""
+    return is_feature_enabled(FEATURE) and connection().is_active
 
 
 # --- redirect tokens ------------------------------------------------------

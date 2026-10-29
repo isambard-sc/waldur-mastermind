@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlsplit
 from django.utils import timezone
 from rest_framework import status, test
 
+from waldur_core.core import models as core_models
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CallRole, ProposalRole
 from waldur_core.permissions.utils import has_user
@@ -68,6 +69,9 @@ class FormsTestBase(test.APITestCase):
             key="airr-gw", name="AIRR Gateway", steps=flows.validate_steps(STEPS)
         )
         models.CallFormFlow.objects.create(call=self.call, flow=self.flow)
+        core_models.Feature.objects.update_or_create(
+            key=client.FEATURE, defaults={"value": True}
+        )
         models.FormbricksConnection.objects.update_or_create(
             pk=1,
             defaults={
@@ -616,9 +620,13 @@ class WebhookTest(FormsTestBase):
         self.assertFalse(models.FormStepResponse.objects.exists())
 
     def test_no_secret_refuses_even_matching_empty_signature(self):
+        # Without a secret the connection is not configured, so the webhook
+        # stops before the signature is even read; verify_signature refuses
+        # an empty key on its own too (test_client.SignatureTest).
         models.FormbricksConnection.objects.filter(pk=1).update(webhook_secret="")
         response = self.post(self.payload(), secret="")
-        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertFalse(models.FormStepResponse.objects.exists())
 
     def test_answers_without_valid_token_refused(self):
         # Anyone can fill in a survey: a hidden proposal_uuid typed into the
@@ -674,3 +682,96 @@ class WebhookTest(FormsTestBase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         stored = models.FormStepResponse.objects.get(step_key="team_details")
         self.assertEqual(stored.raw_response["q_team"], "Alice")
+
+
+class SwitchedOffTest(FormsTestBase):
+    """Nothing reaches applicants unless the feature is on and the
+    connection is enabled; switching either off hides it again."""
+
+    def switch_off(self, what, on=False):
+        if what == "feature":
+            core_models.Feature.objects.filter(key=client.FEATURE).update(value=on)
+        else:
+            models.FormbricksConnection.objects.filter(pk=1).update(enabled=on)
+
+    def test_each_switch_hides_forms(self):
+        for what in ("feature", "connection"):
+            with self.subTest(what):
+                self.switch_off(what)
+                self.client.force_authenticate(self.user)
+                response = self.client.post(
+                    "/api/proposal-forms/start/", {"round_uuid": self.round.uuid.hex}
+                )
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+                # Calls offer Waldur's own form instead.
+                response = self.client.get(
+                    f"/api/proposal-public-calls/{self.call.uuid.hex}/"
+                )
+                self.assertIsNone(response.data["form_flow"])
+
+                self.client.force_authenticate(self.applicant)
+                response = self.client.get(
+                    f"/api/proposal-forms/{self.proposal.uuid.hex}/"
+                )
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertIsNone(response.data["next_step"])
+
+                token = client.build_redirect_token(self.applicant, self.proposal)
+                response = self.client.get(
+                    "/api/proposal-form-redirect/",
+                    {
+                        "step": "project_details",
+                        "proposal_uuid": self.proposal.uuid.hex,
+                        "redirect_token": token,
+                    },
+                )
+                self.assertIn(
+                    f"proposals/{self.proposal.uuid.hex}/", response["Location"]
+                )
+                self.switch_off(what, on=True)
+
+    def test_call_flow_cannot_be_chosen_while_off(self):
+        self.switch_off("feature")
+        call = proposal_factories.CallFactory(state=CallStates.ACTIVE)
+        proposal_factories.RequestedOfferingFactory(call=call, offering=self.offering)
+        call.add_user(self.call_manager, CallRole.MANAGER)
+        self.client.force_authenticate(self.call_manager)
+        url = f"/api/proposal-form-calls/{call.uuid.hex}/"
+        response = self.client.put(url, {"flow": self.flow.uuid.hex}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("not enabled", str(response.data["flow"]))
+        # Taking a flow off is always allowed.
+        response = self.client.put(url, {"flow": None}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_webhook_ignored_while_off(self):
+        self.switch_off("feature")
+        body = b'{"event": "responseFinished"}'
+        timestamp = str(int(time.time()))
+        response = self.client.generic(
+            "POST",
+            "/api/proposal-form-webhook/",
+            body,
+            content_type="application/json",
+            HTTP_WEBHOOK_ID="msg_1",
+            HTTP_WEBHOOK_TIMESTAMP=timestamp,
+            HTTP_WEBHOOK_SIGNATURE="v1,"
+            + client.sign(SECRET, "msg_1", timestamp, body),
+        )
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertFalse(models.FormStepResponse.objects.exists())
+
+    def test_staff_can_set_up_before_switching_on(self):
+        self.switch_off("feature")
+        self.client.force_authenticate(self.staff)
+        response = self.client.patch(
+            "/api/formbricks-connection/", {"base_url": "https://f.example.com"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        response = self.client.post(
+            "/api/form-flows/",
+            {"key": "other", "name": "Other", "steps": [STEPS[1]]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)

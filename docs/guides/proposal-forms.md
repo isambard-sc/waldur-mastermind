@@ -8,6 +8,26 @@ webhook and are kept per step; a step can also copy answers onto the proposal
 
 Everything is configured through the API: there are no deployment settings.
 
+## Switching it on
+
+Two switches, both needed before any call can take applications this way:
+
+- the feature **`proposal.formbricks_forms`** (staff, in the features admin):
+  HomePort shows the Formbricks settings, the flows and each call's flow
+  choice only while it is on;
+- the connection's **`enabled`**, which staff can only set once the
+  connection is configured.
+
+While either is off, calls report `form_flow: null` (so applicants get
+Waldur's own form), a flow cannot be chosen for a call, starting or editing an
+application is refused, the survey-ending redirect returns the applicant to
+the proposal, and the webhook answers 503 without reading the request. Staff
+can still configure the connection and the flows, so a site can be set up
+before it is switched on. Answers already given stay readable.
+
+Each call then opts in by choosing a flow; without one it keeps Waldur's own
+form.
+
 ## Setting up
 
 1. **Connect the Formbricks server.** As staff, `PATCH /api/formbricks-connection/`:
@@ -38,7 +58,10 @@ Everything is configured through the API: there are no deployment settings.
    every question the step maps, and gives the `ending_url` to set as the
    survey's ending ("Redirect to URL").
 
-5. **Choose a call's flow:** `PUT /api/proposal-form-calls/<call_uuid>/` with
+5. **Switch on** the `proposal.formbricks_forms` feature and the
+   connection's `enabled`.
+
+6. **Choose a call's flow:** `PUT /api/proposal-form-calls/<call_uuid>/` with
    `{"flow": "<flow uuid>"}` (or `null` for Waldur's own form). Anyone who may
    update the call may do this until the call has proposals. The flow's
    resource choices must name offerings the call requests.
