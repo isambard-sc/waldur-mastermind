@@ -511,15 +511,29 @@ class ProposalFormWebhookView(views.APIView):
 
     @extend_schema(exclude=True)
     def post(self, request):
+        # Formbricks' "Test endpoint" button posts {"event": "testEndpoint"},
+        # signed with a secret it only reveals once the webhook is saved - so
+        # it cannot verify here, and Formbricks fails the test on a 5xx. It
+        # changes nothing, so it is acknowledged before anything is checked.
+        # The raw body is read first: the signature is over it, and Django
+        # only keeps it if it is read before the parsed data.
+        request.body  # noqa: B018
+        payload = request.data if isinstance(request.data, dict) else {}
+        if payload.get("event") == "testEndpoint":
+            logger.info("Formbricks webhook test received.")
+            return response.Response({"detail": "ok"}, status=status.HTTP_200_OK)
         if not client.is_available():
-            # Not an error Formbricks should retry into: the site has
-            # switched applying through Formbricks off.
+            # Acknowledged, not refused: a 5xx would make Formbricks retry, and
+            # would fail its test while the site is still being set up (the
+            # connection cannot be enabled before the webhook's secret is known).
             logger.warning("Formbricks webhook ignored: Formbricks forms are off.")
-            return response.Response(status=status.HTTP_503_SERVICE_UNAVAILABLE)
+            return response.Response(
+                {"detail": "Ignored: Formbricks forms are off."},
+                status=status.HTTP_200_OK,
+            )
         if not client.verify_signature(request):
             raise exceptions.PermissionDenied(_("Invalid webhook signature."))
 
-        payload = request.data if isinstance(request.data, dict) else {}
         if payload.get("event") != "responseFinished":
             return response.Response(status=status.HTTP_200_OK)
 

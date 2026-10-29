@@ -21,7 +21,8 @@ Two switches, both needed before any call can take applications this way:
 While either is off, calls report `form_flow: null` (so applicants get
 Waldur's own form), a flow cannot be chosen for a call, starting or editing an
 application is refused, the survey-ending redirect returns the applicant to
-the proposal, and the webhook answers 503 without reading the request. Staff
+the proposal, and the webhook acknowledges (200) and ignores what it is sent,
+so Formbricks neither retries nor fails its endpoint test. Staff
 can still configure the connection and the flows, so a site can be set up
 before it is switched on. Answers already given stay readable.
 
@@ -47,6 +48,11 @@ form.
 2. **Add the webhook in Formbricks** for the environment holding the surveys:
    the URL is `webhook_url` from the connection, with the trigger
    "Response finished". Copy its signing secret into `webhook_secret`.
+   Formbricks' "Test endpoint" button posts `{"event": "testEndpoint"}`,
+   signed with a secret it only shows after saving, so Waldur acknowledges
+   that test without checking it. The URL must be one Formbricks' server can
+   reach: from inside a Formbricks container, `localhost` is Formbricks
+   itself (a POST there answers 405).
 
 3. **Create the flows.** Through `POST /api/form-flows/`, or from YAML with
    `waldur import_form_flows <file> [--dry-run]` (`export_form_flows` writes
