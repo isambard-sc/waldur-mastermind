@@ -1,0 +1,71 @@
+# The AIRR Gateway (airr-gw) and Rapid Access (airr-ra) application flows.
+#
+# The survey and question ids are those of the development Formbricks
+# instance: every Formbricks environment has its own, so change them to the
+# target instance's before importing elsewhere, e.g.
+#
+#   waldur import_form_flows airr_form_flows.yaml --dry-run
+#
+# then check each flow against Formbricks with POST /api/form-flows/{uuid}/check/,
+# which also gives the "Redirect to URL" each survey's ending needs.
+flows:
+  - key: airr-gw
+    name: AIRR Gateway application
+    description: Project details, team, compliance and the Gateway assessment.
+    steps:
+      - key: project_details
+        label: Project details
+        survey_id: cmt4q1c400004qe01zta9vmnm
+        reviewer_visible: true
+        field_map:
+          fjxcnvv5q1ny48q2wazmq2eb: name               # Project title
+          drihiecfnvzubpjfjc39ai6p: project_summary    # Project summary
+        resources:
+          question_id: peoi4op1vjaws6c2dvigbahe        # AIRR service requested
+          options:
+            # "Zenith" is offered in the survey but has no offering yet, so
+            # choosing it is skipped (and logged) until an option is added.
+            - label: Isambard-AI
+              offering_slug: isambard-a-1
+              attribute_map:
+                u3bpmiiaumhqqhjk9yrdet6u: allocation   # GPU hours requested
+      - key: team_details
+        label: Team details
+        survey_id: cmt4qbc2g0005qe0143hnuqqs
+      - key: compliance
+        label: Compliance
+        survey_id: cmt4rw5cp0008qe01g0dvhrbb
+      - key: assessment
+        label: Assessment
+        survey_id: cmt4qby6u0006qe01dd81j1ew
+        reviewer_visible: true
+  - key: airr-ra
+    name: AIRR Rapid Access application
+    description: Project details, team, compliance and the Rapid Access assessment.
+    steps:
+      - key: project_details
+        label: Project details
+        survey_id: cmt4q1c400004qe01zta9vmnm
+        reviewer_visible: true
+        field_map:
+          fjxcnvv5q1ny48q2wazmq2eb: name               # Project title
+          drihiecfnvzubpjfjc39ai6p: project_summary    # Project summary
+        resources:
+          question_id: peoi4op1vjaws6c2dvigbahe        # AIRR service requested
+          options:
+            # "Zenith" is offered in the survey but has no offering yet, so
+            # choosing it is skipped (and logged) until an option is added.
+            - label: Isambard-AI
+              offering_slug: isambard-a-1
+              attribute_map:
+                u3bpmiiaumhqqhjk9yrdet6u: allocation   # GPU hours requested
+      - key: team_details
+        label: Team details
+        survey_id: cmt4qbc2g0005qe0143hnuqqs
+      - key: compliance
+        label: Compliance
+        survey_id: cmt4rw5cp0008qe01g0dvhrbb
+      - key: assessment
+        label: Assessment
+        survey_id: cmt4qc2ey0007qe011sx23uti
+        reviewer_visible: true

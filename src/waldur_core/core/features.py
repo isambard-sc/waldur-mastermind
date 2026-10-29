@@ -432,6 +432,9 @@ class ProposalSection(FeatureSection):
     auto_assign_award_id = Feature(
         "Give each new proposal an award ID (for example 0261-4064-4676-1) as its slug, and carry it onto the project created when the proposal is accepted. Only takes effect together with application_portal_only, which stops the OpenPortal shortname from overwriting the project slug."
     )
+    formbricks_forms = Feature(
+        "Let calls take applications through Formbricks surveys (fork-only). Shows the Formbricks settings, form flows and each call's flow choice; applying also needs the Formbricks connection configured and enabled."
+    )
 
 
 class ResellerSection(FeatureSection):

@@ -211,6 +211,8 @@ class EncryptedFieldDiscoveryTest(SimpleTestCase):
                 "matrix_chat.MatrixBotIdentity.pickle_key",
                 "matrix_chat.MatrixHistoryExport.data_key",
                 "matrix_chat.MatrixUserProfile.recovery_key",
+                "proposal_forms.FormbricksConnection.api_key",
+                "proposal_forms.FormbricksConnection.webhook_secret",
                 "structure.ServiceSettings.password",
                 "structure.ServiceSettings.token",
             },

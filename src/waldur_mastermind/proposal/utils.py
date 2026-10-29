@@ -23,6 +23,7 @@ from waldur_core.permissions.enums import RoleEnum
 from waldur_core.permissions.utils import get_users
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.permissions import _get_customer
+from waldur_mastermind.common.serializers import strip_hidden_options
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import permissions as marketplace_permissions
 from waldur_mastermind.marketplace import utils as marketplace_utils
@@ -521,6 +522,24 @@ def _purchase_order_source(
     return requested
 
 
+def _resource_options_from(
+    offering: marketplace_models.Offering, attributes: dict | None
+) -> dict:
+    """The resource's options, as an order for the same attributes sets them.
+
+    The values of the offering's resource options are read from the awarded
+    attributes -- the Formbricks GPUh amount is one -- so that the provider
+    reads the awarded amount from ``Resource.options`` exactly as it does for
+    a resource ordered through the marketplace (see OrderCreateSerializer).
+    """
+    resource_options = (offering.resource_options or {}).get("options") or {}
+    attributes = attributes or {}
+    return strip_hidden_options(
+        resource_options,
+        {key: attributes[key] for key in resource_options if key in attributes},
+    )
+
+
 def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
     # Idempotency guard: a proposal is provisioned exactly once. Without this a
     # second allocation (e.g. re-driving the workflow, or a stale caller) would
@@ -661,6 +680,7 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
             # afterwards would price and bill a six-month grant as one month.
             # The marketplace order path sets it in the same order and says so.
             resource.end_date = _requested_end_date(awarded, project, today)
+            resource.options = _resource_options_from(offering, awarded.attributes)
             resource.init_cost()
             resource.save()
 

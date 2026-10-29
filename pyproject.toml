@@ -132,6 +132,7 @@ waldur_notifications = "waldur_mastermind.notifications.extension:NotificationsE
 waldur_policy = "waldur_mastermind.policy.extension:PolicyExtension"
 waldur_proposal = "waldur_mastermind.proposal.extension:ProposalExtension"
 waldur_proposal_archive = "waldur_mastermind.proposal_archive.extension:ProposalArchiveExtension"
+waldur_proposal_forms = "waldur_mastermind.proposal_forms.extension:ProposalFormsExtension"
 waldur_rancher = "waldur_rancher.extension:RancherExtension"
 waldur_support = "waldur_mastermind.support.extension:SupportExtension"
 waldur_vmware = "waldur_vmware.extension:VMwareExtension"
