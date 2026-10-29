@@ -625,8 +625,18 @@ class WebhookTest(FormsTestBase):
         # an empty key on its own too (test_client.SignatureTest).
         models.FormbricksConnection.objects.filter(pk=1).update(webhook_secret="")
         response = self.post(self.payload(), secret="")
-        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertFalse(models.FormStepResponse.objects.exists())
+
+    def test_formbricks_test_ping_acknowledged(self):
+        # Formbricks signs its test with a secret Waldur cannot know yet, and
+        # fails the test on any 5xx, 404 or 405.
+        for configured in (True, False):
+            models.FormbricksConnection.objects.filter(pk=1).update(enabled=configured)
+            response = self.post(
+                {"event": "testEndpoint"}, secret="whsec_" + "QUJD" * 8
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     def test_answers_without_valid_token_refused(self):
         # Anyone can fill in a survey: a hidden proposal_uuid typed into the
@@ -759,7 +769,7 @@ class SwitchedOffTest(FormsTestBase):
             HTTP_WEBHOOK_SIGNATURE="v1,"
             + client.sign(SECRET, "msg_1", timestamp, body),
         )
-        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertFalse(models.FormStepResponse.objects.exists())
 
     def test_staff_can_set_up_before_switching_on(self):
