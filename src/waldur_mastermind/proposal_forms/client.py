@@ -172,18 +172,37 @@ def prefill_from_answers(answers: dict) -> dict:
 # --- Management API -------------------------------------------------------
 
 
-def _get(path, conn=None):
+def _request(method, path, conn=None, json=None, params=None):
     conn = conn or connection()
     try:
-        response = requests.get(
+        response = requests.request(
+            method,
             f"{conn.management_base_url}{path}",
             headers={"x-api-key": conn.api_key},
+            json=json,
+            params=params,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         return response.json()
+    except requests.HTTPError as e:
+        status = e.response.status_code
+        if status in (401, 403):
+            raise FormbricksError(
+                f"Formbricks refused {method} {path} ({status}): the API key cannot "
+                "reach it. Give the key access to the survey's project and "
+                "environment, and make the survey visible to the whole workspace "
+                "(Formbricks hides restricted surveys from API keys)."
+            ) from e
+        if status == 404:
+            raise FormbricksError(f"Formbricks has no {path} (404).") from e
+        raise FormbricksError(f"Formbricks {method} {path} failed: {e}") from e
     except (requests.RequestException, ValueError) as e:
-        raise FormbricksError(f"Formbricks request to {path} failed: {e}") from e
+        raise FormbricksError(f"Formbricks {method} {path} failed: {e}") from e
+
+
+def _get(path, conn=None, params=None):
+    return _request("GET", path, conn, params=params)
 
 
 def check_connection(conn) -> dict:
@@ -240,21 +259,66 @@ def get_survey(survey_id) -> dict:
     return survey_labels(get_survey_definition(survey_id))
 
 
-# Hidden fields a survey must declare for the flow to work: the webhook
-# trusts nothing else, and the ending's redirect needs them too.
-REQUIRED_HIDDEN_FIELDS = ("proposal_uuid", "redirect_token")
+def _choice_labels(element) -> list:
+    return [
+        _headline_text(choice.get("label")) for choice in element.get("choices") or []
+    ]
 
 
-def redirect_ending_url(step_key, api_url) -> str:
-    """The "Redirect to URL" each survey's ending should use, so that the
-    applicant is taken on to the next step. Formbricks fills in the
-    #recall:...# parts from the hidden fields."""
-    recall = "#recall:{0}/fallback:#"
-    return (
-        f"{api_url}?step={step_key}"
-        f"&proposal_uuid={recall.format('proposal_uuid')}"
-        f"&redirect_token={recall.format('redirect_token')}"
-    )
+def survey_questions(survey: dict) -> list:
+    """A survey's questions in the order asked, for showing in Waldur:
+    [{id, type, label, choices}]."""
+    questions = []
+    for block in survey.get("blocks") or []:
+        for element in block.get("elements") or []:
+            questions.append(
+                {
+                    "id": element["id"],
+                    "type": element.get("type", ""),
+                    "label": _headline_text(element.get("headline")),
+                    "choices": _choice_labels(element),
+                }
+            )
+    if not questions:
+        # Older Formbricks versions: a flat list of questions.
+        for question in survey.get("questions") or []:
+            questions.append(
+                {
+                    "id": question["id"],
+                    "type": question.get("type", ""),
+                    "label": _headline_text(question.get("headline")),
+                    "choices": _choice_labels(question),
+                }
+            )
+    return questions
+
+
+SURVEY_PAGE_SIZE = 100
+
+
+def list_surveys(conn=None) -> list:
+    """Every survey the API key can see, across its projects and
+    environments."""
+    surveys = []
+    offset = 0
+    while True:
+        page = _get(
+            "/api/v1/management/surveys",
+            conn,
+            params={"limit": SURVEY_PAGE_SIZE, "offset": offset},
+        )["data"]
+        surveys.extend(page)
+        if len(page) < SURVEY_PAGE_SIZE:
+            return surveys
+        offset += SURVEY_PAGE_SIZE
+
+
+def update_survey(survey_id, changes: dict) -> dict:
+    """Change only the given survey settings: Formbricks merges an update
+    into the stored survey, so anything not named is left as it is."""
+    return _request("PUT", f"/api/v1/management/surveys/{survey_id}", json=changes)[
+        "data"
+    ]
 
 
 # --- webhook signatures ---------------------------------------------------

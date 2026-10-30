@@ -209,20 +209,50 @@ class FormFlowSerializer(serializers.HyperlinkedModelSerializer):
         return attrs
 
 
+class SurveyQuestionSerializer(serializers.Serializer):
+    id = serializers.CharField()
+    type = serializers.CharField()
+    label = serializers.CharField(allow_blank=True)
+    choices = serializers.ListField(child=serializers.CharField(allow_blank=True))
+
+
 class FormFlowCheckStepSerializer(serializers.Serializer):
     key = serializers.CharField()
     survey_id = serializers.CharField()
-    ok = serializers.BooleanField()
-    problems = serializers.ListField(child=serializers.CharField())
-    ending_url = serializers.CharField(
-        help_text="What to set as the survey ending's 'Redirect to URL', so "
-        "the applicant is taken on to the next step."
+    survey_name = serializers.CharField(allow_blank=True)
+    in_sync = serializers.BooleanField(
+        help_text="Nothing to change and nothing wrong: ready for applicants."
     )
+    changes = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="What Sync would change in the survey (after a sync: empty).",
+    )
+    problems = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="What Waldur cannot fix itself, to be fixed in Formbricks.",
+    )
+    questions = SurveyQuestionSerializer(many=True)
 
 
 class FormFlowCheckSerializer(serializers.Serializer):
-    ok = serializers.BooleanField()
+    in_sync = serializers.BooleanField()
     steps = FormFlowCheckStepSerializer(many=True)
+
+
+class FormbricksSurveySerializer(serializers.Serializer):
+    """A survey in Formbricks, for choosing a flow's steps."""
+
+    id = serializers.CharField()
+    name = serializers.CharField(allow_blank=True)
+    type = serializers.CharField(allow_blank=True)
+    status = serializers.CharField(allow_blank=True)
+    environment_id = serializers.CharField(allow_blank=True)
+    question_count = serializers.IntegerField()
+    updated_at = serializers.CharField(allow_blank=True)
+    used_by_flows = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="Keys of the flows that use this survey as a step.",
+    )
 
 
 # --- a call's flow ------------------------------------------------------------
