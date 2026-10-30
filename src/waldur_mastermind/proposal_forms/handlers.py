@@ -8,13 +8,12 @@ from rest_framework import exceptions
 
 from waldur_core.core.models import is_feature_enabled
 from waldur_core.core.signals import pre_serializer_fields
-from waldur_core.structure import models as structure_models
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal import serializers as proposal_serializers
 from waldur_mastermind.proposal import views as proposal_views
 from waldur_mastermind.proposal.enums import ProposalStates
 
-from . import client, responses, serializers, tasks
+from . import client, models, responses, serializers, tasks
 
 # pre_serializer_fields is sent for the exact serializer class, so a subclass
 # needs its own connection.
@@ -75,22 +74,23 @@ pre_delete.connect(
 )
 
 
-def delete_project_responses(sender, instance, **kwargs):
-    """A project is deleted (projects are soft-deleted, which sends this
-    signal but cascades nothing): its end-of-project answers go, in Waldur
-    and, once the deletion has committed, in Formbricks."""
-    links = responses.subject_links(instance)
-    answers = responses.subject_responses(instance)
-    if not links.exists() and not answers.exists():
+def delete_end_of_project_response(sender, instance, **kwargs):
+    """A project's end-of-project answers outlive the project's removal:
+    Waldur removes an expired project (a soft delete, which cascades nothing)
+    once its grace period ends, and the feedback is the point of the forms.
+    They go only when the project row itself is deleted, which cascades here:
+    then its response goes in Formbricks too."""
+    if instance.project_id is None or not instance.response_id:
         return
-    responses.queue_subject_deletions(instance, f"project {instance.uuid.hex} deleted")
-    answers.delete()
-    links.delete()
+    responses.queue_deletion(
+        instance.response_id, f"project {instance.project_id} deleted"
+    )
     transaction.on_commit(tasks.process_formbricks_deletions.delay)
 
 
-pre_delete.connect(
-    delete_project_responses,
-    sender=structure_models.Project,
-    dispatch_uid="proposal_forms.delete_project_responses",
-)
+for model in (models.FormLink, models.FormStepResponse):
+    pre_delete.connect(
+        delete_end_of_project_response,
+        sender=model,
+        dispatch_uid=f"proposal_forms.delete_end_of_project_{model.__name__}",
+    )

@@ -477,7 +477,8 @@ class ProjectFormViewSet(viewsets.GenericViewSet):
     it, staff and support."""
 
     lookup_field = "uuid"
-    queryset = structure_models.Project.available_objects.all()
+    # Removed projects too: their answers outlive them (see handlers).
+    queryset = structure_models.Project.objects.all()
     permission_classes = (rf_permissions.IsAuthenticated,)
     serializer_class = serializers.ProjectFormSerializer
 
@@ -493,6 +494,10 @@ class ProjectFormViewSet(viewsets.GenericViewSet):
         proposal = responses.project_proposal(project)
         if not form_permissions.can_read_closing(self.request.user, project, proposal):
             raise exceptions.NotFound()
+        if project.is_removed and self.action != "retrieve":
+            raise exceptions.ValidationError(
+                _("The project has ended, so its forms are closed.")
+            )
         flow = responses.closing_flow(project)
         if flow is None:
             raise exceptions.ValidationError(

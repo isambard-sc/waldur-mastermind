@@ -302,14 +302,44 @@ class RoutingTest(ClosingFormsBase):
 
 
 class DeletionTest(ClosingFormsBase):
-    def test_deleting_the_project_deletes_its_answers(self):
+    def answer(self):
         link = self.issue()
         responses.apply_response(record(link))
+
+    def test_answers_outlive_the_projects_removal_at_its_end(self):
+        # What Waldur does to an expired project once its grace period ends.
+        self.answer()
+        self.project.delete()
+        self.assertTrue(models.FormStepResponse.objects.exists())
+        self.assertFalse(models.FormbricksDeletion.objects.exists())
+
+        for user in (self.call_manager, self.staff, self.support):
+            with self.subTest(user=user):
+                response = self.get(user)
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertFalse(response.data["can_fill_in"])
+                self.assertEqual(len(response.data["responses"]), 1)
+        # The PI no longer has the project.
+        self.assertEqual(self.get(self.pi).status_code, status.HTTP_404_NOT_FOUND)
+        # And the forms are closed.
+        self.client.force_authenticate(self.staff)
+        response = self.client.post(self.url("link"), {"step": "feedback"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_deleting_the_project_row_deletes_them_everywhere(self):
+        # A project no proposal created, so nothing protects its row.
+        default = models.SiteClosingFormFlow.get()
+        default.flow = self.closing
+        default.save()
+        proposal_models.Proposal.objects.filter(pk=self.proposal.pk).update(
+            project=None
+        )
+        self.answer()
         with (
             mock.patch.object(tasks.process_formbricks_deletions, "delay"),
             self.captureOnCommitCallbacks(execute=True),
         ):
-            self.project.delete()
+            self.project.delete(soft=False)
         self.assertFalse(models.FormStepResponse.objects.exists())
         self.assertFalse(models.FormLink.objects.exists())
         self.assertTrue(
