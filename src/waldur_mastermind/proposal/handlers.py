@@ -8,6 +8,7 @@ from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 from waldur_core.checklist import models as checklist_models
+from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.enums import RoleEnum
 from waldur_core.permissions.models import Role, UserRole
 from waldur_core.permissions.utils import RoleChange, RoleEventDetails
@@ -416,3 +417,38 @@ def withdraw_reviews_of_decided_proposal(sender, instance, created=False, **kwar
     utils.withdraw_pending_reviews(
         instance, f"the proposal was {instance.get_state_display().lower()}."
     )
+
+
+def hand_over_single_proposal_manager(sender, instance, current_user=None, **kwargs):
+    """On calls with one manager per proposal, granting the manager role
+    hands the proposal over: the previous manager stays on the team as a
+    proposal administrator, and the new manager becomes its owner."""
+    proposal = instance.scope
+    if not isinstance(proposal, models.Proposal) or not _is_manager_role(instance.role):
+        return
+    if not proposal.round.call.single_proposal_manager:
+        return
+    new_manager = instance.user
+    previous = UserRole.objects.filter(
+        scope=proposal, is_active=True, role__name=RoleEnum.PROPOSAL_MANAGER
+    ).exclude(user=new_manager)
+    admin_role = Role.objects.filter(name=RoleEnum.PROPOSAL_ADMIN).first()
+    reason = f"Proposal management handed over to {new_manager.full_name}."
+    for user_role in previous:
+        user_role.revoke(current_user, reason=reason)
+        if (
+            admin_role
+            and not UserRole.objects.filter(
+                scope=proposal, user=user_role.user, role=admin_role, is_active=True
+            ).exists()
+        ):
+            permissions_utils.add_user_or_skip(
+                proposal,
+                user_role.user,
+                admin_role,
+                created_by=current_user,
+                reason=reason,
+            )
+    if proposal.created_by_id != new_manager.id:
+        proposal.created_by = new_manager
+        proposal.save(update_fields=["created_by"])

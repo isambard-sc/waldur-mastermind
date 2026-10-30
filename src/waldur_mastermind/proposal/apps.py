@@ -50,6 +50,10 @@ class ProposalConfig(AppConfig):
                         f"{related_model.__name__}"
                     ),
                 )
+        permission_signals.role_granted.connect(
+            handlers.hand_over_single_proposal_manager,
+            dispatch_uid="waldur_mastermind.proposal.hand_over_single_proposal_manager",
+        )
         signals.post_save.connect(
             handlers.withdraw_reviews_of_decided_proposal,
             sender=models.Proposal,

@@ -298,6 +298,16 @@ class Call(
         ),
     )
 
+    single_proposal_manager = models.BooleanField(
+        default=False,
+        help_text=(
+            "Whether each proposal has exactly one proposal manager, its "
+            "owner. Granting the manager role then hands the proposal over: "
+            "the previous manager becomes a proposal administrator and the "
+            "new one its owner (created_by). Off: a proposal may have several "
+            "managers."
+        ),
+    )
     copy_summary_to_project = models.BooleanField(
         default=False,
         help_text=(
