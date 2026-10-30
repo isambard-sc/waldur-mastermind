@@ -1534,6 +1534,77 @@ CONSTANCE_CONFIG = {
         "placeholders. Overridden by the active SystemPrompt record when set.",
         "text_field",
     ),
+    # AI reporting settings (waldur_mastermind.ai_reporting - a separate feature from
+    # the AI Assistant above: a staff/support tool that asks a question and gets a
+    # report, not a conversational assistant. Harness lives in a separate repo,
+    # waldur-ai-harness; see AI_REPORTING_HARNESS_URL for where it's reached.)
+    "AI_REPORTING_ENABLED": (
+        True,
+        "Enable the AI reporting feature and calls to the harness service.",
+    ),
+    "AI_REPORTING_NAME": (
+        "Isambard Reporting Assistant",
+        "Display name for the AI reporting assistant persona.",
+    ),
+    "AI_REPORTING_MODEL": (
+        "",
+        "Bedrock model id override for the AI reporting harness, e.g. "
+        "'anthropic.claude-opus-5-5'. Leave empty to use the harness's own "
+        "configured default instead.",
+    ),
+    "AI_REPORTING_CUSTOM_INSTRUCTIONS": (
+        "",
+        "Additional instructions injected into the AI reporting system prompt. "
+        "Use this for organisation-specific context, terminology, or "
+        "behavioural guidelines.",
+        "text_field",
+    ),
+    "AI_REPORTING_HISTORY_LIMIT": (
+        -1,
+        "Maximum number of past messages kept in an AI reporting conversation's "
+        "context window. -1 means unlimited.",
+    ),
+    "AI_REPORTING_MAX_TURNS": (
+        -1,
+        "Maximum tool-use turns the harness may take per question before it "
+        "must give a final answer. -1 means use the harness's own default.",
+    ),
+    "AI_REPORTING_REQUEST_TIMEOUT_SECONDS": (
+        600,
+        "Timeout in seconds for a single call from Waldur to the AI reporting harness.",
+    ),
+    "AI_REPORTING_TOKEN_LIMIT_DAILY": (
+        -1,
+        "Per-user daily token cap for AI reporting. -1 means unlimited.",
+    ),
+    "AI_REPORTING_TOKEN_LIMIT_WEEKLY": (
+        -1,
+        "Per-user weekly token cap for AI reporting. -1 means unlimited.",
+    ),
+    "AI_REPORTING_TOKEN_LIMIT_MONTHLY": (
+        -1,
+        "Per-user monthly token cap for AI reporting. -1 means unlimited.",
+    ),
+    "AI_REPORTING_GLOBAL_DAILY_TOKEN_BUDGET": (
+        5000000,
+        "Site-wide daily token cap across all AI reporting traffic. -1 means unlimited.",
+    ),
+    "AI_REPORTING_GLOBAL_REQUESTS_PER_MINUTE": (
+        60,
+        "Site-wide burst cap across all AI reporting traffic.",
+    ),
+    "AI_REPORTING_MESSAGE_RETENTION_DAYS": (
+        90,
+        "Number of days to retain AI reporting questions/answers before "
+        "automatic deletion. Set to -1 to disable automatic cleanup.",
+    ),
+    "AI_REPORTING_FILE_RETENTION_DAYS": (
+        21,
+        "Number of days to retain AI reporting generated files (charts, PDFs, "
+        "CSVs) before automatic deletion - shorter than the message retention "
+        "above since file bytes are the more expensive part to keep. Set to "
+        "-1 to disable automatic cleanup.",
+    ),
     # Anonymous AI assistant settings
     "ANONYMOUS_CHAT_USER_SLUG_SALT": (
         "",
@@ -2314,6 +2385,22 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ANONYMOUS_CHAT_REVIEW_ENABLED",
         "ANONYMOUS_CHAT_REVIEW_DAILY_TOKEN_BUDGET",
         "ANONYMOUS_CHAT_ARTIFACT_RETENTION_DAYS",
+    ),
+    "AI reporting settings": (
+        "AI_REPORTING_NAME",
+        "AI_REPORTING_ENABLED",
+        "AI_REPORTING_MODEL",
+        "AI_REPORTING_CUSTOM_INSTRUCTIONS",
+        "AI_REPORTING_HISTORY_LIMIT",
+        "AI_REPORTING_MAX_TURNS",
+        "AI_REPORTING_REQUEST_TIMEOUT_SECONDS",
+        "AI_REPORTING_TOKEN_LIMIT_DAILY",
+        "AI_REPORTING_TOKEN_LIMIT_WEEKLY",
+        "AI_REPORTING_TOKEN_LIMIT_MONTHLY",
+        "AI_REPORTING_GLOBAL_DAILY_TOKEN_BUDGET",
+        "AI_REPORTING_GLOBAL_REQUESTS_PER_MINUTE",
+        "AI_REPORTING_MESSAGE_RETENTION_DAYS",
+        "AI_REPORTING_FILE_RETENTION_DAYS",
     ),
     "Software catalog general": (
         "SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES",
