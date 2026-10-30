@@ -1,9 +1,11 @@
 from django.db import transaction
+from django.db.models import Q
 from django.urls import reverse
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from waldur_core.core.models import is_feature_enabled
+from waldur_core.structure import models as structure_models
 from waldur_mastermind.proposal import models as proposal_models
 
 from . import client, flows, models
@@ -126,6 +128,7 @@ class FormFlowSerializer(serializers.HyperlinkedModelSerializer):
             "key",
             "name",
             "description",
+            "purpose",
             "steps",
             "calls_count",
             "created",
@@ -137,7 +140,10 @@ class FormFlowSerializer(serializers.HyperlinkedModelSerializer):
         }
 
     def get_calls_count(self, flow) -> int:
-        return flow.call_links.count()
+        """How many calls use the flow, for applications or at a project's end."""
+        return models.CallFormFlow.objects.filter(
+            Q(flow=flow) | Q(closing_flow=flow)
+        ).count()
 
     def validate_steps(self, value):
         try:
@@ -147,6 +153,20 @@ class FormFlowSerializer(serializers.HyperlinkedModelSerializer):
 
     def validate(self, attrs):
         flow = self.instance
+        if (
+            flow is not None
+            and "purpose" in attrs
+            and attrs["purpose"] != flow.purpose
+            and (
+                models.CallFormFlow.objects.filter(
+                    Q(flow=flow) | Q(closing_flow=flow)
+                ).exists()
+                or models.SiteClosingFormFlow.objects.filter(flow=flow).exists()
+            )
+        ):
+            raise serializers.ValidationError(
+                {"purpose": "The flow is used by a call; its purpose cannot change."}
+            )
         steps = attrs.get("steps")
         if flow is None or steps is None:
             return attrs
@@ -155,7 +175,12 @@ class FormFlowSerializer(serializers.HyperlinkedModelSerializer):
         kept = {step["key"] for step in steps}
         answered = set(
             models.FormStepResponse.objects.filter(
-                proposal__round__call__form_flow_link__flow=flow
+                Q(proposal__round__call__form_flow_link__flow=flow)
+                | Q(
+                    project__in=proposal_models.Proposal.objects.filter(
+                        round__call__form_flow_link__closing_flow=flow
+                    ).values("project")
+                )
             )
             .exclude(step_key__in=kept)
             .values_list("step_key", flat=True)
@@ -163,9 +188,9 @@ class FormFlowSerializer(serializers.HyperlinkedModelSerializer):
         if answered:
             raise serializers.ValidationError(
                 {
-                    "steps": "Applicants have answered step(s) "
-                    f"{', '.join(sorted(answered))}; they cannot be removed or "
-                    "renamed."
+                    "steps": "Step(s) "
+                    f"{', '.join(sorted(answered))} have been answered; they "
+                    "cannot be removed or renamed."
                 }
             )
         return attrs
@@ -221,14 +246,19 @@ class FormbricksSurveySerializer(serializers.Serializer):
 
 
 class CallFormFlowSerializer(serializers.Serializer):
-    """Which flow a call's applicants fill in; null for Waldur's own form."""
+    """Which flows a call uses: the one its applicants fill in (null:
+    Waldur's own form alone), and the one the PIs of the projects it grants
+    fill in when their project ends (null: none)."""
 
     call_uuid = serializers.UUIDField(source="uuid", read_only=True)
     flow = serializers.SlugRelatedField(
         slug_field="uuid",
-        queryset=models.FormFlow.objects.all(),
+        queryset=models.FormFlow.objects.filter(
+            purpose=models.FormFlow.Purposes.APPLICATION
+        ),
         allow_null=True,
         source="form_flow",
+        help_text="An application flow.",
     )
     flow_key = serializers.CharField(
         source="form_flow.key", read_only=True, allow_null=True
@@ -239,18 +269,53 @@ class CallFormFlowSerializer(serializers.Serializer):
     locked = serializers.SerializerMethodField(
         help_text="True once the call has proposals: its flow can no longer change."
     )
+    closing_flow = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.FormFlow.objects.filter(
+            purpose=models.FormFlow.Purposes.CLOSING
+        ),
+        allow_null=True,
+        required=False,
+        source="closing_form_flow",
+        help_text="An end-of-project flow.",
+    )
+    closing_flow_key = serializers.CharField(
+        source="closing_form_flow.key", read_only=True, allow_null=True
+    )
+    closing_flow_name = serializers.CharField(
+        source="closing_form_flow.name", read_only=True, allow_null=True
+    )
+    closing_locked = serializers.SerializerMethodField(
+        help_text="True once a project of the call has started its end-of-project "
+        "forms: its end-of-project flow can no longer change."
+    )
+    closing_forms_open_days_before_end = serializers.IntegerField(
+        min_value=0,
+        required=False,
+        help_text="How many days before a project's end date its end-of-project "
+        "forms open. 0: on the end date. They stay open afterwards.",
+    )
 
     def get_locked(self, call) -> bool:
         return call_has_proposals(call)
 
+    def get_closing_locked(self, call) -> bool:
+        return call_has_closing_forms(call)
+
     def validate(self, attrs):
         call = self.instance
-        flow = attrs.get("form_flow")
+        flow = attrs.get("form_flow", call.form_flow)
         if flow != call.form_flow and call_has_proposals(call):
             raise serializers.ValidationError(
                 "The call already has proposals, so its form can no longer change."
             )
-        if flow is not None and not client.is_available():
+        closing = attrs.get("closing_form_flow", call.closing_form_flow)
+        if closing != call.closing_form_flow and call_has_closing_forms(call):
+            raise serializers.ValidationError(
+                "Projects of the call have started their end-of-project forms, "
+                "so its end-of-project flow can no longer change."
+            )
+        if (flow is not None or closing is not None) and not client.is_available():
             raise serializers.ValidationError(
                 {
                     "flow": "Formbricks forms are not enabled on this site, so a "
@@ -260,15 +325,27 @@ class CallFormFlowSerializer(serializers.Serializer):
         return attrs
 
     def update(self, call, validated_data):
-        flow = validated_data["form_flow"]
+        flow = validated_data.get("form_flow", call.form_flow)
+        closing = validated_data.get("closing_form_flow", call.closing_form_flow)
+        days = validated_data.get(
+            "closing_forms_open_days_before_end",
+            call.closing_forms_open_days_before_end,
+        )
         with transaction.atomic():
-            if flow is None:
+            if flow is None and closing is None:
                 models.CallFormFlow.objects.filter(call=call).delete()
             else:
                 models.CallFormFlow.objects.update_or_create(
-                    call=call, defaults={"flow": flow}
+                    call=call,
+                    defaults={
+                        "flow": flow,
+                        "closing_flow": closing,
+                        "closing_forms_open_days_before_end": days,
+                    },
                 )
         call.form_flow = flow
+        call.closing_form_flow = closing
+        call.closing_forms_open_days_before_end = days
         return call
 
 
@@ -281,6 +358,21 @@ def get_call_form_flow(call):
         return call.form_flow_link.flow
     except models.CallFormFlow.DoesNotExist:
         return None
+
+
+def get_call_closing_flow(call):
+    try:
+        return call.form_flow_link.closing_flow
+    except models.CallFormFlow.DoesNotExist:
+        return None
+
+
+def call_has_closing_forms(call) -> bool:
+    return models.FormLink.objects.filter(
+        project__in=proposal_models.Proposal.objects.filter(round__call=call).values(
+            "project"
+        )
+    ).exists()
 
 
 # --- applying -----------------------------------------------------------------
@@ -355,6 +447,82 @@ class ProposalFormFetchResultSerializer(ProposalFormSerializer):
     )
 
 
+# --- end-of-project forms ----------------------------------------------------
+
+
+class SiteClosingFormFlowSerializer(serializers.ModelSerializer):
+    """The end-of-project flow for projects whose call has none, including
+    projects no call granted."""
+
+    flow = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.FormFlow.objects.filter(
+            purpose=models.FormFlow.Purposes.CLOSING
+        ),
+        allow_null=True,
+        required=False,
+        help_text="An end-of-project flow; null for none.",
+    )
+    flow_key = serializers.CharField(source="flow.key", read_only=True, allow_null=True)
+    flow_name = serializers.CharField(
+        source="flow.name", read_only=True, allow_null=True
+    )
+    customers = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=structure_models.Customer.objects.all(),
+        many=True,
+        required=False,
+        help_text="Organisations whose projects use the flow; empty: every "
+        "organisation.",
+    )
+
+    class Meta:
+        model = models.SiteClosingFormFlow
+        fields = (
+            "flow",
+            "flow_key",
+            "flow_name",
+            "closing_forms_open_days_before_end",
+            "customers",
+        )
+
+
+class ProjectFormSerializer(serializers.Serializer):
+    """A project's end-of-project forms: which are answered, and the answers."""
+
+    project_uuid = serializers.UUIDField()
+    flow_key = serializers.CharField()
+    flow_name = serializers.CharField()
+    available = serializers.BooleanField(
+        help_text="Whether Formbricks forms are on for this site now."
+    )
+    opens_on = serializers.DateField(
+        allow_null=True,
+        help_text="The day the forms open; null if the project has no end date.",
+    )
+    is_open = serializers.BooleanField(
+        help_text="Whether the forms are open now (from opens_on, for as long "
+        "as the project exists)."
+    )
+    can_fill_in = serializers.BooleanField(
+        help_text="Whether the viewer may open and edit the forms now: the "
+        "project's PI or an owner of its organisation, while they are open, "
+        "with forms available."
+    )
+    steps = ProposalFormStepStatusSerializer(many=True)
+    missing = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="Labels of the forms still to answer.",
+    )
+    responses = FormStepResponseSerializer(many=True)
+
+
+class ProjectFormFetchResultSerializer(ProjectFormSerializer):
+    fetched = serializers.IntegerField(
+        help_text="How many responses this fetch brought in or updated."
+    )
+
+
 # --- fields added to upstream's call serializers ------------------------------
 
 
@@ -381,11 +549,30 @@ def _get_form_flow(serializer, call):
     return {"uuid": flow.uuid, "key": flow.key, "name": flow.name}
 
 
+@extend_schema_field(CallFormFlowSummarySerializer(allow_null=True))
+def _get_closing_form_flow(serializer, call):
+    context = serializer.context
+    if "formbricks_forms_on" not in context:
+        context["formbricks_forms_on"] = is_feature_enabled(client.FEATURE)
+    if not context["formbricks_forms_on"]:
+        return None
+    flow = get_call_closing_flow(call)
+    if flow is None:
+        return None
+    return {"uuid": flow.uuid, "key": flow.key, "name": flow.name}
+
+
 def add_form_flow_to_call(sender, fields, **kwargs):
     """Calls say whether they take applications through Formbricks, so the
-    frontend knows which form to start."""
+    frontend knows which form to start, and whether the projects they grant
+    have end-of-project forms."""
     fields["form_flow"] = serializers.SerializerMethodField(
         help_text="The Formbricks flow applicants fill in; null for Waldur's "
         "own proposal form."
     )
     setattr(sender, "get_form_flow", _get_form_flow)
+    fields["closing_form_flow"] = serializers.SerializerMethodField(
+        help_text="The Formbricks flow the PIs of the projects the call grants "
+        "fill in when their project ends; null for none."
+    )
+    setattr(sender, "get_closing_form_flow", _get_closing_form_flow)

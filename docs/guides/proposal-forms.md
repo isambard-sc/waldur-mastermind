@@ -149,3 +149,71 @@ so HomePort can fetch on the applicant's return.
 - Waldur deletes in Formbricks only responses whose ids it recorded from its
   own links (superseded by an edit, or of a deleted draft), and never
   surveys. Every survey change is logged.
+
+## End-of-project forms
+
+A flow's `purpose` is `application` (filled in for a proposal, as above) or
+`closing`: filled in by a project's PI when the project ends. The answers
+belong to the project, never to a proposal, so the two never mix.
+
+### Which projects get them
+
+1. A project created from a proposal uses the **closing flow of the call**
+   that granted it, if that call has one:
+   `PUT /api/proposal-form-calls/<call_uuid>/` with `closing_flow` and
+   `closing_forms_open_days_before_end`. The closing flow can change until a
+   project of the call has started its forms (`closing_locked`).
+2. Otherwise, it uses the **site's closing flow**, if the site has one and it
+   applies to the project's organisation: `PATCH /api/site-closing-form-flow/`
+   (staff) with `flow`, `closing_forms_open_days_before_end` and `customers`
+   (organisations; empty means every organisation). This covers projects no
+   call created, such as awards made before calls were used.
+
+A project with no end date never opens its forms.
+
+### When and who
+
+The forms open `closing_forms_open_days_before_end` days before the project's
+end date (0: on the day) and stay open for as long as the project exists, so
+answers can still be given or edited after the end.
+
+- **Fill in:** the project's PI (project managers) and owners of its
+  organisation, i.e. whoever holds `PROJECT.CREATE_PERMISSION` on the project
+  or its organisation. Staff too.
+- **Read:** those, plus the managers of the call that granted the project,
+  and staff and support. Not reviewers.
+
+The PIs are emailed once when the forms open
+(`proposal.closing_forms_open`, registered and enabled by migration). A
+project whose forms opened more than a week before the site started sending
+them is not emailed, so switching the feature on does not email the PI of
+every project that ended long ago.
+
+### API
+
+| Call | What |
+|------|------|
+| `GET /api/project-forms/<project_uuid>/` | State (`opens_on`, `is_open`, `can_fill_in`, steps, `missing`) and the answers; 400 if the project has no end-of-project forms |
+| `POST /api/project-forms/<project_uuid>/link/` `{step}` | A single-use link, once open |
+| `POST /api/project-forms/<project_uuid>/fetch/` | Bring the answers up to date |
+
+Links carry IDs only: `project_uuid`, and `proposal_uuid`, `call_uuid` and
+`round_uuid` when a call granted the project. The survey's endings return to
+`<HomePort>/projects/<uuid>/?form_survey=<survey id>`. Deleting the project
+deletes its answers, in Waldur and in Formbricks.
+
+### Setting up (the AIRR end-of-project survey)
+
+1. Create a flow with `purpose: closing` whose step is the survey
+   (`cms6adb6t0007uk01zr97jsxc` for AIRR).
+2. Check and sync it. Sync adds the ID hidden fields and points every ending
+   at the project page. The fields the HomePort-only version used
+   (`project_name`, `project_slug`, `user_name`, `user_email`,
+   `call_reference`) are no longer set by Waldur and are never shown as
+   answers; remove them from the survey in Formbricks when convenient.
+3. Choose it as the site's closing flow (for existing awards, perhaps
+   limited to the AIRR organisations), and/or as calls' closing flows.
+
+A survey cannot be a step of both an application flow and a closing flow,
+since its endings can return to only one kind of page: check reports it and
+sync leaves it alone. Use a copy of the survey instead.

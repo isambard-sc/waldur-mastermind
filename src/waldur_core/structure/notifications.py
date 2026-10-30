@@ -1101,6 +1101,13 @@ class ReviewRejectedContext(BaseModel):
     rejected_reviews: int = Field(description="Number of rejected/cancelled reviews.")
 
 
+class ClosingFormsOpenContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    project_name: str = Field(description="Name of the project.")
+    project_url: str = Field(description="A URL to the project's page.")
+    end_date: Any = Field(description="The project's end date.")
+
+
 class ReviewReturnedContext(BaseModel):
     site_name: str = Field(description="Name of the site from settings.")
     proposal_name: str = Field(description="Name of the proposal reviewed.")
@@ -1520,6 +1527,14 @@ class ProposalSection(NotificationSection):
         key="review_rejected",
         description="A notification to the call managers about a rejected review.",
         context_model=ReviewRejectedContext,
+    )
+    closing_forms_open = Notification(
+        key="closing_forms_open",
+        description=(
+            "Tells a project's PI that its end-of-project forms are open and "
+            "waiting to be filled in (Formbricks forms, fork-only)."
+        ),
+        context_model=ClosingFormsOpenContext,
     )
     review_returned = Notification(
         key="review_returned",

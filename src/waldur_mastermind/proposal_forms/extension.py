@@ -38,6 +38,11 @@ class ProposalFormsExtension(WaldurExtension):
                 "schedule": timedelta(minutes=15),
                 "args": (),
             },
+            "waldur-proposal-forms-notify-closing-forms-open": {
+                "task": "waldur_mastermind.proposal_forms.notify_closing_forms_open",
+                "schedule": timedelta(hours=6),
+                "args": (),
+            },
             "waldur-proposal-forms-process-formbricks-deletions": {
                 "task": "waldur_mastermind.proposal_forms.process_formbricks_deletions",
                 "schedule": timedelta(minutes=30),

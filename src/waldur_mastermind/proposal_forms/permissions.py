@@ -1,7 +1,8 @@
 from rest_framework import exceptions
 
+from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import ProposalRole
-from waldur_core.permissions.utils import has_user
+from waldur_core.permissions.utils import has_permission, has_user
 from waldur_mastermind.proposal import permissions as proposal_permissions
 from waldur_mastermind.proposal.enums import ProposalStates
 
@@ -40,3 +41,29 @@ def is_staff_or_support_for_reads(request, view, obj=None):
     if user.is_support and request.method in ("GET", "HEAD", "OPTIONS"):
         return
     raise exceptions.PermissionDenied()
+
+
+# --- end-of-project forms -------------------------------------------------------
+
+
+def can_fill_in_closing(user, project) -> bool:
+    """The project's PI (its managers) and the owners of its organisation:
+    those who may add people to the project. Staff too."""
+    if user is None or not user.is_authenticated or not user.is_active:
+        return False
+    permission = PermissionEnum.CREATE_PROJECT_PERMISSION
+    return has_permission(user, permission, project) or has_permission(
+        user, permission, project.customer
+    )
+
+
+def can_read_closing(user, project, proposal) -> bool:
+    """Those who fill them in, the managers of the call that granted the
+    project, staff and support. Not reviewers."""
+    if user.is_staff or user.is_support:
+        return True
+    if can_fill_in_closing(user, project):
+        return True
+    return proposal is not None and proposal_permissions.oversees_proposal_call(
+        user, proposal
+    )

@@ -409,12 +409,12 @@ class FetchTest(FormsResponseBase):
 
     def test_periodic_fetch_only_for_draft_proposals_with_open_links(self):
         self.issue()
-        with mock.patch.object(responses, "fetch_for_proposal", return_value={}) as f:
+        with mock.patch.object(responses, "fetch_for_subject", return_value={}) as f:
             tasks.fetch_open_form_responses()
         f.assert_called_once_with(self.proposal)
         self.proposal.state = ProposalStates.SUBMITTED
         self.proposal.save()
-        with mock.patch.object(responses, "fetch_for_proposal", return_value={}) as f:
+        with mock.patch.object(responses, "fetch_for_subject", return_value={}) as f:
             tasks.fetch_open_form_responses()
         f.assert_not_called()
 

@@ -7,6 +7,7 @@ from model_utils.models import TimeStampedModel
 
 from waldur_core.core import fields as core_fields
 from waldur_core.core import models as core_models
+from waldur_core.structure import models as structure_models
 from waldur_mastermind.proposal import models as proposal_models
 
 
@@ -90,7 +91,8 @@ class FormbricksConnection(TimeStampedModel):
 
 
 class FormFlow(core_models.UuidMixin, TimeStampedModel):
-    """A chain of Formbricks surveys an applicant fills in, step by step.
+    """A chain of Formbricks surveys filled in step by step: by applicants
+    for their proposal, or by a project's PI when the project ends.
 
     steps is a list of step definitions, checked when saved through the API
     (see flows.validate_steps): each step has a key, a label, the Formbricks
@@ -102,8 +104,28 @@ class FormFlow(core_models.UuidMixin, TimeStampedModel):
         unique=True,
         help_text=_("Identifier calls refer to the flow by, e.g. 'airr-gw'."),
     )
+
+    class Purposes:
+        APPLICATION = "application"  # filled in for a proposal, before submission
+        CLOSING = "closing"  # filled in for a project, when it ends
+
+        CHOICES = (
+            (APPLICATION, "Application"),
+            (CLOSING, "End of project"),
+        )
+
     name = models.CharField(max_length=200)
     description = models.TextField(blank=True)
+    purpose = models.CharField(
+        max_length=20,
+        choices=Purposes.CHOICES,
+        default=Purposes.APPLICATION,
+        help_text=_(
+            "What the flow is filled in for: a proposal (application) or a "
+            "project at its end (closing). Decides the surveys' hidden fields "
+            "and the page their endings return to."
+        ),
+    )
     steps = models.JSONField(default=list)
     survey_schemas = models.JSONField(
         default=dict,
@@ -122,8 +144,9 @@ class FormFlow(core_models.UuidMixin, TimeStampedModel):
 
 
 class CallFormFlow(TimeStampedModel):
-    """Which flow a call's applicants fill in. No row means the call uses
-    Waldur's own proposal form."""
+    """Which flows a call uses: the one its applicants fill in (none: Waldur's
+    own proposal form alone), and the one the PIs of the projects it grants
+    fill in when their project ends (none: no end-of-project forms)."""
 
     call = models.OneToOneField(
         proposal_models.Call,
@@ -131,15 +154,88 @@ class CallFormFlow(TimeStampedModel):
         related_name="form_flow_link",
     )
     flow = models.ForeignKey(
-        FormFlow, on_delete=models.PROTECT, related_name="call_links"
+        FormFlow,
+        on_delete=models.PROTECT,
+        related_name="call_links",
+        null=True,
+        blank=True,
+    )
+    closing_flow = models.ForeignKey(
+        FormFlow,
+        on_delete=models.PROTECT,
+        related_name="closing_call_links",
+        null=True,
+        blank=True,
+    )
+    closing_forms_open_days_before_end = models.PositiveIntegerField(
+        default=0,
+        help_text=_(
+            "How many days before a project's end date its end-of-project "
+            "forms open. 0: on the end date. They stay open afterwards."
+        ),
     )
 
     def __str__(self):
         return f"{self.call} -> {self.flow}"
 
 
+class SiteClosingFormFlow(TimeStampedModel):
+    """The end-of-project flow for projects whose call has none: those no
+    call granted (awards made before calls were used, or outside them) and
+    those of calls without one. A single row (see get()). It may be limited
+    to some organisations' projects; none listed means every organisation."""
+
+    flow = models.ForeignKey(
+        FormFlow,
+        on_delete=models.PROTECT,
+        related_name="+",
+        null=True,
+        blank=True,
+    )
+    closing_forms_open_days_before_end = models.PositiveIntegerField(
+        default=0,
+        help_text=_(
+            "How many days before a project's end date its end-of-project "
+            "forms open. 0: on the end date. They stay open afterwards."
+        ),
+    )
+    customers = models.ManyToManyField(
+        structure_models.Customer,
+        blank=True,
+        related_name="+",
+        help_text=_(
+            "The organisations whose projects use the flow; none: every organisation."
+        ),
+    )
+
+    @classmethod
+    def get(cls) -> "SiteClosingFormFlow":
+        default, _ = cls.objects.get_or_create(pk=1)
+        return default
+
+    def applies_to(self, project) -> bool:
+        if self.flow_id is None:
+            return False
+        if not self.customers.exists():
+            return True
+        return self.customers.filter(pk=project.customer_id).exists()
+
+
+class ClosingFormsNotice(TimeStampedModel):
+    """That a project's PI was told its end-of-project forms are open, so
+    they are told once."""
+
+    project = models.OneToOneField(
+        structure_models.Project,
+        on_delete=models.CASCADE,
+        related_name="closing_forms_notice",
+    )
+
+
 class FormLink(TimeStampedModel):
-    """A single-use survey link Waldur issued for one proposal's form.
+    """A single-use survey link Waldur issued for one form of a proposal (an
+    application form) or of a project (an end-of-project form): exactly one
+    of the two is set.
 
     Formbricks gives each link an id (suId) and records it on the response
     made through it; that id is how Waldur knows whose response it is.
@@ -163,10 +259,19 @@ class FormLink(TimeStampedModel):
         proposal_models.Proposal,
         on_delete=models.CASCADE,
         related_name="form_links",
+        null=True,
+        blank=True,
+    )
+    project = models.ForeignKey(
+        structure_models.Project,
+        on_delete=models.CASCADE,
+        related_name="closing_form_links",
+        null=True,
+        blank=True,
     )
     step_key = models.CharField(max_length=100)
     survey_id = models.CharField(max_length=100)
-    url = models.TextField(help_text=_("The link as handed to the applicant."))
+    url = models.TextField(help_text=_("The link as handed out."))
     issued_to = models.ForeignKey(
         core_models.User, on_delete=models.SET_NULL, null=True, related_name="+"
     )
@@ -175,8 +280,21 @@ class FormLink(TimeStampedModel):
     )
     response_id = models.CharField(max_length=100, blank=True)
 
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(proposal__isnull=False, project__isnull=True)
+                | models.Q(proposal__isnull=True, project__isnull=False),
+                name="proposal_forms_link_one_subject",
+            )
+        ]
+
+    @property
+    def subject(self):
+        return self.proposal or self.project
+
     def __str__(self):
-        return f"{self.proposal} / {self.step_key} / {self.single_use_id}"
+        return f"{self.subject} / {self.step_key} / {self.single_use_id}"
 
 
 class FormbricksDeletion(TimeStampedModel):
@@ -210,6 +328,15 @@ class FormStepResponse(core_models.UuidMixin, TimeStampedModel):
         proposal_models.Proposal,
         on_delete=models.CASCADE,
         related_name="form_step_responses",
+        null=True,
+        blank=True,
+    )
+    project = models.ForeignKey(
+        structure_models.Project,
+        on_delete=models.CASCADE,
+        related_name="closing_form_responses",
+        null=True,
+        blank=True,
     )
     step_key = models.CharField(max_length=100)
     survey_id = models.CharField(max_length=100)
@@ -224,7 +351,27 @@ class FormStepResponse(core_models.UuidMixin, TimeStampedModel):
     question_order = models.JSONField(default=list, blank=True)
 
     class Meta:
-        unique_together = ("proposal", "step_key")
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(proposal__isnull=False, project__isnull=True)
+                | models.Q(proposal__isnull=True, project__isnull=False),
+                name="proposal_forms_response_one_subject",
+            ),
+            models.UniqueConstraint(
+                fields=["proposal", "step_key"],
+                condition=models.Q(proposal__isnull=False),
+                name="proposal_forms_response_proposal_step",
+            ),
+            models.UniqueConstraint(
+                fields=["project", "step_key"],
+                condition=models.Q(project__isnull=False),
+                name="proposal_forms_response_project_step",
+            ),
+        ]
+
+    @property
+    def subject(self):
+        return self.proposal or self.project
 
     def __str__(self):
-        return f"{self.proposal} / {self.step_key}"
+        return f"{self.subject} / {self.step_key}"
