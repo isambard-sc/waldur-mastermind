@@ -298,6 +298,13 @@ class Call(
         ),
     )
 
+    copy_summary_to_project = models.BooleanField(
+        default=False,
+        help_text=(
+            "Whether the project created for an accepted proposal takes the "
+            "proposal's summary as its description."
+        ),
+    )
     minimum_number_of_documents = models.PositiveSmallIntegerField(
         default=0,
         help_text=(

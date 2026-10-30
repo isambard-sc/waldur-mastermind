@@ -2132,6 +2132,7 @@ class ProtectedCallSerializer(PublicCallSerializer):
             "reviewers_see_assigned_only",
             "one_request_per_offering",
             "minimum_number_of_documents",
+            "copy_summary_to_project",
             "undecided_at_round_completion",
         )
         view_name = "proposal-protected-call-detail"

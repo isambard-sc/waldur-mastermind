@@ -599,6 +599,12 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
     if award_ids.is_enabled() and award_ids.is_award_id(proposal.slug):
         project_fields["slug"] = proposal.slug
 
+    if proposal_round.call.copy_summary_to_project and proposal.project_summary:
+        description_field = structure_models.Project._meta.get_field("description")
+        project_fields["description"] = proposal.project_summary[
+            : description_field.max_length
+        ]
+
     project = structure_models.Project.objects.create(**project_fields)
     project = cast(structure_models.Project, project)
 
