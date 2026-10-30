@@ -7,8 +7,9 @@ For each survey a flow uses, Waldur needs:
 - the hidden field `proposal_uuid`, so staff browsing Formbricks can see
   whose response is whose (Waldur itself trusts only the link);
 - every ending redirecting back to the proposal in Waldur;
-- responses anonymised: Formbricks then keeps no page URL, browser or
-  country with them, which Waldur has no use for.
+- responses anonymised, on Formbricks versions that can: Formbricks then
+  keeps no page URL, browser or country with them, which Waldur has no use
+  for.
 
 plan() works out what is missing, without changing anything; apply() makes
 those changes. Formbricks merges an update into the stored survey, so only
@@ -119,7 +120,12 @@ def plan(survey: dict, ending_url: str) -> dict:
         else:
             notes.append("Add an ending that redirects back to the proposal in Waldur.")
 
-    if not survey.get("isAnonymizeResponsesEnabled"):
+    # Only on Formbricks versions that have the setting (it arrived after
+    # 4.9): an older one accepts the field and ignores it, so asking for it
+    # there would never be in sync.
+    if "isAnonymizeResponsesEnabled" in survey and not survey.get(
+        "isAnonymizeResponsesEnabled"
+    ):
         changes["isAnonymizeResponsesEnabled"] = True
         notes.append(
             "Anonymise responses (Formbricks stops keeping the page URL, browser "

@@ -84,6 +84,11 @@ class PlanTest(SimpleTestCase):
         self.assertEqual(ending["url"], URL)
         self.assertRegex(ending["id"], r"^c[a-z0-9]{23}$")
 
+    def test_formbricks_without_anonymising_is_not_asked_to(self):
+        survey = self.survey()
+        del survey["isAnonymizeResponsesEnabled"]
+        self.assertEqual(sync.plan(survey, URL)["changes"], {})
+
     def test_what_waldur_cannot_fix_is_reported(self):
         planned = sync.plan(self.survey(type="app", status="draft"), URL)
         self.assertEqual(len(planned["problems"]), 2)
