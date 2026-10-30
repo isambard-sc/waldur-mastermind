@@ -5,6 +5,7 @@ from rest_framework import status, test
 
 from waldur_core.permissions.fixtures import ProposalRole
 from waldur_core.structure.tests import factories as structure_factories
+from waldur_mastermind.proposal.enums import ProposalStates
 from waldur_mastermind.proposal.tests import factories, fixtures
 
 
@@ -31,6 +32,9 @@ class ReviewerRoleExpiryConcealmentTest(test.APITestCase):
         return any("expiration_time" in item for item in self._results(response))
 
     def test_reviewer_does_not_see_role_expiration(self):
+        # Call reviewers read submitted proposals, never drafts.
+        self.proposal.state = ProposalStates.SUBMITTED
+        self.proposal.save()
         self.client.force_authenticate(self.fixture.reviewer_1)
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)

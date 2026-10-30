@@ -2,6 +2,7 @@ from rest_framework import status, test
 
 from waldur_core.permissions.fixtures import CallRole
 from waldur_core.structure.tests import factories as structure_factories
+from waldur_mastermind.proposal.enums import ProposalStates
 from waldur_mastermind.proposal.tests import factories, fixtures
 
 
@@ -111,7 +112,10 @@ class ProposalListUsersPermissionTest(test.APITestCase):
     def test_call_reviewer_is_allowed(self):
         # Reviewers (and panel members) assigned to the call may view the
         # proposal team read-only, so the review interface renders and they can
-        # comment on the team section.
+        # comment on the team section. They read submitted proposals, never
+        # drafts.
+        self.proposal.state = ProposalStates.SUBMITTED
+        self.proposal.save()
         self.client.force_authenticate(self.fixture.reviewer_1)
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)

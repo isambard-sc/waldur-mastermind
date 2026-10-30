@@ -33,6 +33,9 @@ SVG_WITH_SCRIPT = (
 class ProposalGetTest(test.APITestCase):
     def setUp(self):
         self.fixture = fixtures.ProposalFixture()
+        # Call reviewers read submitted proposals, never drafts.
+        self.fixture.proposal.state = ProposalStates.SUBMITTED
+        self.fixture.proposal.save()
         self.url = factories.ProposalFactory.get_url(self.fixture.proposal)
 
     @data(
@@ -76,7 +79,9 @@ class ProposalGetTest(test.APITestCase):
         another_round = factories.RoundFactory(call=another_call)
         another_reviewer = structure_factories.UserFactory()
         another_call.add_user(another_reviewer, CallRole.REVIEWER)
-        another_proposal = factories.ProposalFactory(round=another_round)
+        another_proposal = factories.ProposalFactory(
+            round=another_round, state=ProposalStates.SUBMITTED
+        )
         another_proposals_url = factories.ProposalFactory.get_url(another_proposal)
         return another_reviewer, another_proposals_url
 
