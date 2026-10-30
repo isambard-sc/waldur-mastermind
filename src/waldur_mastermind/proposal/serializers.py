@@ -2071,6 +2071,7 @@ class ProtectedCallSerializer(PublicCallSerializer):
             "order_author_user_name",
             "carry_over_drafts",
             "cancel_drafts_at_cutoff",
+            "withdraw_pending_reviews",
             "undecided_at_round_completion",
         )
         view_name = "proposal-protected-call-detail"

@@ -11,7 +11,7 @@ from waldur_core.checklist import models as checklist_models
 from waldur_core.permissions.enums import RoleEnum
 from waldur_core.permissions.models import Role, UserRole
 from waldur_core.permissions.utils import RoleChange, RoleEventDetails
-from waldur_mastermind.proposal import enums, models
+from waldur_mastermind.proposal import enums, models, utils
 from waldur_mastermind.proposal import permissions as proposal_permissions
 
 logger = logging.getLogger(__name__)
@@ -394,3 +394,25 @@ def touch_draft_on_related_change(sender, instance, **kwargs):
     models.Proposal.objects.filter(
         pk=proposal_id, state=enums.ProposalStates.DRAFT
     ).update(modified=timezone.now())
+
+
+DECIDED_STATES = (
+    enums.ProposalStates.ACCEPTED,
+    enums.ProposalStates.REJECTED,
+    enums.ProposalStates.CANCELED,
+)
+
+
+def withdraw_reviews_of_decided_proposal(sender, instance, created=False, **kwargs):
+    """Once a proposal is decided its unfinished reviews are not needed: on
+    calls that say so, they are deleted rather than left in the reviewers'
+    lists."""
+    if created or not instance.tracker.has_changed("state"):
+        return
+    if instance.state not in DECIDED_STATES:
+        return
+    if not instance.round.call.withdraw_pending_reviews:
+        return
+    utils.withdraw_pending_reviews(
+        instance, f"the proposal was {instance.get_state_display().lower()}."
+    )

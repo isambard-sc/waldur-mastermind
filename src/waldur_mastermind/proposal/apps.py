@@ -51,6 +51,11 @@ class ProposalConfig(AppConfig):
                     ),
                 )
         signals.post_save.connect(
+            handlers.withdraw_reviews_of_decided_proposal,
+            sender=models.Proposal,
+            dispatch_uid="waldur_mastermind.proposal.withdraw_reviews_of_decided_proposal",
+        )
+        signals.post_save.connect(
             handlers.create_checklist_completion,
             sender=models.Proposal,
             dispatch_uid="waldur_mastermind.proposal.create_checklist_completion",

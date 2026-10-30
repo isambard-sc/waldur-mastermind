@@ -297,6 +297,17 @@ class Call(
         ),
     )
 
+    withdraw_pending_reviews = models.BooleanField(
+        default=False,
+        help_text=(
+            "Whether a proposal's unfinished reviews and unanswered review "
+            "requests are deleted once they are no longer needed: when it is "
+            "accepted, rejected or cancelled, or returned to its applicant. "
+            "Off: they stay, and a returned proposal's reviews are marked "
+            "rejected."
+        ),
+    )
+
     publish_results = models.CharField(
         max_length=20,
         choices=ResultsPublication.CHOICES,

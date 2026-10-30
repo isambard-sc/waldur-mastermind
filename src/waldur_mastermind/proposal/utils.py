@@ -32,6 +32,7 @@ from waldur_mastermind.proposal import award_ids, event_publishing
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal.enums import (
     AllocationTimes,
+    AssignmentBatchStatuses,
     AssignmentItemStatuses,
     BulkRoundCadence,
     CallStates,
@@ -1269,6 +1270,45 @@ def _workflow_snapshot(proposal) -> list:
     ]
 
 
+def withdraw_pending_reviews(proposal, why):
+    """Delete a proposal's unfinished reviews and its unanswered review
+    requests, so they leave the reviewers' lists. Submitted reviews are
+    kept. Each deletion is logged; the reviewers are not emailed (the call's
+    managers tell them what they need to know).
+
+    why completes "Review for <proposal> has been withdrawn: ...".
+    """
+    pending_reviews = list(
+        proposal.review_set.filter(state=proposal_models.Review.States.IN_REVIEW)
+    )
+    items = proposal_models.AssignmentItem.objects.filter(proposal=proposal).filter(
+        Q(status=AssignmentItemStatuses.PENDING) | Q(review__in=pending_reviews)
+    )
+    batch_ids = set(items.values_list("batch_id", flat=True))
+    for review in pending_reviews:
+        event_logger.emit(
+            "Review for {proposal_name} has been withdrawn: " + why,
+            event_type=EventType.REVIEW_CANCELED,
+            event_context={"review": review, "proposal_name": proposal.name},
+            scopes=[_get_customer(review)],
+        )
+    items.delete()
+    proposal_models.Review.objects.filter(
+        pk__in=[review.pk for review in pending_reviews]
+    ).delete()
+
+    # A batch left with nothing to answer is answered, or gone if empty.
+    for batch in proposal_models.AssignmentBatch.objects.filter(pk__in=batch_ids):
+        remaining = batch.items.all()
+        if not remaining.exists():
+            batch.delete()
+        elif not remaining.filter(status=AssignmentItemStatuses.PENDING).exists():
+            batch.status = AssignmentBatchStatuses.RESPONDED
+            batch.responded_at = timezone.now()
+            batch.save(update_fields=["status", "responded_at"])
+    return len(pending_reviews)
+
+
 def return_to_applicant(proposal, user, reason, resubmit_by):
     """Hand a submitted proposal back to its applicant to fix and resubmit.
 
@@ -1310,6 +1350,11 @@ def return_to_applicant(proposal, user, reason, resubmit_by):
         open_reviews = list(
             proposal.review_set.filter(state=proposal_models.Review.States.IN_REVIEW)
         )
+        if proposal.round.call.withdraw_pending_reviews:
+            withdraw_pending_reviews(
+                proposal, "the proposal was returned to its applicant."
+            )
+            open_reviews = []
         for review in open_reviews:
             review.state = proposal_models.Review.States.REJECTED
             review.save(update_fields=["state"])
