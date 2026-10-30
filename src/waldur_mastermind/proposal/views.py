@@ -726,6 +726,24 @@ _EXPORT_PROPOSAL_PARAMETER = _export_uuid_parameter(
     "proposal_uuid", "proposal_proposals_list", "Limit the export to one proposal."
 )
 
+_EXPORT_FILE_FORMAT_PARAMETER = OpenApiParameter(
+    "file_format",
+    OpenApiTypes.STR,
+    OpenApiParameter.QUERY,
+    enum=["csv", "xlsx"],
+    description=(
+        "csv (the default) or xlsx, an Excel workbook of the same rows. Named "
+        "file_format because a bare `format` is read by the API itself."
+    ),
+)
+
+
+def _export_response(request, rows, basename, title):
+    if request.query_params.get("file_format") == "xlsx":
+        return exports.xlsx_response(rows, f"{basename}.xlsx", title)
+    return exports.csv_response(rows, f"{basename}.csv")
+
+
 _EXPORT_NAME_PARAMETER = OpenApiParameter(
     "proposal_name",
     OpenApiTypes.STR,
@@ -1001,6 +1019,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             _EXPORT_ROUND_PARAMETER,
             _EXPORT_APPLICANT_PARAMETER,
             _EXPORT_NAME_PARAMETER,
+            _EXPORT_FILE_FORMAT_PARAMETER,
             OpenApiParameter(
                 "proposal_state",
                 OpenApiTypes.STR,
@@ -1010,7 +1029,10 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                 description="Limit the export to proposals in these states.",
             ),
         ],
-        responses={(200, "text/csv"): OpenApiTypes.BINARY},
+        responses={
+            (200, "text/csv"): OpenApiTypes.BINARY,
+            (200, exports.XLSX_CONTENT_TYPE): OpenApiTypes.BINARY,
+        },
         filters=False,
     )
     @decorators.action(detail=True, methods=["get"], url_path="export-proposals")
@@ -1024,9 +1046,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             name=request.query_params.get("proposal_name"),
         )
         schema = exports.CallExportSchema(call)
-        return exports.csv_response(
+        return _export_response(
+            request,
             exports.proposal_rows(schema, queryset),
-            f"{call.slug}-proposals.csv",
+            f"{call.slug}-proposals",
+            "Proposals",
         )
 
     export_proposals_permissions = [
@@ -1047,6 +1071,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             _EXPORT_REVIEWER_PARAMETER,
             _EXPORT_PROPOSAL_PARAMETER,
             _EXPORT_NAME_PARAMETER,
+            _EXPORT_FILE_FORMAT_PARAMETER,
             OpenApiParameter(
                 "review_state",
                 OpenApiTypes.STR,
@@ -1056,7 +1081,10 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                 description="Limit the export to reviews in these states.",
             ),
         ],
-        responses={(200, "text/csv"): OpenApiTypes.BINARY},
+        responses={
+            (200, "text/csv"): OpenApiTypes.BINARY,
+            (200, exports.XLSX_CONTENT_TYPE): OpenApiTypes.BINARY,
+        },
         filters=False,
     )
     @decorators.action(detail=True, methods=["get"], url_path="export-reviews")
@@ -1070,9 +1098,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             proposal_uuid=_export_uuid(request, "proposal_uuid"),
             proposal_name=request.query_params.get("proposal_name"),
         )
-        return exports.csv_response(
+        return _export_response(
+            request,
             exports.review_rows(queryset),
-            f"{call.slug}-reviews.csv",
+            f"{call.slug}-reviews",
+            "Reviews",
         )
 
     export_reviews_permissions = export_proposals_permissions

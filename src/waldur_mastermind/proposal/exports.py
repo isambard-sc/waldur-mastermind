@@ -1,4 +1,4 @@
-"""CSV exports of a call's proposals and reviews.
+"""CSV and Excel exports of a call's proposals and reviews.
 
 Panel meetings, funding-body reporting and archiving all work from a
 spreadsheet of proposals. The table export in the frontend can only write the
@@ -10,13 +10,18 @@ them is slow besides, so the call writes the file itself.
 The column set is derived from the *call*, not from the proposals that happen
 to match the filters, so every row of one call's export has the same shape and
 two exports of the same call are comparable.
+
+Excel is the same rows in another format. openpyxl is imported only when an
+Excel file is asked for: see "Lazy imports for heavy optional dependencies"
+in CLAUDE.md.
 """
 
 import csv
+import io
 from collections.abc import Iterator
 from decimal import Decimal, InvalidOperation
 
-from django.http import StreamingHttpResponse
+from django.http import HttpResponse, StreamingHttpResponse
 
 from waldur_mastermind.marketplace.enums import BillingTypes
 from waldur_mastermind.proposal import models, utils
@@ -378,5 +383,57 @@ def csv_response(rows: Iterator[list[str]], filename: str) -> StreamingHttpRespo
         (writer.writerow([_safe_cell(cell) for cell in row]) for row in rows),
         content_type="text/csv; charset=utf-8",
     )
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response
+
+
+XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _xlsx_value(value):
+    """Numbers as numbers, so they sum and sort; everything else as text."""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int | float | Decimal):
+        return value
+    text = _text(value)
+    if text and _is_number(text):
+        number = Decimal(text)
+        return int(number) if number == number.to_integral_value() else float(number)
+    return text
+
+
+def xlsx_response(rows: Iterator[list[str]], filename: str, title: str) -> HttpResponse:
+    """The rows as an Excel workbook of one sheet, header bold and frozen.
+
+    Every text cell is written as a string, never a formula, so text an
+    applicant or reviewer wrote cannot run in the call manager's Excel (the
+    CSV export's protecting apostrophe is not needed, and would show).
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = title[:31]
+    widths: dict[int, int] = {}
+    for row_index, row in enumerate(rows, start=1):
+        for column, value in enumerate(row, start=1):
+            cell = sheet.cell(row=row_index, column=column)
+            cell.value = _xlsx_value(value)
+            if isinstance(cell.value, str):
+                cell.data_type = "s"
+            if row_index == 1:
+                cell.font = Font(bold=True)
+            widths[column] = max(widths.get(column, 0), len(_text(value)))
+    sheet.freeze_panes = "A2"
+    for column, width in widths.items():
+        sheet.column_dimensions[get_column_letter(column)].width = min(
+            max(width + 2, 10), 60
+        )
+    output = io.BytesIO()
+    workbook.save(output)
+    response = HttpResponse(output.getvalue(), content_type=XLSX_CONTENT_TYPE)
     response["Content-Disposition"] = f'attachment; filename="{filename}"'
     return response
