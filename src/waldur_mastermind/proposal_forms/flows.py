@@ -50,6 +50,7 @@ OPTION_KEYS = frozenset(
 
 # Formbricks ids are cuid-style; the survey id also goes into a URL path.
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+SURVEY_ID_PATTERN = _ID_PATTERN
 
 
 class FlowError(ValueError):

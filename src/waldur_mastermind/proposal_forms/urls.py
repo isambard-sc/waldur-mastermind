@@ -25,6 +25,16 @@ urlpatterns = [
         name="formbricks-connection-test",
     ),
     re_path(
+        r"^api/formbricks-surveys/$",
+        views.FormbricksSurveyListView.as_view(),
+        name="formbricks-surveys",
+    ),
+    re_path(
+        r"^api/proposal-form-return/$",
+        views.ProposalFormReturnView.as_view(),
+        name="proposal-form-return",
+    ),
+    re_path(
         r"^api/proposal-form-redirect/$",
         views.ProposalFormRedirectView.as_view(),
         name="proposal-form-redirect",

@@ -105,6 +105,14 @@ class FormFlow(core_models.UuidMixin, TimeStampedModel):
     name = models.CharField(max_length=200)
     description = models.TextField(blank=True)
     steps = models.JSONField(default=list)
+    survey_schemas = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=_(
+            "What each step's survey asks, as read from Formbricks at the last "
+            "sync: {survey_id: {name, questions: [{id, type, label, choices}]}}."
+        ),
+    )
 
     class Meta:
         ordering = ("name",)

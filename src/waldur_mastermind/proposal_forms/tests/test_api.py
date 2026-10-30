@@ -1,5 +1,6 @@
 import datetime
 import json
+import os
 import time
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -16,7 +17,7 @@ from waldur_mastermind.marketplace.tests import factories as marketplace_factori
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal.enums import CallStates, ProposalStates
 from waldur_mastermind.proposal.tests import factories as proposal_factories
-from waldur_mastermind.proposal_forms import client, flows, models
+from waldur_mastermind.proposal_forms import client, flows, models, sync
 
 SECRET = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"
 
@@ -157,11 +158,15 @@ class ConnectionApiTest(FormsTestBase):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+    @mock.patch.object(client, "list_surveys", return_value=[{"id": "s1"}])
     @mock.patch.object(client, "check_connection")
-    def test_connection_test(self, check_connection):
+    def test_connection_test(self, check_connection, list_surveys):
         self.client.force_authenticate(self.staff)
         response = self.client.post(self.url + "test/")
-        self.assertEqual(response.data, {"ok": True, "detail": "Connected."})
+        self.assertEqual(
+            response.data,
+            {"ok": True, "detail": "Connected. The key can see 1 survey(s)."},
+        )
 
         check_connection.side_effect = client.FormbricksError("401 Unauthorized")
         response = self.client.post(self.url + "test/")
@@ -244,42 +249,136 @@ class FlowApiTest(FormsTestBase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertTrue(models.FormFlow.objects.filter(pk=self.flow.pk).exists())
 
-    @mock.patch.object(client, "get_survey_definition")
-    def test_check_against_formbricks(self, get_survey_definition):
-        surveys = {
-            "survey1": {
-                "blocks": [
-                    {
-                        "elements": [
-                            {"id": "q_title", "headline": {"default": "Title"}},
-                            {"id": "q_service", "headline": {"default": "Service"}},
-                        ]
-                    }
-                ],
-                "hiddenFields": {"enabled": True, "fieldIds": ["proposal_uuid"]},
-            },
-            "survey2": {
-                "blocks": [],
-                "hiddenFields": {
-                    "enabled": True,
-                    "fieldIds": ["proposal_uuid", "redirect_token"],
-                },
-            },
+    def ready_survey(self, survey_id, **overrides):
+        """A survey as Formbricks returns it, already set up for Waldur."""
+        url = sync.return_url("http://testserver/", survey_id)
+        survey = {
+            "id": survey_id,
+            "name": f"Survey {survey_id}",
+            "type": "link",
+            "status": "inProgress",
+            "singleUse": {"enabled": True, "isEncrypted": False},
+            "hiddenFields": {"enabled": True, "fieldIds": ["proposal_uuid"]},
+            "endings": [{"id": "e1", "type": "redirectToUrl", "url": url}],
+            "isAnonymizeResponsesEnabled": True,
+            "blocks": [
+                {
+                    "elements": [
+                        {
+                            "id": "q1",
+                            "type": "openText",
+                            "headline": {"default": "<p>Why?</p>"},
+                        }
+                    ]
+                }
+            ],
         }
-        get_survey_definition.side_effect = lambda survey_id: surveys[survey_id]
-        self.client.force_authenticate(self.staff)
-        response = self.client.post(self.detail(self.flow) + "check/")
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertFalse(response.data["ok"])
+        survey.update(overrides)
+        return survey
+
+    def test_check_reports_changes_without_making_them(self):
+        surveys = {
+            "survey1": self.ready_survey(
+                "survey1",
+                singleUse=None,
+                endings=[{"id": "e1", "type": "endScreen", "headline": {}}],
+            ),
+            "survey2": self.ready_survey("survey2"),
+        }
+        self.client.force_authenticate(self.support)
+        with (
+            mock.patch.object(client, "get_survey_definition", side_effect=surveys.get),
+            mock.patch.object(client, "update_survey") as update_survey,
+        ):
+            response = self.client.get(self.detail(self.flow) + "check/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        update_survey.assert_not_called()
+        self.assertFalse(response.data["in_sync"])
         first, second = response.data["steps"]
-        problems = " ".join(first["problems"])
-        self.assertIn("redirect_token", problems)
-        self.assertIn("q_summary", problems)
-        self.assertIn("q_hours", problems)
-        self.assertNotIn("q_title", problems)
-        self.assertTrue(second["ok"])
-        self.assertIn("step=team_details", second["ending_url"])
-        self.assertIn("#recall:redirect_token/fallback:#", second["ending_url"])
+        self.assertFalse(first["in_sync"])
+        self.assertEqual(len(first["changes"]), 2)
+        self.assertTrue(second["in_sync"])
+        self.assertEqual(
+            second["questions"],
+            [{"id": "q1", "type": "openText", "label": "Why?", "choices": []}],
+        )
+
+    def test_check_reports_unreachable_survey(self):
+        self.client.force_authenticate(self.staff)
+        error = client.FormbricksError("Formbricks refused GET ... (401)")
+        with mock.patch.object(client, "get_survey_definition", side_effect=error):
+            response = self.client.get(self.detail(self.flow) + "check/")
+        self.assertFalse(response.data["steps"][0]["in_sync"])
+        self.assertIn("401", response.data["steps"][0]["problems"][0])
+
+    def test_sync_writes_only_what_is_missing_and_stores_questions(self):
+        surveys = {
+            "survey1": self.ready_survey("survey1", isAnonymizeResponsesEnabled=False),
+            "survey2": self.ready_survey("survey2"),
+        }
+
+        def update(survey_id, changes):
+            surveys[survey_id] = {**surveys[survey_id], **changes}
+            return surveys[survey_id]
+
+        self.client.force_authenticate(self.staff)
+        with (
+            mock.patch.object(client, "get_survey_definition", side_effect=surveys.get),
+            mock.patch.object(client, "update_survey", side_effect=update) as upd,
+        ):
+            response = self.client.post(self.detail(self.flow) + "sync/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        upd.assert_called_once_with("survey1", {"isAnonymizeResponsesEnabled": True})
+        self.assertTrue(response.data["in_sync"])
+        self.flow.refresh_from_db()
+        self.assertEqual(
+            self.flow.survey_schemas["survey2"]["questions"][0]["label"], "Why?"
+        )
+
+    def test_only_staff_sync(self):
+        self.client.force_authenticate(self.support)
+        response = self.client.post(self.detail(self.flow) + "sync/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_survey_list(self):
+        listed = [
+            self.ready_survey("survey1", name="Beta", environmentId="env1"),
+            self.ready_survey("other", name="alpha", blocks=[]),
+        ]
+        self.client.force_authenticate(self.staff)
+        with mock.patch.object(client, "list_surveys", return_value=listed):
+            response = self.client.get("/api/formbricks-surveys/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual([s["name"] for s in response.data], ["alpha", "Beta"])
+        beta = response.data[1]
+        self.assertEqual(beta["used_by_flows"], ["airr-gw"])
+        self.assertEqual(beta["question_count"], 1)
+        self.assertEqual(beta["environment_id"], "env1")
+
+        self.client.force_authenticate(self.user)
+        response = self.client.get("/api/formbricks-surveys/")
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class ReturnRedirectTest(FormsTestBase):
+    def test_returns_to_the_proposal_with_the_survey(self):
+        response = self.client.get(
+            "/api/proposal-form-return/",
+            {"proposal_uuid": self.proposal.uuid.hex, "survey": "survey1"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertIn(
+            f"proposals/{self.proposal.uuid.hex}/?form_survey=survey1",
+            response["Location"],
+        )
+
+    def test_unrecognisable_values_go_to_the_proposal_list(self):
+        response = self.client.get(
+            "/api/proposal-form-return/",
+            {"proposal_uuid": "#recall:proposal_uuid/fallback:#", "survey": "x/y"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertTrue(response["Location"].endswith("proposals/"))
 
 
 class CallFlowApiTest(FormsTestBase):
@@ -785,3 +884,101 @@ class SwitchedOffTest(FormsTestBase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+
+class RealPayloadTest(FormsTestBase):
+    """A responseFinished delivery captured from a live Formbricks, redacted
+    (tests/fixtures/formbricks_response_finished.json), replayed through the
+    webhook: the proposal and token are this test's, everything else is as
+    Formbricks sent it."""
+
+    FIXTURE = os.path.join(
+        os.path.dirname(__file__), "fixtures", "formbricks_response_finished.json"
+    )
+    LABELS = {
+        "cid9d22768jyf65hht3sakqq": "Project title",
+        "g81oicc5tihv86395lclkfpz": "Project duration, in months",
+        "j4b388ormyl4jiwajx158uel": "GPUh requested",
+        "tf4lhp5vsvc7993sx27q5ugd": "AIRR service requested",
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.flow.steps = flows.validate_steps(
+            [
+                {
+                    "key": "project_details",
+                    "label": "Project details",
+                    "survey_id": "t14sgutihynd7edwluh8trg1",
+                    "reviewer_visible": True,
+                    "field_map": {"cid9d22768jyf65hht3sakqq": "name"},
+                }
+            ]
+        )
+        self.flow.save()
+        patcher = mock.patch.object(client, "get_survey", return_value=self.LABELS)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def payload(self):
+        with open(self.FIXTURE, encoding="utf-8") as f:
+            payload = json.load(f)
+        answers = payload["data"]["data"]
+        answers["proposal_uuid"] = self.proposal.uuid.hex
+        answers["redirect_token"] = client.build_redirect_token(
+            self.applicant, self.proposal
+        )
+        return payload
+
+    def post(self, payload):
+        body = json.dumps(payload).encode()
+        timestamp = str(int(time.time()))
+        return self.client.generic(
+            "POST",
+            "/api/proposal-form-webhook/",
+            body,
+            content_type="application/json",
+            HTTP_WEBHOOK_ID="msg_real",
+            HTTP_WEBHOOK_TIMESTAMP=timestamp,
+            HTTP_WEBHOOK_SIGNATURE="v1,"
+            + client.sign(SECRET, "msg_real", timestamp, body),
+        )
+
+    def test_real_delivery_is_kept_and_mapped(self):
+        response = self.post(self.payload())
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.proposal.refresh_from_db()
+        self.assertEqual(self.proposal.name, "My new project application")
+
+        stored = models.FormStepResponse.objects.get(proposal=self.proposal)
+        self.assertEqual(stored.step_key, "project_details")
+        self.assertEqual(stored.survey_id, "t14sgutihynd7edwluh8trg1")
+        self.assertEqual(stored.response_id, "cmvufemih0003u6014xwem7kl")
+        self.assertNotIn("redirect_token", stored.raw_response)
+        # Formbricks sends every answer as text.
+        self.assertEqual(stored.raw_response["j4b388ormyl4jiwajx158uel"], "1234")
+
+        self.client.force_authenticate(self.applicant)
+        response = self.client.get(f"/api/proposal-forms/{self.proposal.uuid.hex}/")
+        (answers,) = response.data["responses"]
+        self.assertEqual(
+            [(q["label"], q["answer"]) for q in answers["questions"]],
+            [
+                ("Project title", "My new project application"),
+                ("Project duration, in months", "5"),
+                ("GPUh requested", "1234"),
+                ("AIRR service requested", "Zenith"),
+            ],
+        )
+        self.assertTrue(response.data["steps"][0]["completed"])
+        self.assertIsNone(response.data["next_step"])
+
+    def test_real_delivery_replayed_for_another_proposal_refused(self):
+        # The captured body as delivered names a proposal it holds no valid
+        # token for: refused.
+        with open(self.FIXTURE, encoding="utf-8") as f:
+            payload = json.load(f)
+        response = self.post(payload)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(models.FormStepResponse.objects.exists())

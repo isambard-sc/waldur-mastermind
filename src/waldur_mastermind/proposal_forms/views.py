@@ -1,5 +1,6 @@
 import logging
 import uuid as uuid_lib
+from urllib.parse import urlencode
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -24,7 +25,7 @@ from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal.enums import CallStates, ProposalStates, RoundStatuses
 from waldur_mastermind.proposal.permissions import CALL_PERMISSION_SOURCES
 
-from . import client, flows, mapper, models, serializers
+from . import client, flows, mapper, models, serializers, sync
 from . import permissions as form_permissions
 
 logger = logging.getLogger(__name__)
@@ -134,7 +135,11 @@ class FormbricksConnectionTestView(views.APIView):
         else:
             try:
                 client.check_connection(connection)
-                result = {"ok": True, "detail": "Connected."}
+                count = len(client.list_surveys(connection))
+                result = {
+                    "ok": True,
+                    "detail": f"Connected. The key can see {count} survey(s).",
+                }
             except client.FormbricksError as e:
                 result = {"ok": False, "detail": str(e)}
         return response.Response(
@@ -162,55 +167,106 @@ class FormFlowViewSet(ActionsViewSet):
     unsafe_methods_permissions = [is_staff]
     destroy_validators = [flow_is_not_used]
 
+    def _check_response(self, results):
+        data = {"in_sync": all(r["in_sync"] for r in results), "steps": results}
+        return response.Response(serializers.FormFlowCheckSerializer(data).data)
+
     @extend_schema(
         request=None,
         responses=serializers.FormFlowCheckSerializer,
-        description="Check each step against its survey in Formbricks: that "
-        "it exists, declares the hidden fields the flow needs, and has every "
-        "question the step maps.",
+        description="Read each step's survey from Formbricks and report what Sync "
+        "would change, and anything Waldur cannot fix itself. Changes nothing.",
     )
-    @decorators.action(detail=True, methods=["post"], url_path="check")
+    @decorators.action(detail=True, methods=["get"], url_path="check")
     def check_surveys(self, request, uuid=None):
         flow = self.get_object()
-        ending_base = _api_url(request, "proposal-form-redirect")
-        results = []
-        for step in flow.steps:
-            problems = []
-            try:
-                survey = client.get_survey_definition(step["survey_id"])
-            except client.FormbricksError as e:
-                problems.append(str(e))
-                survey = None
-            if survey is not None:
-                hidden = client.survey_hidden_fields(survey)
-                missing = [f for f in client.REQUIRED_HIDDEN_FIELDS if f not in hidden]
-                if missing:
-                    problems.append(
-                        "The survey does not declare hidden field(s) "
-                        f"{', '.join(missing)}."
-                    )
-                questions = set(client.survey_labels(survey))
-                expected = set(step.get("field_map", {}))
-                if step.get("resources"):
-                    expected.add(step["resources"]["question_id"])
-                    for option in step["resources"]["options"]:
-                        expected.update(option["attribute_map"])
-                for question_id in sorted(expected - questions):
-                    problems.append(f"The survey has no question {question_id}.")
-            results.append(
-                {
-                    "key": step["key"],
-                    "survey_id": step["survey_id"],
-                    "ok": not problems,
-                    "problems": problems,
-                    "ending_url": client.redirect_ending_url(step["key"], ending_base),
-                }
-            )
-        data = {"ok": all(r["ok"] for r in results), "steps": results}
-        return response.Response(serializers.FormFlowCheckSerializer(data).data)
+        return self._check_response(
+            sync.check_flow(flow, request.build_absolute_uri("/"))
+        )
 
     # Not "check": check_permissions would shadow DRF's own method.
     check_surveys_permissions = [form_permissions.is_staff_or_support_for_reads]
+
+    @extend_schema(
+        request=None,
+        responses=serializers.FormFlowCheckSerializer,
+        description="Make each step's survey ready in Formbricks: single-use "
+        "links, the proposal_uuid hidden field, endings back to the proposal, "
+        "anonymised responses. Only those settings are written. Returns the "
+        "check after the changes.",
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def sync(self, request, uuid=None):
+        flow = self.get_object()
+        return self._check_response(
+            sync.sync_flow(flow, request.build_absolute_uri("/"), request.user)
+        )
+
+    sync_permissions = [is_staff]
+
+
+class FormbricksSurveyListView(views.APIView):
+    """The surveys in Formbricks the API key can reach, for choosing a flow's
+    steps."""
+
+    permission_classes = (rf_permissions.IsAuthenticated,)
+
+    @extend_schema(
+        operation_id="formbricks_surveys_list",
+        responses=serializers.FormbricksSurveySerializer(many=True),
+    )
+    def get(self, request):
+        form_permissions.is_staff_or_support_for_reads(request, self)
+        try:
+            surveys = client.list_surveys()
+        except client.FormbricksError as e:
+            raise exceptions.ValidationError(str(e))
+        used_by = {}
+        for flow in models.FormFlow.objects.all():
+            for step in flow.steps:
+                used_by.setdefault(step["survey_id"], []).append(flow.key)
+        data = [
+            {
+                "id": survey["id"],
+                "name": survey.get("name") or "",
+                "type": survey.get("type") or "",
+                "status": survey.get("status") or "",
+                "environment_id": survey.get("environmentId") or "",
+                "question_count": len(client.survey_questions(survey)),
+                "updated_at": survey.get("updatedAt") or "",
+                "used_by_flows": sorted(used_by.get(survey["id"], [])),
+            }
+            for survey in surveys
+        ]
+        data.sort(key=lambda s: s["name"].lower())
+        return response.Response(
+            serializers.FormbricksSurveySerializer(data, many=True).data
+        )
+
+
+class ProposalFormReturnView(views.APIView):
+    """Where a survey's endings send the applicant: on to the proposal in
+    HomePort, telling it which form was just finished so it can fetch the
+    answers. Changes nothing, so needs no authentication."""
+
+    authentication_classes = ()
+    permission_classes = (rf_permissions.AllowAny,)
+
+    # Not called by the frontend, so not in the API schema or the SDK.
+    @extend_schema(exclude=True)
+    def get(self, request):
+        proposal_uuid = request.query_params.get("proposal_uuid", "")
+        survey_id = request.query_params.get("survey", "")
+        try:
+            proposal_hex = uuid_lib.UUID(proposal_uuid).hex
+        except ValueError:
+            return http_redirect(core_utils.format_homeport_link("proposals/"))
+        link = core_utils.format_homeport_link(
+            "proposals/{proposal_uuid}/", proposal_uuid=proposal_hex
+        )
+        if flows.SURVEY_ID_PATTERN.match(survey_id):
+            link = f"{link}?{urlencode({'form_survey': survey_id})}"
+        return http_redirect(link)
 
 
 # --- a call's flow ----------------------------------------------------------------
