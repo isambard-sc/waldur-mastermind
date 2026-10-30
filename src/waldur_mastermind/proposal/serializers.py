@@ -1643,6 +1643,14 @@ class RequestedResourceSerializer(
 
     def create(self, validated_data):
         validated_data["created_by"] = self.context["request"].user
+        proposal = validated_data["proposal"]
+        if proposal.round.call.one_request_per_offering:
+            # The latest request for an offering is the one that counts, so
+            # it cannot be provisioned twice on award.
+            models.RequestedResource.objects.filter(
+                proposal=proposal,
+                requested_offering=validated_data["requested_offering"],
+            ).delete()
         return super().create(validated_data)
 
 
@@ -2122,6 +2130,7 @@ class ProtectedCallSerializer(PublicCallSerializer):
             "cancel_drafts_at_cutoff",
             "withdraw_pending_reviews",
             "reviewers_see_assigned_only",
+            "one_request_per_offering",
             "undecided_at_round_completion",
         )
         view_name = "proposal-protected-call-detail"

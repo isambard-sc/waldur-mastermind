@@ -297,6 +297,15 @@ class Call(
         ),
     )
 
+    one_request_per_offering = models.BooleanField(
+        default=False,
+        help_text=(
+            "Whether a proposal holds at most one resource request per "
+            "offering: a new request for an offering it already requests "
+            "replaces the earlier one. Off: it may request an offering more "
+            "than once."
+        ),
+    )
     reviewers_see_assigned_only = models.BooleanField(
         default=False,
         help_text=(
