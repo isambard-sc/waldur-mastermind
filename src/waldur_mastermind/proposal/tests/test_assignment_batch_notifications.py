@@ -18,6 +18,7 @@ from waldur_mastermind.proposal.enums import (
     AssignmentBatchStatuses,
     AssignmentItemStatuses,
     ProposalDisclosureLevels,
+    ProposalStates,
     ReviewerPoolInvitationStatuses,
 )
 
@@ -498,6 +499,9 @@ class ReviewPathReviewerApplicantVisibilityTest(
         self._assert_hidden(self.reviewer_user)
 
     def test_call_reviewer_sees_only_exposed_fields(self):
+        # Call reviewers read submitted proposals, never drafts.
+        self.proposal.state = ProposalStates.SUBMITTED
+        self.proposal.save()
         call_reviewer = structure_factories.UserFactory()
         self.call.add_user(call_reviewer, CallRole.REVIEWER)
         self._assert_hidden(call_reviewer)

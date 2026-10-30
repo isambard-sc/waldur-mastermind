@@ -401,6 +401,7 @@ class EventType(StrEnum):
     RESOURCE_UPDATE_SUCCEEDED = "resource_update_succeeded"
     RESTRICT_MEMBERS = "restrict_members"
     REVIEW_CANCELED = "review_canceled"
+    REVIEW_RETURNED = "review_returned"
     REVIEWER_WORKLOAD_LIMIT_OVERRIDDEN = "reviewer_workload_limit_overridden"
     ROLE_CLONED = "role_cloned"
     ROLE_CONCEALED = "role_concealed"
@@ -912,6 +913,7 @@ EVENT_GROUP_MAPPING = {
     ],
     EventGroup.REVIEW: [
         EventType.REVIEW_CANCELED,
+        EventType.REVIEW_RETURNED,
     ],
     EventGroup.SSH: [
         EventType.SSH_KEY_CREATION_SUCCEEDED,

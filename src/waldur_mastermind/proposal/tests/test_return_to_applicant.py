@@ -1,6 +1,7 @@
 import datetime
 from unittest import mock
 
+from django.template.loader import render_to_string
 from django.utils import timezone
 from rest_framework import status, test
 
@@ -248,3 +249,11 @@ class ReturnNotificationTest(ReturnTestBase):
         self.assertEqual(context["reason"], "Fix the budget.")
         self.assertFalse(context["extended"])
         self.assertEqual(emails, [self.applicant.email])
+
+    def test_deadline_is_written_in_utc(self):
+        deadline = datetime.datetime(2026, 11, 13, 16, 0, tzinfo=datetime.UTC)
+        context = {"resubmit_by": deadline, "reason": "Fix it."}
+        for name in ("message.txt", "message.html"):
+            with timezone.override("Europe/London"):
+                text = render_to_string(f"proposal/proposal_returned_{name}", context)
+            self.assertIn("13 November 2026, 16:00 UTC", text)

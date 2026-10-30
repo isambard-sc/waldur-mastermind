@@ -492,12 +492,22 @@ def get_reverse_scope_types_mapping():
 # their AppConfig.ready(). Being able to read an object does not always mean
 # being able to read the audit trail about it.
 _scope_event_guards: dict[type, Callable[[Any, Any], bool]] = {}
+# Guarded models whose events may still be filed on wider feeds.
+_scope_events_on_wider_feeds: set[type] = set()
 
 
-def register_scope_event_guard(model: type, guard: Callable[[Any, Any], bool]):
+def register_scope_event_guard(
+    model: type, guard: Callable[[Any, Any], bool], wider_feeds: bool = False
+):
     """Register ``guard(user, scope) -> bool``; returning ``False`` hides the
-    events logged against ``scope`` from ``user``."""
+    events logged against ``scope`` from ``user``.
+
+    ``wider_feeds``: the events may still be filed on the organization's
+    feed too, because those the guard keeps out cannot read that feed.
+    """
     _scope_event_guards[model] = guard
+    if wider_feeds:
+        _scope_events_on_wider_feeds.add(model)
 
 
 def can_view_scope_events(user, scope) -> bool:
@@ -508,8 +518,12 @@ def can_view_scope_events(user, scope) -> bool:
 def has_scope_event_guard(scope) -> bool:
     """Whether ``scope`` restricts who reads its events. Such a scope's events
     must not also be filed on a wider feed (its organization's, say), whose
-    readers the guard would never be asked about."""
-    return type(scope) in _scope_event_guards
+    readers the guard would never be asked about -- unless it was registered
+    with ``wider_feeds``."""
+    return (
+        type(scope) in _scope_event_guards
+        and type(scope) not in _scope_events_on_wider_feeds
+    )
 
 
 # Per-event-type guards, registered by apps from their AppConfig.ready().

@@ -7,6 +7,8 @@ from waldur_core.core.serializers import (
 )
 from waldur_core.structure.models import Customer
 from waldur_mastermind.marketplace.models import Offering
+from waldur_mastermind.proposal.enums import ProposalStates
+from waldur_mastermind.proposal.models import Round
 
 from . import models, utils
 
@@ -20,6 +22,12 @@ class QueryOutputSerializer(serializers.Serializer):
     customers = IdNamePairSerializer(many=True, required=False)
     offerings = IdNamePairSerializer(many=True, required=False)
     all_users = serializers.BooleanField(required=False)
+    rounds = IdNamePairSerializer(many=True, required=False)
+    proposal_states = serializers.ListField(
+        child=serializers.CharField(), required=False
+    )
+    proposal_teams = serializers.BooleanField(required=False)
+    reviewers = serializers.BooleanField(required=False)
 
 
 class BroadcastMessageQuerySerializer(serializers.Serializer):
@@ -36,6 +44,30 @@ class BroadcastMessageQuerySerializer(serializers.Serializer):
         required=False,
     )
     all_users = serializers.BooleanField(default=False)
+    rounds = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=Round.objects.all(),
+        many=True,
+        required=False,
+        help_text="Proposal rounds whose applicants (and, optionally, "
+        "reviewers) receive the message.",
+    )
+    proposal_states = serializers.ListField(
+        child=serializers.ChoiceField(
+            choices=[state for state, _label in ProposalStates.CHOICES]
+        ),
+        required=False,
+        help_text="Only the rounds' proposals in these states, e.g. draft to "
+        "remind those who have not submitted. All states if empty.",
+    )
+    proposal_teams = serializers.BooleanField(
+        default=True,
+        help_text="Whether the rounds' proposal teams receive the message.",
+    )
+    reviewers = serializers.BooleanField(
+        default=False,
+        help_text="Whether the reviewers of the rounds' proposals receive the message.",
+    )
 
 
 def format_options(options):
@@ -49,6 +81,11 @@ def serialize_query(query):
     if "offerings" in query:
         serialized_query["offerings"] = format_options(query["offerings"])
     serialized_query["all_users"] = query.get("all_users", False)
+    if query.get("rounds"):
+        serialized_query["rounds"] = format_options(query["rounds"])
+        serialized_query["proposal_states"] = list(query.get("proposal_states", []))
+        serialized_query["proposal_teams"] = query.get("proposal_teams", True)
+        serialized_query["reviewers"] = query.get("reviewers", False)
     return serialized_query
 
 

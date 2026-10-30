@@ -343,6 +343,7 @@ def notify_call_managers_about_rejected_review(review_uuid):
         "reviewer_name": review.reviewer.full_name,
         "assign_date": review.created,
         "rejection_date": review.modified,
+        "rejection_reason": review.rejection_reason,
         "create_review_link": core_utils.format_homeport_link(
             "call-management/{customer_uuid}/proposals/",
             customer_uuid=review.proposal.round.call.manager.customer.uuid,
@@ -1528,6 +1529,34 @@ def notify_team_about_returned_proposal(return_uuid, extended):
         ),
     }
     core_utils.broadcast_mail("proposal", "proposal_returned", context, emails)
+
+
+@shared_task(name="waldur_mastermind.proposal.notify_reviewer_about_returned_review")
+def notify_reviewer_about_returned_review(review_uuid):
+    """Tell a reviewer their submitted review was returned to them, and why."""
+    review = (
+        proposal_models.Review.objects.select_related(
+            "proposal__round__call", "reviewer"
+        )
+        .filter(uuid=review_uuid)
+        .first()
+    )
+    if review is None or not review.reviewer.email:
+        return
+    context = {
+        "site_name": config.SITE_NAME,
+        "proposal_name": review.proposal.name,
+        "call_name": review.proposal.round.call.name,
+        "reason": review.return_reason,
+        "review_end_date": review.review_end_date,
+        "review_url": core_utils.format_homeport_link(
+            "proposal-review/{review_uuid}/",
+            review_uuid=review.uuid,
+        ),
+    }
+    core_utils.broadcast_mail(
+        "proposal", "review_returned", context, [review.reviewer.email]
+    )
 
 
 # --- stale drafts ---------------------------------------------------------------

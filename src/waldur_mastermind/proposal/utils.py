@@ -32,6 +32,7 @@ from waldur_mastermind.proposal import award_ids, event_publishing
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal.enums import (
     AllocationTimes,
+    AssignmentBatchStatuses,
     AssignmentItemStatuses,
     BulkRoundCadence,
     CallStates,
@@ -597,6 +598,12 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
     # its project should get the ordinary one rather than a copy of that.
     if award_ids.is_enabled() and award_ids.is_award_id(proposal.slug):
         project_fields["slug"] = proposal.slug
+
+    if proposal_round.call.copy_summary_to_project and proposal.project_summary:
+        description_field = structure_models.Project._meta.get_field("description")
+        project_fields["description"] = proposal.project_summary[
+            : description_field.max_length
+        ]
 
     project = structure_models.Project.objects.create(**project_fields)
     project = cast(structure_models.Project, project)
@@ -1269,6 +1276,45 @@ def _workflow_snapshot(proposal) -> list:
     ]
 
 
+def withdraw_pending_reviews(proposal, why):
+    """Delete a proposal's unfinished reviews and its unanswered review
+    requests, so they leave the reviewers' lists. Submitted reviews are
+    kept. Each deletion is logged; the reviewers are not emailed (the call's
+    managers tell them what they need to know).
+
+    why completes "Review for <proposal> has been withdrawn: ...".
+    """
+    pending_reviews = list(
+        proposal.review_set.filter(state=proposal_models.Review.States.IN_REVIEW)
+    )
+    items = proposal_models.AssignmentItem.objects.filter(proposal=proposal).filter(
+        Q(status=AssignmentItemStatuses.PENDING) | Q(review__in=pending_reviews)
+    )
+    batch_ids = set(items.values_list("batch_id", flat=True))
+    for review in pending_reviews:
+        event_logger.emit(
+            "Review for {proposal_name} has been withdrawn: " + why,
+            event_type=EventType.REVIEW_CANCELED,
+            event_context={"review": review, "proposal_name": proposal.name},
+            scopes=[_get_customer(review)],
+        )
+    items.delete()
+    proposal_models.Review.objects.filter(
+        pk__in=[review.pk for review in pending_reviews]
+    ).delete()
+
+    # A batch left with nothing to answer is answered, or gone if empty.
+    for batch in proposal_models.AssignmentBatch.objects.filter(pk__in=batch_ids):
+        remaining = batch.items.all()
+        if not remaining.exists():
+            batch.delete()
+        elif not remaining.filter(status=AssignmentItemStatuses.PENDING).exists():
+            batch.status = AssignmentBatchStatuses.RESPONDED
+            batch.responded_at = timezone.now()
+            batch.save(update_fields=["status", "responded_at"])
+    return len(pending_reviews)
+
+
 def return_to_applicant(proposal, user, reason, resubmit_by):
     """Hand a submitted proposal back to its applicant to fix and resubmit.
 
@@ -1310,6 +1356,11 @@ def return_to_applicant(proposal, user, reason, resubmit_by):
         open_reviews = list(
             proposal.review_set.filter(state=proposal_models.Review.States.IN_REVIEW)
         )
+        if proposal.round.call.withdraw_pending_reviews:
+            withdraw_pending_reviews(
+                proposal, "the proposal was returned to its applicant."
+            )
+            open_reviews = []
         for review in open_reviews:
             review.state = proposal_models.Review.States.REJECTED
             review.save(update_fields=["state"])
@@ -1369,6 +1420,57 @@ def extend_return(proposal, user, resubmit_by):
         scopes=[_get_customer(proposal)],
     )
     return returned
+
+
+def return_review_to_reviewer(review, user, reason):
+    """Hand a submitted review back to its reviewer to change, while its
+    proposal is still undecided. It is in review again, due afresh from now
+    (Review.review_end_date), and the reviewer is told why."""
+    with transaction.atomic():
+        review = (
+            proposal_models.Review.objects.select_for_update(of=("self",))
+            .select_related("proposal")
+            .get(pk=review.pk)
+        )
+        proposal = review.proposal
+        if review.state != proposal_models.Review.States.SUBMITTED:
+            raise serializers.ValidationError(
+                "Only a submitted review can be returned to its reviewer."
+            )
+        if proposal.state not in (ProposalStates.SUBMITTED, ProposalStates.IN_REVIEW):
+            raise serializers.ValidationError(
+                "The proposal has been decided; its reviews can no longer change."
+            )
+        if proposal.decision_held:
+            raise serializers.ValidationError(
+                "This proposal has a decision held for publication; reopen the "
+                "decision before returning its reviews."
+            )
+        review.state = proposal_models.Review.States.IN_REVIEW
+        review.returned_at = timezone.now()
+        review.returned_by = user
+        review.return_reason = reason
+        review.save(
+            update_fields=[
+                "state",
+                "returned_at",
+                "returned_by",
+                "return_reason",
+                "modified",
+            ]
+        )
+        event_logger.emit(
+            "Review for {proposal_name} has been returned to its reviewer by "
+            "{returned_by}.",
+            event_type=EventType.REVIEW_RETURNED,
+            event_context={
+                "review": review,
+                "proposal_name": proposal.name,
+                "returned_by": user.full_name if user else "",
+            },
+            scopes=[_get_customer(review)],
+        )
+    return review
 
 
 def close_open_return(proposal):

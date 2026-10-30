@@ -1,4 +1,4 @@
-Hello,
+{% load tz %}Hello,
 {% if extended %}
 The deadline to resubmit your proposal "{{ proposal_name }}" in call "{{ call_name }}" has been extended.
 {% else %}
@@ -7,7 +7,7 @@ The managers of call "{{ call_name }}" have returned your proposal "{{ proposal_
 Reason:
 {{ reason }}
 {% endif %}
-Please resubmit it by {{ resubmit_by }}: {{ proposal_url }}
+Please resubmit it by {{ resubmit_by|utc|date:"j F Y, H:i" }} UTC: {{ proposal_url }}
 
 If you have any questions, please contact the call's managers.
 

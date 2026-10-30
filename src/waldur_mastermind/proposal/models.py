@@ -11,8 +11,10 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import MinValueValidator
 from django.db import models, transaction
 from django.db.models import Q
+from django.db.models.functions import Coalesce, Greatest
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from django.utils.translation import ngettext
 from model_utils import FieldTracker
 from model_utils.models import TimeStampedModel
 from model_utils.tracker import FieldInstanceTracker
@@ -294,6 +296,60 @@ class Call(
             "carried over) is cancelled. Off: it stays a draft, which can no "
             "longer be submitted, until the stale-draft clean-up (site settings "
             "PROPOSAL_STALE_DRAFT_*) warns its team and deletes it."
+        ),
+    )
+
+    single_proposal_manager = models.BooleanField(
+        default=False,
+        help_text=(
+            "Whether each proposal has exactly one proposal manager, its "
+            "owner. Granting the manager role then hands the proposal over: "
+            "the previous manager becomes a proposal administrator and the "
+            "new one its owner (created_by). Off: a proposal may have several "
+            "managers."
+        ),
+    )
+    copy_summary_to_project = models.BooleanField(
+        default=False,
+        help_text=(
+            "Whether the project created for an accepted proposal takes the "
+            "proposal's summary as its description."
+        ),
+    )
+    minimum_number_of_documents = models.PositiveSmallIntegerField(
+        default=0,
+        help_text=(
+            "How many supporting documents a proposal must have before it can "
+            "be submitted. 0: none is required by number (the call's field "
+            "settings may still require supporting documentation)."
+        ),
+    )
+    one_request_per_offering = models.BooleanField(
+        default=False,
+        help_text=(
+            "Whether a proposal holds at most one resource request per "
+            "offering: a new request for an offering it already requests "
+            "replaces the earlier one. Off: it may request an offering more "
+            "than once."
+        ),
+    )
+    reviewers_see_assigned_only = models.BooleanField(
+        default=False,
+        help_text=(
+            "Whether a call reviewer (the CALL.REVIEWER role) reads only the "
+            "proposals they review. Off: they read every submitted proposal in "
+            "the call. Panel members read every submitted proposal either way; "
+            "neither reads drafts."
+        ),
+    )
+    withdraw_pending_reviews = models.BooleanField(
+        default=False,
+        help_text=(
+            "Whether a proposal's unfinished reviews and unanswered review "
+            "requests are deleted once they are no longer needed: when it is "
+            "accepted, rejected or cancelled, or returned to its applicant. "
+            "Off: they stay, and a returned proposal's reviews are marked "
+            "rejected."
         ),
     )
 
@@ -1202,6 +1258,33 @@ class ProposalIDGenerator(models.Model):
         )
 
 
+def documents_missing_message(call) -> str:
+    required = call.minimum_number_of_documents
+    return ngettext(
+        "This call requires at least %(count)d supporting document.",
+        "This call requires at least %(count)d supporting documents.",
+        required,
+    ) % {"count": required}
+
+
+def documents_missing_expression():
+    """How many supporting documents each proposal still lacks for its call's
+    minimum, for querysets that serialise ``can_submit`` for many proposals at
+    once; ``Proposal.documents_missing`` reads the annotation when present."""
+    attached = (
+        ProposalDocumentation.objects.filter(proposal=models.OuterRef("pk"))
+        .order_by()
+        .values("proposal")
+        .annotate(count=models.Count("pk"))
+        .values("count")
+    )
+    return Greatest(
+        models.F("round__call__minimum_number_of_documents")
+        - Coalesce(models.Subquery(attached), 0),
+        0,
+    )
+
+
 def has_proposal_manager_expression():
     """``Exists`` over a proposal's active proposal manager grants.
 
@@ -1229,7 +1312,7 @@ def filter_proposals(user):
                 user
             )
         )
-        | Q(round__call__in=managers.get_connected_calls(user))
+        | managers.get_call_role_proposals_query(user)
         # Offering managers (technical reviewers) act on the technical_assessment
         # step, so they must be able to retrieve the non-draft proposals that
         # requested one of their accepted offerings (not every proposal on the
@@ -1511,10 +1594,24 @@ class Proposal(
                 "%(offerings)s."
             ) % {"offerings": ", ".join(missing_orders)}
 
+        documents_missing = self.documents_missing()
+        if documents_missing:
+            return False, documents_missing_message(self.round.call)
+
         if not self.has_proposal_manager():
             return False, MISSING_PROPOSAL_MANAGER_MESSAGE
 
         return True, None
+
+    def documents_missing(self) -> int:
+        """How many more supporting documents the call requires."""
+        annotated = getattr(self, "_documents_missing", None)
+        if annotated is not None:
+            return annotated
+        required = self.round.call.minimum_number_of_documents
+        if not required:
+            return 0
+        return max(0, required - self.proposaldocumentation_set.count())
 
     def save(self, *args, **kwargs):
         if not self.slug:
@@ -1941,6 +2038,27 @@ class Review(
     summary_score = models.PositiveSmallIntegerField(blank=True, default=0)
     summary_public_comment = models.TextField(blank=True)
     summary_private_comment = models.TextField(blank=True)
+    rejection_reason = models.TextField(
+        blank=True,
+        help_text="Why the reviewer declined the review, for the call's managers.",
+    )
+    returned_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the call's managers last returned the submitted review "
+        "to its reviewer. The review is then due afresh from this time.",
+    )
+    returned_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    return_reason = models.TextField(
+        blank=True,
+        help_text="What the call's managers asked the reviewer to change.",
+    )
     comment_project_title = models.CharField(max_length=255, null=True, blank=True)
     comment_project_summary = models.CharField(max_length=255, null=True, blank=True)
     comment_project_description = models.CharField(
@@ -1985,7 +2103,8 @@ class Review(
         if not self.proposal.round.review_duration_in_days:
             return None
 
-        end_date = self.created + timedelta(
+        # A review returned to its reviewer is due afresh from its return.
+        end_date = (self.returned_at or self.created) + timedelta(
             days=self.proposal.round.review_duration_in_days
         )
         try:

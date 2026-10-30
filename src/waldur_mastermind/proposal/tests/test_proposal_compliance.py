@@ -357,6 +357,9 @@ class ProposalComplianceAPITest(ProposalComplianceTestMixin, test.APITestCase):
 
     def test_reviewer_can_access_compliance_checklist(self):
         """Test that reviewers can access compliance checklist (same permission as viewing proposal)."""
+        # Call reviewers read submitted proposals, never drafts.
+        self.fixture.proposal.state = ProposalStates.SUBMITTED
+        self.fixture.proposal.save()
         url = (
             proposal_factories.ProposalFactory.get_url(self.fixture.proposal)
             + "checklist/"
@@ -371,6 +374,9 @@ class ProposalComplianceAPITest(ProposalComplianceTestMixin, test.APITestCase):
 
     def test_unauthorized_answer_submission(self):
         """Test that unauthorized users cannot submit answers."""
+        # Call reviewers read submitted proposals, never drafts.
+        self.fixture.proposal.state = ProposalStates.SUBMITTED
+        self.fixture.proposal.save()
         url = (
             proposal_factories.ProposalFactory.get_url(self.fixture.proposal)
             + "submit_answers/"
@@ -1071,6 +1077,9 @@ class AssignedReviewerComplianceAccessTest(
                 )
 
     def test_review_view_of_compliance_checklist_is_for_call_managers(self):
+        # Call reviewers read submitted proposals, never drafts.
+        self.proposal.state = ProposalStates.SUBMITTED
+        self.proposal.save()
         for user, expected in (
             (self.fixture.call_manager, status.HTTP_200_OK),
             (self.fixture.call_organizer_user, status.HTTP_200_OK),

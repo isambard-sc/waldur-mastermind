@@ -46,15 +46,21 @@ class ProposalAsRoleFilterTest(test.APITestCase):
         # Reviews for this one.
         self.reviewed_round = self._make_round()
         self.reviewed_round.call.add_user(self.user, CallRole.REVIEWER)
+        # Call reviewers and panel members read submitted proposals, never
+        # drafts.
         self.reviewed_proposal = factories.ProposalFactory(
-            name="On a call I review for", round=self.reviewed_round
+            name="On a call I review for",
+            round=self.reviewed_round,
+            state=ProposalStates.SUBMITTED,
         )
 
         # Sits on this one's panel.
         self.panel_round = self._make_round()
         self.panel_round.call.add_user(self.user, CallRole.PANEL_MEMBER)
         self.panel_proposal = factories.ProposalFactory(
-            name="On a call I sit on the panel of", round=self.panel_round
+            name="On a call I sit on the panel of",
+            round=self.panel_round,
+            state=ProposalStates.SUBMITTED,
         )
 
         # Technically assesses this one: it requested an accepted offering they

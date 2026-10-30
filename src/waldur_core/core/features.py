@@ -175,7 +175,7 @@ class UserSection(FeatureSection):
     )
 
     allow_user_creation = Feature(
-        "Allow users to create new user accounts when adding team members to projects and proposals."
+        "Allow users to create new user accounts when adding team members to projects and proposals. An account created by adding a proposal team member by email takes the email as its username."
     )
 
     pending_user_actions = Feature("Show pending user actions.")

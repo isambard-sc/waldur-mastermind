@@ -1,12 +1,15 @@
 import collections
 import logging
 
+from django.contrib.contenttypes.models import ContentType
 from django.db.models import Q
 
 from waldur_core.core.models import User
+from waldur_core.permissions.models import UserRole
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.marketplace.enums import ResourceStates
 from waldur_mastermind.marketplace.models import Offering, Resource
+from waldur_mastermind.proposal import models as proposal_models
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +102,42 @@ def get_mapping(query):
                 if email not in notification_emails:
                     notification_emails[email] = info
 
+    for user in get_round_recipients(query):
+        users[user.id] = user
+
     return users, user_offerings, user_customers, notification_emails
+
+
+def get_round_recipients(query):
+    """The people of the query's proposal rounds: the teams of their
+    proposals (in the given states, or all), and their reviewers if asked."""
+    rounds = query.get("rounds")
+    if not rounds:
+        return []
+    proposals = proposal_models.Proposal.objects.filter(round__in=rounds)
+    if query.get("proposal_states"):
+        proposals = proposals.filter(state__in=query["proposal_states"])
+    user_ids = set()
+    if query.get("proposal_teams", True):
+        user_ids |= set(
+            UserRole.objects.filter(
+                content_type=ContentType.objects.get_for_model(
+                    proposal_models.Proposal
+                ),
+                object_id__in=proposals.values("id"),
+                is_active=True,
+            ).values_list("user_id", flat=True)
+        )
+        user_ids |= set(
+            proposals.exclude(created_by=None).values_list("created_by_id", flat=True)
+        )
+    if query.get("reviewers"):
+        user_ids |= set(
+            proposal_models.Review.objects.filter(proposal__in=proposals)
+            .exclude(state=proposal_models.Review.States.REJECTED)
+            .values_list("reviewer_id", flat=True)
+        )
+    return User.objects.filter(id__in=user_ids, is_active=True).exclude(email="")
 
 
 def get_recipients_for_query(query):

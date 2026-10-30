@@ -324,6 +324,26 @@ def can_view_proposal_event_feed(user, proposal) -> bool:
     return not _is_reviewer_only_view(user, proposal)
 
 
+def can_view_call_event_feed(user, call) -> bool:
+    """Whether the user may read the events logged against the call.
+
+    The call feed is its managers' administration trail: who was given which
+    role on the call (reviewers and panel members among them), invitations
+    and settings changes. Those who hold a call role only to evaluate its
+    proposals do not read it; those who run the call, staff and support do.
+    """
+    if user.is_anonymous:
+        return False
+    if user.is_staff or user.is_support:
+        return True
+    visibility = ApplicantVisibility(user)
+    if visibility._manages_call(call):
+        return True
+    return call.id not in get_connected_calls(
+        user, [CallRole.REVIEWER, CallRole.PANEL_MEMBER]
+    )
+
+
 def get_concealed_team_member_query(query_params, concealed: set[str]) -> list[str]:
     """Return the list_users query parameters that match on a concealed
     attribute, as they appear in the request."""
@@ -685,6 +705,9 @@ class ProposalReviewSerializer(
             "summary_score",
             "summary_public_comment",
             "summary_private_comment",
+            "rejection_reason",
+            "returned_at",
+            "return_reason",
             "round_uuid",
             "round_name",
             "round_slug",
@@ -707,7 +730,13 @@ class ProposalReviewSerializer(
             "created",
             "modified",
         )
-        read_only_fields = ("coi_confirmed", "coi_confirmed_at")
+        read_only_fields = (
+            "coi_confirmed",
+            "coi_confirmed_at",
+            "rejection_reason",
+            "returned_at",
+            "return_reason",
+        )
         protected_fields = ("proposal", "reviewer")
         extra_kwargs = {
             "url": {
@@ -805,8 +834,12 @@ class ProposalReviewSerializer(
             # Show real reviewer info, hide anonymous identifier
             fields.pop("anonymous_reviewer_name", None)
 
-        # Always remove private comments for non-authorized users
+        # Always remove private comments for non-authorized users, and what
+        # passed between the reviewer and the call's managers.
         fields.pop("summary_private_comment", None)
+        fields.pop("rejection_reason", None)
+        fields.pop("returned_at", None)
+        fields.pop("return_reason", None)
 
         return fields
 
@@ -850,6 +883,85 @@ set_override(
         "summary_private_comment",
     ],
 )
+
+
+class ReviewAssignmentImportSerializer(serializers.Serializer):
+    round = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.Round.objects.all(),
+        help_text="The round whose proposals the file assigns.",
+    )
+    file = serializers.FileField(
+        help_text="CSV with a proposal_id column (the proposal's ID, its slug) "
+        "and a reviewer_email column (a call reviewer's email).",
+    )
+    apply = serializers.BooleanField(
+        default=False,
+        help_text="False: only report what each row would do. True: create the "
+        "reviews for the valid rows; their reviewers are emailed as for any "
+        "review assigned by hand.",
+    )
+
+
+class ReviewAssignmentImportRowSerializer(serializers.Serializer):
+    line = serializers.IntegerField()
+    proposal_id = serializers.CharField()
+    reviewer_email = serializers.CharField()
+    proposal_name = serializers.CharField()
+    reviewer_name = serializers.CharField()
+    status = serializers.ChoiceField(
+        choices=["created", "ready", "skipped", "error"],
+        help_text="created (applied), ready (dry run: would be created), "
+        "skipped (already assigned) or error.",
+    )
+    detail = serializers.CharField()
+
+
+class AddUserByEmailSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    first_name = serializers.CharField(
+        max_length=100,
+        required=False,
+        allow_blank=True,
+        help_text="Used only when the account is created.",
+    )
+    last_name = serializers.CharField(
+        max_length=100,
+        required=False,
+        allow_blank=True,
+        help_text="Used only when the account is created.",
+    )
+    role = serializers.CharField()
+    expiration_time = serializers.DateTimeField(
+        required=False, allow_null=True, input_formats=["%Y-%m-%d", "iso-8601"]
+    )
+
+    def validate_email(self, value):
+        return value.strip().lower()
+
+
+class AddUserByEmailResultSerializer(serializers.Serializer):
+    user_uuid = serializers.UUIDField()
+    created = serializers.BooleanField(
+        help_text="Whether the account was created by this request."
+    )
+    expiration_time = serializers.DateTimeField(allow_null=True)
+
+
+class ReturnToReviewerSerializer(serializers.Serializer):
+    reason = serializers.CharField(
+        max_length=2000,
+        help_text="What the reviewer is asked to change; sent to them.",
+    )
+
+
+class ReviewRejectSerializer(serializers.Serializer):
+    reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=2000,
+        help_text="Why the reviewer declines; sent to the call's managers.",
+    )
 
 
 class ReviewSubmitSerializer(serializers.ModelSerializer):
@@ -1594,6 +1706,14 @@ class RequestedResourceSerializer(
 
     def create(self, validated_data):
         validated_data["created_by"] = self.context["request"].user
+        proposal = validated_data["proposal"]
+        if proposal.round.call.one_request_per_offering:
+            # The latest request for an offering is the one that counts, so
+            # it cannot be provisioned twice on award.
+            models.RequestedResource.objects.filter(
+                proposal=proposal,
+                requested_offering=validated_data["requested_offering"],
+            ).delete()
         return super().create(validated_data)
 
 
@@ -2071,6 +2191,12 @@ class ProtectedCallSerializer(PublicCallSerializer):
             "order_author_user_name",
             "carry_over_drafts",
             "cancel_drafts_at_cutoff",
+            "withdraw_pending_reviews",
+            "reviewers_see_assigned_only",
+            "one_request_per_offering",
+            "minimum_number_of_documents",
+            "copy_summary_to_project",
+            "single_proposal_manager",
             "undecided_at_round_completion",
         )
         view_name = "proposal-protected-call-detail"

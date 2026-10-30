@@ -2300,6 +2300,9 @@ class ProposalTeamVisibilityTest(test.APITestCase):
         )
 
     def test_call_reviewer_can_view_proposal_team(self):
+        # Call reviewers read submitted proposals, never drafts.
+        self.fixture.proposal.state = ProposalStates.SUBMITTED
+        self.fixture.proposal.save()
         self.client.force_authenticate(self.fixture.reviewer_1)
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)

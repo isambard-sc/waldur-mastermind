@@ -30,6 +30,7 @@ from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
 from rest_framework import decorators, exceptions, mixins, response, status, viewsets
 from rest_framework import permissions as rf_permissions
+from rest_framework.parsers import FormParser, MultiPartParser
 
 from waldur_core.checklist import enums as checklist_enums
 from waldur_core.checklist import models as checklist_models
@@ -38,7 +39,7 @@ from waldur_core.checklist.enums import ChecklistTypes
 from waldur_core.checklist.mixins import ReviewerChecklistMixin, UserChecklistMixin
 from waldur_core.core import validators as core_validators
 from waldur_core.core.exceptions import IncorrectStateException
-from waldur_core.core.models import User
+from waldur_core.core.models import User, is_feature_enabled
 from waldur_core.core.utils import SubqueryCount
 from waldur_core.core.views import (
     ActionMethodMixin,
@@ -51,11 +52,12 @@ from waldur_core.logging.enums import EventType
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CallRole, ProposalRole
+from waldur_core.permissions.serializers import UserRoleCreateSerializer
 from waldur_core.permissions.utils import (
     has_permission,
     permission_factory,
 )
-from waldur_core.permissions.views import UserRoleMixin
+from waldur_core.permissions.views import UserRoleMixin, validate_scope_not_soft_deleted
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure.managers import (
     filter_queryset_for_user,
@@ -73,6 +75,7 @@ from waldur_mastermind.proposal import (
     filters,
     models,
     orcid_service,
+    review_import,
     round_lifecycle,
     serializers,
     tasks,
@@ -231,6 +234,14 @@ def validate_project_details_complete(proposal):
         raise exceptions.ValidationError(
             _("The following required fields are empty: %(fields)s.")
             % {"fields": ", ".join(sorted(missing))}
+        )
+
+
+def validate_documents_present(proposal):
+    """The call's minimum number of supporting documents is attached."""
+    if proposal.documents_missing():
+        raise exceptions.ValidationError(
+            models.documents_missing_message(proposal.round.call)
         )
 
 
@@ -715,6 +726,24 @@ _EXPORT_PROPOSAL_PARAMETER = _export_uuid_parameter(
     "proposal_uuid", "proposal_proposals_list", "Limit the export to one proposal."
 )
 
+_EXPORT_FILE_FORMAT_PARAMETER = OpenApiParameter(
+    "file_format",
+    OpenApiTypes.STR,
+    OpenApiParameter.QUERY,
+    enum=["csv", "xlsx"],
+    description=(
+        "csv (the default) or xlsx, an Excel workbook of the same rows. Named "
+        "file_format because a bare `format` is read by the API itself."
+    ),
+)
+
+
+def _export_response(request, rows, basename, title):
+    if request.query_params.get("file_format") == "xlsx":
+        return exports.xlsx_response(rows, f"{basename}.xlsx", title)
+    return exports.csv_response(rows, f"{basename}.csv")
+
+
 _EXPORT_NAME_PARAMETER = OpenApiParameter(
     "proposal_name",
     OpenApiTypes.STR,
@@ -990,6 +1019,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             _EXPORT_ROUND_PARAMETER,
             _EXPORT_APPLICANT_PARAMETER,
             _EXPORT_NAME_PARAMETER,
+            _EXPORT_FILE_FORMAT_PARAMETER,
             OpenApiParameter(
                 "proposal_state",
                 OpenApiTypes.STR,
@@ -999,7 +1029,10 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                 description="Limit the export to proposals in these states.",
             ),
         ],
-        responses={(200, "text/csv"): OpenApiTypes.BINARY},
+        responses={
+            (200, "text/csv"): OpenApiTypes.BINARY,
+            (200, exports.XLSX_CONTENT_TYPE): OpenApiTypes.BINARY,
+        },
         filters=False,
     )
     @decorators.action(detail=True, methods=["get"], url_path="export-proposals")
@@ -1013,9 +1046,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             name=request.query_params.get("proposal_name"),
         )
         schema = exports.CallExportSchema(call)
-        return exports.csv_response(
+        return _export_response(
+            request,
             exports.proposal_rows(schema, queryset),
-            f"{call.slug}-proposals.csv",
+            f"{call.slug}-proposals",
+            "Proposals",
         )
 
     export_proposals_permissions = [
@@ -1036,6 +1071,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             _EXPORT_REVIEWER_PARAMETER,
             _EXPORT_PROPOSAL_PARAMETER,
             _EXPORT_NAME_PARAMETER,
+            _EXPORT_FILE_FORMAT_PARAMETER,
             OpenApiParameter(
                 "review_state",
                 OpenApiTypes.STR,
@@ -1045,7 +1081,10 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
                 description="Limit the export to reviews in these states.",
             ),
         ],
-        responses={(200, "text/csv"): OpenApiTypes.BINARY},
+        responses={
+            (200, "text/csv"): OpenApiTypes.BINARY,
+            (200, exports.XLSX_CONTENT_TYPE): OpenApiTypes.BINARY,
+        },
         filters=False,
     )
     @decorators.action(detail=True, methods=["get"], url_path="export-reviews")
@@ -1059,9 +1098,11 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
             proposal_uuid=_export_uuid(request, "proposal_uuid"),
             proposal_name=request.query_params.get("proposal_name"),
         )
-        return exports.csv_response(
+        return _export_response(
+            request,
             exports.review_rows(queryset),
-            f"{call.slug}-reviews.csv",
+            f"{call.slug}-reviews",
+            "Reviews",
         )
 
     export_reviews_permissions = export_proposals_permissions
@@ -1295,6 +1336,50 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         )
 
     rounds_serializer_class = serializers.ProtectedRoundSerializer
+
+    @extend_schema(
+        request={"multipart/form-data": serializers.ReviewAssignmentImportSerializer},
+        responses=serializers.ReviewAssignmentImportRowSerializer(many=True),
+        description="Assign reviewers to a round's proposals from a CSV file of "
+        "proposal IDs and call reviewers' emails. First call it without apply "
+        "to see what each row would do; with apply, a review is created for "
+        "every valid row. Rows already assigned are skipped.",
+    )
+    @decorators.action(
+        detail=True,
+        methods=["post"],
+        url_path="import-review-assignments",
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def import_review_assignments(self, request, uuid=None):
+        call: models.Call = self.get_object()
+        payload = serializers.ReviewAssignmentImportSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        round_obj = payload.validated_data["round"]
+        if round_obj.call_id != call.id:
+            raise exceptions.ValidationError({"round": _("Not a round of this call.")})
+        try:
+            text = payload.validated_data["file"].read().decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raise exceptions.ValidationError({"file": _("The file is not UTF-8 text.")})
+        rows = review_import.parse_rows(text)
+        results = review_import.import_assignments(
+            call,
+            round_obj,
+            rows,
+            request.user,
+            payload.validated_data["apply"],
+            check_reviewer_workload_limit,
+        )
+        return response.Response(
+            serializers.ReviewAssignmentImportRowSerializer(results, many=True).data
+        )
+
+    import_review_assignments_permissions = [
+        permission_factory(
+            PermissionEnum.MANAGE_PROPOSAL_REVIEW, CALL_PERMISSION_SOURCES
+        )
+    ]
 
     @extend_schema(
         operation_id="proposal_protected_calls_rounds_bulk_set",
@@ -3288,6 +3373,7 @@ class ProposalViewSet(
                 _latest_step_status=Subquery(latest_step_status),
                 # Read by can_submit.
                 _has_proposal_manager=models.has_proposal_manager_expression(),
+                _documents_missing=models.documents_missing_expression(),
             )
             # ProposalSerializer.can_submit reads every requested resource, its
             # call entry and the offering's components. Prefetched here for the
@@ -3577,6 +3663,7 @@ class ProposalViewSet(
         core_validators.StateValidator(ProposalStates.DRAFT),
         validate_round_is_open,
         validate_project_details_complete,
+        validate_documents_present,
         validate_requested_amounts_present,
         validate_purchase_orders_present,
         validate_proposal_manager_present,
@@ -4038,6 +4125,71 @@ class ProposalViewSet(
     complete_workflow_step_permissions = [
         proposal_permissions.can_act_on_active_workflow_step
     ]
+
+    @extend_schema(
+        request=serializers.AddUserByEmailSerializer,
+        responses={status.HTTP_201_CREATED: serializers.AddUserByEmailResultSerializer},
+        description="Add someone to the proposal's team by email, creating their "
+        "account (the email is its username) if there is none, so they need "
+        "not accept an invitation. Checked exactly as add_user is; a refused "
+        "grant creates no account. Only while the site allows user creation "
+        "(feature user.allow_user_creation).",
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def add_user_by_email(self, request, uuid=None):
+        if not is_feature_enabled("user.allow_user_creation"):
+            raise exceptions.PermissionDenied(
+                _("Adding team members by email is not enabled on this site.")
+            )
+        proposal = self.get_object()
+        validate_scope_not_soft_deleted(proposal)
+        input_serializer = serializers.AddUserByEmailSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        data = input_serializer.validated_data
+        email = data["email"]
+
+        with transaction.atomic():
+            user = (
+                User.objects.filter(email__iexact=email).order_by("date_joined").first()
+                or User.objects.filter(username__iexact=email).first()
+            )
+            created = user is None
+            if created:
+                user = User.objects.create_user(
+                    username=email,
+                    email=email,
+                    first_name=data.get("first_name", ""),
+                    last_name=data.get("last_name", ""),
+                    registration_method="proposal",
+                )
+                user.set_unusable_password()
+                user.save()
+            role_serializer = UserRoleCreateSerializer(
+                data={
+                    "user": user.uuid.hex,
+                    "role": data["role"],
+                    "expiration_time": data.get("expiration_time"),
+                },
+                context={"scope": proposal, "request": request, "view": self},
+            )
+            # Raised inside the transaction: a refused grant leaves no account.
+            role_serializer.is_valid(raise_exception=True)
+            perm = self.grant_validated_role(proposal, role_serializer.validated_data)
+
+        if created:
+            logger.info(
+                "Created user %s by email for the team of proposal %s.",
+                user.uuid.hex,
+                proposal.uuid.hex,
+            )
+        result = serializers.AddUserByEmailResultSerializer(
+            {
+                "user_uuid": user.uuid,
+                "created": created,
+                "expiration_time": perm.expiration_time,
+            }
+        )
+        return response.Response(result.data, status=status.HTTP_201_CREATED)
 
     @extend_schema(
         description=(
@@ -4747,13 +4899,13 @@ class ReviewViewSet(ActionsViewSet):
 
     def perform_create(self, serializer):
         proposal = serializer.validated_data["proposal"]
+        # A draft is its applicants' alone until they submit it.
         if proposal.state not in [
-            ProposalStates.DRAFT,
             ProposalStates.IN_REVIEW,
             ProposalStates.SUBMITTED,
         ]:
             raise exceptions.ValidationError(
-                _("Valid states for proposals: Draft, In Review, Submitted.")
+                _("Valid states for proposals: In Review, Submitted.")
             )
         with transaction.atomic():
             # A reviewer in the call's pool may not be given reviews above
@@ -4824,14 +4976,18 @@ class ReviewViewSet(ActionsViewSet):
         raise exceptions.PermissionDenied()
 
     @extend_schema(
-        description="Reject a review, changing its state to REJECTED.",
-        request=None,
+        description="Reject a review, changing its state to REJECTED. The "
+        "reviewer may say why; the reason is sent to the call's managers.",
+        request=serializers.ReviewRejectSerializer,
         responses={status.HTTP_200_OK: None},
     )
     @decorators.action(detail=True, methods=["post"])
     def reject(self, request, uuid=None):
         review: models.Review = self.get_object()
+        serializer = serializers.ReviewRejectSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         review.state = models.Review.States.REJECTED
+        review.rejection_reason = serializer.validated_data.get("reason", "")
         review.save()
         tasks.notify_call_managers_about_rejected_review.delay(review.uuid)
         return response.Response(
@@ -4842,6 +4998,36 @@ class ReviewViewSet(ActionsViewSet):
     reject_validators = [
         core_validators.StateValidator(models.Review.States.IN_REVIEW),
     ]
+
+    @extend_schema(
+        description="Return a submitted review to its reviewer to change, while "
+        "the proposal is undecided. It is in review again, due afresh from now, "
+        "and the reviewer is emailed the reason. For those who may decide the "
+        "call's proposals.",
+        request=serializers.ReturnToReviewerSerializer,
+        responses={status.HTTP_200_OK: serializers.ProposalReviewSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def return_to_reviewer(self, request, uuid=None):
+        review: models.Review = self.get_object()
+        input_serializer = serializers.ReturnToReviewerSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        review = utils.return_review_to_reviewer(
+            review, request.user, input_serializer.validated_data["reason"]
+        )
+        transaction.on_commit(
+            lambda: tasks.notify_reviewer_about_returned_review.delay(review.uuid.hex)
+        )
+        return response.Response(
+            self.get_serializer(review).data, status=status.HTTP_200_OK
+        )
+
+    def can_decide_reviewed_proposal(request, view, obj=None):
+        proposal_permissions.can_decide_proposal(
+            request, view, obj.proposal if obj else None
+        )
+
+    return_to_reviewer_permissions = [can_decide_reviewed_proposal]
 
     @extend_schema(
         description="Submit a review, changing its state to SUBMITTED.",

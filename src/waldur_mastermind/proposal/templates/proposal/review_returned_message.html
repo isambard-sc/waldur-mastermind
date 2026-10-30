@@ -1,0 +1,19 @@
+{% load tz %}<html>
+<head lang="en">
+    <meta charset="UTF-8">
+    <title>Your review has been returned to you</title>
+</head>
+<body>
+<p>Hello,</p>
+<p>The managers of call "{{ call_name }}" have returned your review of proposal "{{ proposal_name }}" to you, and ask you to change it before submitting it again.</p>
+<p><strong>Their request:</strong></p>
+<p style="white-space: pre-wrap;">{{ reason }}</p>
+{% if review_end_date %}
+<p>Please submit it again by <strong>{{ review_end_date|utc|date:"j F Y, H:i" }} UTC</strong>: <a href="{{ review_url }}">{{ review_url }}</a></p>
+{% else %}
+<p>Your review: <a href="{{ review_url }}">{{ review_url }}</a></p>
+{% endif %}
+<p>If you have any questions, please contact the call's managers.</p>
+<p>This is an automated message from the {{ site_name }}. Please do not reply to this email.</p>
+</body>
+</html>

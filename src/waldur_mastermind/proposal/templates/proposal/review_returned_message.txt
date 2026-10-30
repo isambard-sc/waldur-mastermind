@@ -1,0 +1,14 @@
+{% load tz %}Hello,
+
+The managers of call "{{ call_name }}" have returned your review of proposal "{{ proposal_name }}" to you, and ask you to change it before submitting it again.
+
+Their request:
+{{ reason }}
+{% if review_end_date %}
+Please submit it again by {{ review_end_date|utc|date:"j F Y, H:i" }} UTC: {{ review_url }}
+{% else %}
+Your review: {{ review_url }}
+{% endif %}
+If you have any questions, please contact the call's managers.
+
+This is an automated message from the {{ site_name }}. Please do not reply to this email.

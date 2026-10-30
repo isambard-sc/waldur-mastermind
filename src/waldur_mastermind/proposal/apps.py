@@ -50,6 +50,15 @@ class ProposalConfig(AppConfig):
                         f"{related_model.__name__}"
                     ),
                 )
+        permission_signals.role_granted.connect(
+            handlers.hand_over_single_proposal_manager,
+            dispatch_uid="waldur_mastermind.proposal.hand_over_single_proposal_manager",
+        )
+        signals.post_save.connect(
+            handlers.withdraw_reviews_of_decided_proposal,
+            sender=models.Proposal,
+            dispatch_uid="waldur_mastermind.proposal.withdraw_reviews_of_decided_proposal",
+        )
         signals.post_save.connect(
             handlers.create_checklist_completion,
             sender=models.Proposal,
@@ -79,6 +88,12 @@ class ProposalConfig(AppConfig):
         # Evaluators read the proposal but not its team administration trail.
         logging_utils.register_scope_event_guard(
             models.Proposal, serializers.can_view_proposal_event_feed
+        )
+        # Nor the call's: who reviews or sits on its panel is its managers' to
+        # know. Its events still reach the managing organisation's feed, which
+        # those it keeps out (reviewers, panel members) cannot read.
+        logging_utils.register_scope_event_guard(
+            models.Call, serializers.can_view_call_event_feed, wider_feeds=True
         )
         # That a held decision was reopened tells that one had been made: only
         # those who may see held decisions learn it before the round publishes.
