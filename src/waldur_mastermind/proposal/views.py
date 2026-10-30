@@ -30,6 +30,7 @@ from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema, extend_schema_view
 from rest_framework import decorators, exceptions, mixins, response, status, viewsets
 from rest_framework import permissions as rf_permissions
+from rest_framework.parsers import FormParser, MultiPartParser
 
 from waldur_core.checklist import enums as checklist_enums
 from waldur_core.checklist import models as checklist_models
@@ -74,6 +75,7 @@ from waldur_mastermind.proposal import (
     filters,
     models,
     orcid_service,
+    review_import,
     round_lifecycle,
     serializers,
     tasks,
@@ -1304,6 +1306,50 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
         )
 
     rounds_serializer_class = serializers.ProtectedRoundSerializer
+
+    @extend_schema(
+        request={"multipart/form-data": serializers.ReviewAssignmentImportSerializer},
+        responses=serializers.ReviewAssignmentImportRowSerializer(many=True),
+        description="Assign reviewers to a round's proposals from a CSV file of "
+        "proposal IDs and call reviewers' emails. First call it without apply "
+        "to see what each row would do; with apply, a review is created for "
+        "every valid row. Rows already assigned are skipped.",
+    )
+    @decorators.action(
+        detail=True,
+        methods=["post"],
+        url_path="import-review-assignments",
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def import_review_assignments(self, request, uuid=None):
+        call: models.Call = self.get_object()
+        payload = serializers.ReviewAssignmentImportSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        round_obj = payload.validated_data["round"]
+        if round_obj.call_id != call.id:
+            raise exceptions.ValidationError({"round": _("Not a round of this call.")})
+        try:
+            text = payload.validated_data["file"].read().decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raise exceptions.ValidationError({"file": _("The file is not UTF-8 text.")})
+        rows = review_import.parse_rows(text)
+        results = review_import.import_assignments(
+            call,
+            round_obj,
+            rows,
+            request.user,
+            payload.validated_data["apply"],
+            check_reviewer_workload_limit,
+        )
+        return response.Response(
+            serializers.ReviewAssignmentImportRowSerializer(results, many=True).data
+        )
+
+    import_review_assignments_permissions = [
+        permission_factory(
+            PermissionEnum.MANAGE_PROPOSAL_REVIEW, CALL_PERMISSION_SOURCES
+        )
+    ]
 
     @extend_schema(
         operation_id="proposal_protected_calls_rounds_bulk_set",

@@ -885,6 +885,38 @@ set_override(
 )
 
 
+class ReviewAssignmentImportSerializer(serializers.Serializer):
+    round = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.Round.objects.all(),
+        help_text="The round whose proposals the file assigns.",
+    )
+    file = serializers.FileField(
+        help_text="CSV with a proposal_id column (the proposal's ID, its slug) "
+        "and a reviewer_email column (a call reviewer's email).",
+    )
+    apply = serializers.BooleanField(
+        default=False,
+        help_text="False: only report what each row would do. True: create the "
+        "reviews for the valid rows; their reviewers are emailed as for any "
+        "review assigned by hand.",
+    )
+
+
+class ReviewAssignmentImportRowSerializer(serializers.Serializer):
+    line = serializers.IntegerField()
+    proposal_id = serializers.CharField()
+    reviewer_email = serializers.CharField()
+    proposal_name = serializers.CharField()
+    reviewer_name = serializers.CharField()
+    status = serializers.ChoiceField(
+        choices=["created", "ready", "skipped", "error"],
+        help_text="created (applied), ready (dry run: would be created), "
+        "skipped (already assigned) or error.",
+    )
+    detail = serializers.CharField()
+
+
 class AddUserByEmailSerializer(serializers.Serializer):
     email = serializers.EmailField()
     first_name = serializers.CharField(
