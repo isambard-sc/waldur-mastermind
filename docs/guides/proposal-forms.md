@@ -199,8 +199,13 @@ every project that ended long ago.
 
 Links carry IDs only: `project_uuid`, and `proposal_uuid`, `call_uuid` and
 `round_uuid` when a call granted the project. The survey's endings return to
-`<HomePort>/projects/<uuid>/?form_survey=<survey id>`. Deleting the project
-deletes its answers, in Waldur and in Formbricks.
+`<HomePort>/projects/<uuid>/?form_survey=<survey id>`.
+
+The forms stay open through the project's grace period. When Waldur removes
+the project after it (a soft delete), the forms close but the answers are
+kept, in Waldur and in Formbricks: the call's managers, staff and support can
+still read them. They are deleted, in both, only if the project row itself
+is permanently deleted.
 
 ### Setting up (the AIRR end-of-project survey)
 

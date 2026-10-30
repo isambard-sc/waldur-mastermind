@@ -59,10 +59,11 @@ def can_fill_in_closing(user, project) -> bool:
 
 def can_read_closing(user, project, proposal) -> bool:
     """Those who fill them in, the managers of the call that granted the
-    project, staff and support. Not reviewers."""
+    project, staff and support. Not reviewers. Once the project is removed,
+    only the call's managers, staff and support."""
     if user.is_staff or user.is_support:
         return True
-    if can_fill_in_closing(user, project):
+    if not project.is_removed and can_fill_in_closing(user, project):
         return True
     return proposal is not None and proposal_permissions.oversees_proposal_call(
         user, proposal
