@@ -48,6 +48,12 @@ class ReportingMessage(UuidMixin, TimeStampedModel):
     # of whether any one file's copy succeeded.
     new_files = models.JSONField(default=list, blank=True)
     error_message = models.TextField(blank=True, default="")
+    # From the harness's /query response "usage" object (see run_agent.run's
+    # usage_out) - 0 for a pending/failed message, since no Bedrock call
+    # completed. Backs both the AI_REPORTING_TOKEN_LIMIT_*/GLOBAL_* Constance
+    # enforcement (ai_reporting.limits) and the usage-visibility report.
+    input_tokens = models.PositiveIntegerField(default=0)
+    output_tokens = models.PositiveIntegerField(default=0)
 
     class Meta:
         verbose_name = _("AI reporting message")

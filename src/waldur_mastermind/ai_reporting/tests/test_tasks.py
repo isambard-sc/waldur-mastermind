@@ -21,7 +21,10 @@ class AskHarnessTaskTest(test.APITestCase):
     def test_success_marks_done_and_stores_answer(self, mock_post):
         mock_post.return_value = mock.Mock(
             status_code=200,
-            json=lambda: {"answer": "There are 26 projects.", "new_files": ["a.png"]},
+            json=lambda: {
+                "answer": "There are 26 projects.", "new_files": ["a.png"],
+                "usage": {"input_tokens": 120, "output_tokens": 45},
+            },
         )
         mock_post.return_value.raise_for_status = mock.Mock()
 
@@ -31,6 +34,25 @@ class AskHarnessTaskTest(test.APITestCase):
         self.assertEqual(self.message.status, ReportingMessage.Status.DONE)
         self.assertEqual(self.message.answer, "There are 26 projects.")
         self.assertEqual(self.message.new_files, ["a.png"])
+        self.assertEqual(self.message.input_tokens, 120)
+        self.assertEqual(self.message.output_tokens, 45)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_missing_usage_defaults_to_zero(self, mock_post):
+        """A harness response with no "usage" key at all (shouldn't happen
+        post-upgrade, but a stale harness pod or a transient bug shouldn't
+        crash the task) must not raise - zero is the honest answer when the
+        cost of this call isn't known."""
+        mock_post.return_value = mock.Mock(
+            status_code=200, json=lambda: {"answer": "ok", "new_files": []},
+        )
+        mock_post.return_value.raise_for_status = mock.Mock()
+
+        ask_harness(self.message.pk)
+
+        self.message.refresh_from_db()
+        self.assertEqual(self.message.input_tokens, 0)
+        self.assertEqual(self.message.output_tokens, 0)
 
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
     def test_identity_headers_use_the_authenticated_users_and_sessions_real_uuids(
