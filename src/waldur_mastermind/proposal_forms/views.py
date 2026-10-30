@@ -101,8 +101,7 @@ class FormbricksConnectionTestView(views.APIView):
             result = {"ok": False, "detail": "Set the URL and API key first."}
         else:
             try:
-                client.check_connection(connection)
-                count = len(client.list_surveys(connection))
+                count = client.check_connection(connection)
                 result = {
                     "ok": True,
                     "detail": f"Connected. The key can see {count} survey(s).",

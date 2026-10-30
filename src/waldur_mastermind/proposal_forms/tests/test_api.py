@@ -135,8 +135,7 @@ class ConnectionApiTest(FormsTestBase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     @mock.patch.object(client, "list_surveys", return_value=[{"id": "s1"}])
-    @mock.patch.object(client, "check_connection")
-    def test_connection_test(self, check_connection, list_surveys):
+    def test_connection_test(self, list_surveys):
         self.client.force_authenticate(self.staff)
         response = self.client.post(self.url + "test/")
         self.assertEqual(
@@ -144,7 +143,7 @@ class ConnectionApiTest(FormsTestBase):
             {"ok": True, "detail": "Connected. The key can see 1 survey(s)."},
         )
 
-        check_connection.side_effect = client.FormbricksError("401 Unauthorized")
+        list_surveys.side_effect = client.FormbricksError("401 Unauthorized")
         response = self.client.post(self.url + "test/")
         self.assertFalse(response.data["ok"])
 

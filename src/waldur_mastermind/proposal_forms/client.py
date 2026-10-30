@@ -144,19 +144,40 @@ def _request(method, path, conn=None, json=None, params=None):
             ) from e
         if status == 404:
             raise FormbricksError(f"Formbricks has no {path} (404).") from e
-        raise FormbricksError(f"Formbricks {method} {path} failed: {e}") from e
+        detail = _error_detail(e.response)
+        raise FormbricksError(
+            f"Formbricks {method} {path} failed ({status})"
+            + (f": {detail}" if detail else ".")
+        ) from e
     except (requests.RequestException, ValueError) as e:
         raise FormbricksError(f"Formbricks {method} {path} failed: {e}") from e
+
+
+def _error_detail(response) -> str:
+    """Formbricks' own explanation of an error, from its JSON body."""
+    try:
+        body = response.json()
+    except ValueError:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    detail = body.get("message") or body.get("error") or body.get("code") or ""
+    return str(detail)[:300]
 
 
 def _get(path, conn=None, params=None):
     return _request("GET", path, conn, params=params)
 
 
-def check_connection(conn) -> dict:
-    """What the Management API says about this key: raises FormbricksError if
-    it cannot be reached or rejects the key."""
-    return _get("/api/v1/management/me", conn)
+def check_connection(conn) -> int:
+    """How many surveys the key can see: raises FormbricksError if Formbricks
+    cannot be reached or rejects the key.
+
+    Not /api/v1/management/me: Formbricks answers that with 400 for a key
+    that reaches more than one environment, which a key for a project's
+    production and development environments does.
+    """
+    return len(list_surveys(conn))
 
 
 def _strip_html(rich_text: str) -> str:

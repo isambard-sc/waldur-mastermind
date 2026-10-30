@@ -1,8 +1,10 @@
 import base64
 import time
+from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
-from django.test import RequestFactory, TestCase
+import requests
+from django.test import RequestFactory, SimpleTestCase, TestCase
 
 from waldur_mastermind.proposal_forms import client, models
 
@@ -187,3 +189,19 @@ class SurveyParsingTest(TestCase):
         self.assertEqual(client.survey_hidden_fields(survey), {"proposal_uuid"})
         survey["hiddenFields"]["enabled"] = False
         self.assertEqual(client.survey_hidden_fields(survey), set())
+
+
+class ErrorDetailTest(SimpleTestCase):
+    def test_formbricks_message_is_shown(self):
+        response = mock.Mock(status_code=400)
+        response.json.return_value = {
+            "code": "bad_request",
+            "message": "You can't use this method with this API key",
+        }
+        error = requests.HTTPError(response=response)
+        response.raise_for_status.side_effect = error
+        with mock.patch.object(client.requests, "request", return_value=response):
+            with self.assertRaises(client.FormbricksError) as raised:
+                client._request("GET", "/x", conn=mock.Mock(management_base_url="u"))
+        self.assertIn("You can't use this method", str(raised.exception))
+        self.assertIn("(400)", str(raised.exception))
