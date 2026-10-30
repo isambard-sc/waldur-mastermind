@@ -4747,13 +4747,13 @@ class ReviewViewSet(ActionsViewSet):
 
     def perform_create(self, serializer):
         proposal = serializer.validated_data["proposal"]
+        # A draft is its applicants' alone until they submit it.
         if proposal.state not in [
-            ProposalStates.DRAFT,
             ProposalStates.IN_REVIEW,
             ProposalStates.SUBMITTED,
         ]:
             raise exceptions.ValidationError(
-                _("Valid states for proposals: Draft, In Review, Submitted.")
+                _("Valid states for proposals: In Review, Submitted.")
             )
         with transaction.atomic():
             # A reviewer in the call's pool may not be given reviews above

@@ -9,6 +9,7 @@ from django.utils import timezone
 from waldur_core.core.models import User
 from waldur_core.core.utils import SubqueryCount
 from waldur_core.permissions.enums import RoleEnum
+from waldur_core.permissions.models import Role, UserRole
 from waldur_core.permissions.utils import get_scope_ids
 from waldur_core.structure.managers import get_connected_customers
 from waldur_mastermind.marketplace import models as marketplace_models
@@ -220,6 +221,41 @@ def get_connected_call_organizers(user):
 def get_connected_calls(user, role=None):
     ctype = ContentType.objects.get_for_model(models.Call)
     return get_scope_ids(user, ctype, role)
+
+
+# Call roles held to evaluate proposals, not to run the call.
+EVALUATOR_CALL_ROLES = (RoleEnum.CALL_REVIEWER, RoleEnum.CALL_PANEL_MEMBER)
+
+
+def get_call_role_proposals_query(user):
+    """The proposals a user reads through a role on their call.
+
+    A role that runs the call (call manager and the like) reads every
+    proposal in it. The evaluator roles never read drafts, which are their
+    applicants' alone; a panel member reads the rest of the call's
+    proposals, and so does a call reviewer unless the call limits reviewers
+    to the proposals they review (Call.reviewers_see_assigned_only), which
+    they then read through their reviews (get_reviewed_proposals).
+    """
+    ctype = ContentType.objects.get_for_model(models.Call)
+    evaluator_role_ids = Role.objects.filter(
+        Q(name__in=EVALUATOR_CALL_ROLES) | Q(template__name__in=EVALUATOR_CALL_ROLES)
+    ).values("pk")
+    running_calls = (
+        UserRole.objects.filter(is_active=True, user=user, content_type=ctype)
+        .exclude(role__in=evaluator_role_ids)
+        .order_by()
+        .values("object_id")
+    )
+    panel_calls = get_connected_calls(user, RoleEnum.CALL_PANEL_MEMBER)
+    reviewer_calls = models.Call.objects.filter(
+        pk__in=get_connected_calls(user, RoleEnum.CALL_REVIEWER),
+        reviewers_see_assigned_only=False,
+    ).values("pk")
+    return Q(round__call__in=running_calls) | (
+        ~Q(state=ProposalStates.DRAFT)
+        & (Q(round__call__in=panel_calls) | Q(round__call__in=reviewer_calls))
+    )
 
 
 def get_offering_manager_proposals(user):

@@ -297,6 +297,15 @@ class Call(
         ),
     )
 
+    reviewers_see_assigned_only = models.BooleanField(
+        default=False,
+        help_text=(
+            "Whether a call reviewer (the CALL.REVIEWER role) reads only the "
+            "proposals they review. Off: they read every submitted proposal in "
+            "the call. Panel members read every submitted proposal either way; "
+            "neither reads drafts."
+        ),
+    )
     withdraw_pending_reviews = models.BooleanField(
         default=False,
         help_text=(
@@ -1240,7 +1249,7 @@ def filter_proposals(user):
                 user
             )
         )
-        | Q(round__call__in=managers.get_connected_calls(user))
+        | managers.get_call_role_proposals_query(user)
         # Offering managers (technical reviewers) act on the technical_assessment
         # step, so they must be able to retrieve the non-draft proposals that
         # requested one of their accepted offerings (not every proposal on the

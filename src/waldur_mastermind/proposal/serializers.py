@@ -324,6 +324,26 @@ def can_view_proposal_event_feed(user, proposal) -> bool:
     return not _is_reviewer_only_view(user, proposal)
 
 
+def can_view_call_event_feed(user, call) -> bool:
+    """Whether the user may read the events logged against the call.
+
+    The call feed is its managers' administration trail: who was given which
+    role on the call (reviewers and panel members among them), invitations
+    and settings changes. Those who hold a call role only to evaluate its
+    proposals do not read it; those who run the call, staff and support do.
+    """
+    if user.is_anonymous:
+        return False
+    if user.is_staff or user.is_support:
+        return True
+    visibility = ApplicantVisibility(user)
+    if visibility._manages_call(call):
+        return True
+    return call.id not in get_connected_calls(
+        user, [CallRole.REVIEWER, CallRole.PANEL_MEMBER]
+    )
+
+
 def get_concealed_team_member_query(query_params, concealed: set[str]) -> list[str]:
     """Return the list_users query parameters that match on a concealed
     attribute, as they appear in the request."""
@@ -2072,6 +2092,7 @@ class ProtectedCallSerializer(PublicCallSerializer):
             "carry_over_drafts",
             "cancel_drafts_at_cutoff",
             "withdraw_pending_reviews",
+            "reviewers_see_assigned_only",
             "undecided_at_round_completion",
         )
         view_name = "proposal-protected-call-detail"

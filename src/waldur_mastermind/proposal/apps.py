@@ -85,6 +85,10 @@ class ProposalConfig(AppConfig):
         logging_utils.register_scope_event_guard(
             models.Proposal, serializers.can_view_proposal_event_feed
         )
+        # Nor the call's: who reviews or sits on its panel is its managers' to know.
+        logging_utils.register_scope_event_guard(
+            models.Call, serializers.can_view_call_event_feed
+        )
         # That a held decision was reopened tells that one had been made: only
         # those who may see held decisions learn it before the round publishes.
         logging_utils.register_event_type_guard(
