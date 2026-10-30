@@ -93,8 +93,8 @@ class FormFlow(core_models.UuidMixin, TimeStampedModel):
     """A chain of Formbricks surveys an applicant fills in, step by step.
 
     steps is a list of step definitions, checked when saved through the API
-    (see flows.validate_steps): each step has a key, a label and the
-    Formbricks survey_id, and may map answers onto the proposal.
+    (see flows.validate_steps): each step has a key, a label, the Formbricks
+    survey_id and whether reviewers may read its answers.
     """
 
     key = models.SlugField(
@@ -138,10 +138,67 @@ class CallFormFlow(TimeStampedModel):
         return f"{self.call} -> {self.flow}"
 
 
-class FormStepResponse(core_models.UuidMixin, TimeStampedModel):
-    """An applicant's answers to one step, as Formbricks sent them.
+class FormLink(TimeStampedModel):
+    """A single-use survey link Waldur issued for one proposal's form.
 
-    Written by the webhook. The question labels are captured at the same
+    Formbricks gives each link an id (suId) and records it on the response
+    made through it; that id is how Waldur knows whose response it is.
+    """
+
+    class States:
+        ISSUED = "issued"  # handed out, no finished response yet
+        ANSWERED = "answered"  # its response holds the form's current answers
+        SUPERSEDED = "superseded"  # answered, then replaced by an edit
+        LATE = "late"  # finished after the proposal was submitted: not applied
+
+        CHOICES = (
+            (ISSUED, "Issued"),
+            (ANSWERED, "Answered"),
+            (SUPERSEDED, "Superseded"),
+            (LATE, "Late"),
+        )
+
+    single_use_id = models.CharField(max_length=255, unique=True)
+    proposal = models.ForeignKey(
+        proposal_models.Proposal,
+        on_delete=models.CASCADE,
+        related_name="form_links",
+    )
+    step_key = models.CharField(max_length=100)
+    survey_id = models.CharField(max_length=100)
+    url = models.TextField(help_text=_("The link as handed to the applicant."))
+    issued_to = models.ForeignKey(
+        core_models.User, on_delete=models.SET_NULL, null=True, related_name="+"
+    )
+    state = models.CharField(
+        max_length=20, choices=States.CHOICES, default=States.ISSUED, db_index=True
+    )
+    response_id = models.CharField(max_length=100, blank=True)
+
+    def __str__(self):
+        return f"{self.proposal} / {self.step_key} / {self.single_use_id}"
+
+
+class FormbricksDeletion(TimeStampedModel):
+    """A Formbricks response Waldur is to delete: one an edit replaced, or one
+    of a draft proposal that was deleted. Kept until Formbricks confirms, so
+    an unreachable Formbricks only delays it. Not linked to the proposal,
+    which may be gone."""
+
+    response_id = models.CharField(max_length=100, unique=True)
+    reason = models.CharField(max_length=200)
+    attempts = models.PositiveIntegerField(default=0)
+    last_error = models.TextField(blank=True)
+
+    def __str__(self):
+        return self.response_id
+
+
+class FormStepResponse(core_models.UuidMixin, TimeStampedModel):
+    """An applicant's answers to one step, as Formbricks has them.
+
+    Written from the webhook or a fetch, and updated when Formbricks changes
+    (it is the source of truth). The question labels are captured at the same
     moment, so the answers always read as the questions were worded when the
     applicant saw them, whatever happens to the survey afterwards.
     """
@@ -157,6 +214,9 @@ class FormStepResponse(core_models.UuidMixin, TimeStampedModel):
     step_key = models.CharField(max_length=100)
     survey_id = models.CharField(max_length=100)
     response_id = models.CharField(max_length=100)
+    link = models.ForeignKey(
+        FormLink, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
+    )
     raw_response = models.JSONField(default=dict, blank=True)
     question_labels = models.JSONField(default=dict, blank=True)
     # jsonb does not keep object key order, so the order the questions were

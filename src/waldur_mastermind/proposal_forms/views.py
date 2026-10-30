@@ -3,67 +3,34 @@ import uuid as uuid_lib
 from urllib.parse import urlencode
 
 from django.contrib.auth import get_user_model
-from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.shortcuts import redirect as http_redirect
-from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
-from drf_spectacular.utils import OpenApiParameter, extend_schema
-from rest_framework import authentication as rf_authentication
+from drf_spectacular.utils import extend_schema
 from rest_framework import decorators, exceptions, response, status, views, viewsets
 from rest_framework import permissions as rf_permissions
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.views import ActionsViewSet
-from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.enums import PermissionEnum
-from waldur_core.permissions.fixtures import ProposalRole
 from waldur_core.permissions.utils import permission_factory
 from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_core.structure.permissions import is_staff
 from waldur_mastermind.proposal import models as proposal_models
-from waldur_mastermind.proposal.enums import CallStates, ProposalStates, RoundStatuses
 from waldur_mastermind.proposal.permissions import CALL_PERMISSION_SOURCES
 
-from . import client, flows, mapper, models, serializers, sync
+from . import client, flows, models, responses, serializers, sync
 from . import permissions as form_permissions
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
 
 
-def _api_url(request, name, **kwargs):
-    return request.build_absolute_uri(reverse(name, kwargs=kwargs))
-
-
-def _require_active():
-    if not client.is_available():
-        raise exceptions.ValidationError(
-            _("Applying through Formbricks is not enabled on this site.")
-        )
-
-
 def _flow_for(call):
     flow = serializers.get_call_form_flow(call)
     if flow is None:
-        raise exceptions.ValidationError(_("This call does not use a form flow."))
+        raise exceptions.ValidationError(_("This call does not use forms."))
     return flow
-
-
-def _survey_link(user, proposal, step):
-    return {
-        "step_key": step["key"],
-        "step_label": step["label"],
-        "survey_url": client.build_survey_url(
-            step["survey_id"], client.hidden_fields(user, proposal)
-        ),
-    }
-
-
-def _completion_url(proposal):
-    return core_utils.format_homeport_link(
-        "proposals/{proposal_uuid}/", proposal_uuid=proposal.uuid.hex
-    )
 
 
 # --- connection -----------------------------------------------------------------
@@ -318,7 +285,8 @@ class CallFormFlowViewSet(viewsets.GenericViewSet):
 
 
 class ProposalFormViewSet(viewsets.GenericViewSet):
-    """An applicant's way through a call's form flow, by proposal UUID."""
+    """A proposal's forms, by proposal UUID: their state, the answers, and
+    links to fill them in."""
 
     lookup_field = "uuid"
     queryset = proposal_models.Proposal.objects.all()
@@ -330,221 +298,117 @@ class ProposalFormViewSet(viewsets.GenericViewSet):
             super().get_queryset(), self.request.user
         ).select_related("round__call")
 
-    @extend_schema(
-        request=serializers.ProposalFormStartSerializer,
-        responses={201: serializers.ProposalFormStartResponseSerializer},
-        description="Start an application: create a draft proposal in the "
-        "round, with the caller as its manager, and return the first survey.",
-    )
-    @decorators.action(detail=False, methods=["post"])
-    def start(self, request):
-        _require_active()
-        serializer = serializers.ProposalFormStartSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        try:
-            call_round = proposal_models.Round.objects.select_related("call").get(
-                uuid=serializer.validated_data["round_uuid"]
-            )
-        except proposal_models.Round.DoesNotExist:
-            raise exceptions.ValidationError({"round_uuid": _("Round not found.")})
-        call = call_round.call
-        # The same rules as creating a proposal through the proposal API.
-        if call.state != CallStates.ACTIVE:
-            raise exceptions.ValidationError(_("Call is not active."))
-        if call_round.status != RoundStatuses.OPEN:
-            raise exceptions.ValidationError(
-                _("The round is not open, so a proposal cannot be started.")
-            )
-        flow = _flow_for(call)
-        permissions_utils.validate_user_restrictions(call, request.user)
-
-        with transaction.atomic():
-            proposal = proposal_models.Proposal.objects.create(
-                # Replaced by the applicant's answer once the step that maps
-                # the name is answered.
-                name=f"Draft {uuid_lib.uuid4().hex[:8]}",
-                round=call_round,
-                created_by=request.user,
-                state=ProposalStates.DRAFT,
-            )
-            proposal.add_user(
-                request.user, ProposalRole.MANAGER, created_by=request.user
-            )
-
-        data = {
-            "proposal_uuid": proposal.uuid,
-            **_survey_link(request.user, proposal, flow.steps[0]),
-        }
-        return response.Response(
-            serializers.ProposalFormStartResponseSerializer(data).data,
-            status=status.HTTP_201_CREATED,
-        )
-
-    @extend_schema(
-        responses=serializers.ProposalFormSerializer,
-        description="Progress through the flow and the answers given. "
-        "Reviewers see only the steps the flow makes reviewer-visible.",
-    )
-    def retrieve(self, request, uuid=None):
-        proposal = self.get_object()
-        flow = _flow_for(proposal.round.call)
-        user = request.user
-
+    def _state(self, proposal, flow):
+        user = self.request.user
+        available = client.is_available()
         answered = dict(
             proposal.form_step_responses.values_list("step_key", "modified")
         )
-        can_fill_in = form_permissions.can_fill_in(user, proposal)
-        next_step = None
-        if can_fill_in and client.is_available():
-            pending = [s for s in flow.steps if s["key"] not in answered]
-            if pending:
-                next_step = _survey_link(user, proposal, pending[0])
-
+        open_keys = set(
+            proposal.form_links.filter(state=models.FormLink.States.ISSUED).values_list(
+                "step_key", flat=True
+            )
+        )
         step_keys = None
         if not form_permissions.sees_all_steps(user, proposal):
             step_keys = flows.reviewer_visible_keys(flow.steps)
-
-        data = {
+        return {
             "proposal_uuid": proposal.uuid,
             "flow_key": flow.key,
             "flow_name": flow.name,
-            "can_fill_in": can_fill_in,
+            "available": available,
+            "can_fill_in": available and form_permissions.can_fill_in(user, proposal),
             "steps": [
                 {
                     "key": step["key"],
                     "label": step["label"],
                     "completed": step["key"] in answered,
                     "submitted_at": answered.get(step["key"]),
+                    "in_progress": step["key"] in open_keys,
                 }
                 for step in flow.steps
             ],
-            "next_step": next_step,
-            "responses": mapper.serialize_form_responses(
+            "missing": responses.missing_steps(proposal, flow),
+            "responses": responses.serialize_form_responses(
                 proposal, flow.steps, step_keys
             ),
         }
-        return response.Response(serializers.ProposalFormSerializer(data).data)
 
     @extend_schema(
-        request=None,
-        responses=serializers.ProposalFormSurveyLinkSerializer,
-        parameters=[
-            OpenApiParameter(
-                "step",
-                str,
-                OpenApiParameter.QUERY,
-                required=True,
-                description="Key of the answered step to change.",
-            )
-        ],
-        description="A survey link to change an answered step, prefilled "
-        "with the answers Formbricks holds now.",
+        responses=serializers.ProposalFormSerializer,
+        description="The proposal's forms, which are answered, and the answers. "
+        "Reviewers see only the forms the flow makes reviewer-visible.",
     )
-    @decorators.action(detail=True, methods=["get"], url_path="edit-link")
-    def edit_link(self, request, uuid=None):
-        _require_active()
+    def retrieve(self, request, uuid=None):
         proposal = self.get_object()
+        flow = _flow_for(proposal.round.call)
+        return response.Response(
+            serializers.ProposalFormSerializer(self._state(proposal, flow)).data
+        )
+
+    @extend_schema(
+        request=serializers.ProposalFormLinkRequestSerializer,
+        responses=serializers.ProposalFormLinkSerializer,
+        description="A single-use link to fill in, resume or edit one of the "
+        "proposal's forms. For the proposal's team, while it is a draft.",
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def link(self, request, uuid=None):
+        proposal = self.get_object()
+        if not client.is_available():
+            raise exceptions.ValidationError(
+                _("Forms are not available on this site just now.")
+            )
         if not form_permissions.can_fill_in(request.user, proposal):
             raise exceptions.PermissionDenied(
                 _(
-                    "Only the proposal's team may change its answers, while it is a draft."
+                    "Only the proposal's team may fill in its forms, while it is a draft."
                 )
             )
         flow = _flow_for(proposal.round.call)
-        step = flows.get_step(flow.steps, request.query_params.get("step", ""))
+        request_serializer = serializers.ProposalFormLinkRequestSerializer(
+            data=request.data
+        )
+        request_serializer.is_valid(raise_exception=True)
+        step = flows.get_step(flow.steps, request_serializer.validated_data["step"])
         if step is None:
-            raise exceptions.ValidationError({"step": _("Not a step of this flow.")})
-        stored = proposal.form_step_responses.filter(step_key=step["key"]).first()
-        if stored is None:
-            raise exceptions.ValidationError({"step": _("Not answered yet.")})
+            raise exceptions.ValidationError({"step": _("Not a form of this call.")})
         try:
-            answers = client.get_response(stored.response_id)
-        except client.FormbricksError as e:
-            logger.warning("Could not fetch Formbricks response for editing: %s", e)
-            # The answers as last received are the next best thing.
-            answers = stored.raw_response
-        link = {
+            link = responses.issue_link(proposal, step, request.user)
+        except responses.LinkError as e:
+            raise exceptions.ValidationError(str(e))
+        data = {
             "step_key": step["key"],
             "step_label": step["label"],
-            "survey_url": client.build_survey_url(
-                step["survey_id"],
-                client.hidden_fields(request.user, proposal),
-                prefill=client.prefill_from_answers(answers),
-            ),
+            "survey_url": link.url,
         }
-        return response.Response(
-            serializers.ProposalFormSurveyLinkSerializer(link).data
-        )
+        return response.Response(serializers.ProposalFormLinkSerializer(data).data)
 
-
-# --- the survey ending's redirect ---------------------------------------------------
-
-
-class RedirectTokenAuthentication(rf_authentication.BaseAuthentication):
-    """Who is applying, from the redirect_token a survey carries.
-
-    A survey's "Redirect to URL" ending is a plain browser navigation, with
-    neither the frontend's token nor a session. Used only by the redirect
-    view below: the token proves nothing anywhere else.
-    """
-
-    def authenticate(self, request):
-        user_pk = client.verify_redirect_token(
-            request.query_params.get("redirect_token"),
-            request.query_params.get("proposal_uuid"),
-        )
-        if user_pk is None:
-            raise exceptions.AuthenticationFailed(
-                _(
-                    "The link has expired or is not valid. Return to the portal to continue."
-                )
+    @extend_schema(
+        request=None,
+        responses=serializers.ProposalFormFetchResultSerializer,
+        description="Bring the proposal's answers up to date from Formbricks, "
+        "for when a response has not arrived on its own.",
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def fetch(self, request, uuid=None):
+        proposal = self.get_object()
+        flow = _flow_for(proposal.round.call)
+        if not client.is_available():
+            raise exceptions.ValidationError(
+                _("Forms are not available on this site just now.")
             )
         try:
-            return User.objects.get(pk=user_pk, is_active=True), None
-        except User.DoesNotExist:
-            raise exceptions.AuthenticationFailed(_("The link is not valid."))
-
-
-class ProposalFormRedirectView(views.APIView):
-    """Where each survey's ending sends the applicant: on to the next
-    unanswered step, or back to the proposal once all are answered."""
-
-    authentication_classes = (RedirectTokenAuthentication,)
-    permission_classes = (rf_permissions.IsAuthenticated,)
-
-    # Not called by the frontend, so not in the API schema or the SDK.
-    @extend_schema(exclude=True)
-    def get(self, request):
-        try:
-            proposal = proposal_models.Proposal.objects.select_related(
-                "round__call"
-            ).get(uuid=request.query_params["proposal_uuid"])
-        except (
-            proposal_models.Proposal.DoesNotExist,
-            KeyError,
-            ValueError,
-            DjangoValidationError,
-        ):
-            raise exceptions.NotFound()
-        if not form_permissions.can_fill_in(request.user, proposal):
-            return http_redirect(_completion_url(proposal))
-        flow = serializers.get_call_form_flow(proposal.round.call)
-        if flow is None or not client.is_available():
-            return http_redirect(_completion_url(proposal))
-
-        # The webhook for the step just finished may not have arrived yet,
-        # so it counts as answered whatever the database says.
-        current = request.query_params.get("step", "")
-        answered = set(proposal.form_step_responses.values_list("step_key", flat=True))
-        answered.add(current)
-        keys = [s["key"] for s in flow.steps]
-        start = keys.index(current) + 1 if current in keys else 0
-        ordered = flow.steps[start:] + flow.steps[:start]
-        pending = [s for s in ordered if s["key"] not in answered]
-        if not pending:
-            return http_redirect(_completion_url(proposal))
-        return http_redirect(
-            _survey_link(request.user, proposal, pending[0])["survey_url"]
+            outcomes = responses.fetch_for_proposal(proposal)
+        except client.FormbricksError as e:
+            logger.warning("Fetch for proposal %s failed: %s", proposal.uuid.hex, e)
+            raise exceptions.ValidationError(
+                _("Formbricks cannot be reached just now. Please try again later.")
+            )
+        data = self._state(proposal, flow)
+        data["fetched"] = outcomes.get("applied", 0) + outcomes.get("updated", 0)
+        return response.Response(
+            serializers.ProposalFormFetchResultSerializer(data).data
         )
 
 
@@ -552,19 +416,19 @@ class ProposalFormRedirectView(views.APIView):
 
 
 class ProposalFormWebhookView(views.APIView):
-    """Formbricks' "responseFinished" webhook: keeps a step's answers and
-    writes them onto the proposal.
+    """Formbricks' webhook: "responseFinished", and "responseUpdated" (a
+    correction made in Formbricks, which is the source of truth).
 
-    Signed by Formbricks (client.verify_signature). The answers carry the
-    proposal and the applicant's redirect_token as hidden fields; the token
-    must have been issued for that proposal to someone still on its team,
-    and the proposal must still be a draft - a signature alone only proves
-    the request came through Formbricks, where anyone can fill in a survey.
+    Signed by Formbricks (client.verify_signature). The response is matched
+    to its proposal and form only by its single-use link id, which Waldur
+    issued and recorded (responses.apply_response); nothing in the answers
+    is trusted, since anyone can fill in a survey.
     """
 
     authentication_classes = ()
     permission_classes = (rf_permissions.AllowAny,)
 
+    # Called by Formbricks, not the frontend: not in the schema or the SDK.
     @extend_schema(exclude=True)
     def post(self, request):
         # Formbricks' "Test endpoint" button posts {"event": "testEndpoint"},
@@ -590,106 +454,12 @@ class ProposalFormWebhookView(views.APIView):
         if not client.verify_signature(request):
             raise exceptions.PermissionDenied(_("Invalid webhook signature."))
 
-        if payload.get("event") != "responseFinished":
+        if payload.get("event") not in ("responseFinished", "responseUpdated"):
             return response.Response(status=status.HTTP_200_OK)
-
-        data = payload.get("data") or {}
-        response_id = data.get("id")
-        survey_id = data.get("surveyId")
-        answers = data.get("data") or {}
-        proposal_uuid = answers.get("proposal_uuid")
-        if not (
-            response_id and survey_id and isinstance(answers, dict) and proposal_uuid
-        ):
-            logger.warning(
-                "Formbricks webhook ignored: no response id, survey id or proposal "
-                "(response %s, survey %s).",
-                response_id,
-                survey_id,
-            )
+        record = payload.get("data")
+        if not isinstance(record, dict):
             return response.Response(status=status.HTTP_400_BAD_REQUEST)
-
-        user_pk = client.verify_redirect_token(
-            answers.get("redirect_token"), proposal_uuid
-        )
-        if user_pk is None:
-            logger.warning(
-                "Formbricks webhook refused: response %s has no valid token for "
-                "proposal %s.",
-                response_id,
-                proposal_uuid,
-            )
-            return response.Response(status=status.HTTP_403_FORBIDDEN)
-
-        try:
-            proposal = proposal_models.Proposal.objects.select_related(
-                "round__call"
-            ).get(uuid=proposal_uuid)
-        except (
-            proposal_models.Proposal.DoesNotExist,
-            ValueError,
-            DjangoValidationError,
-        ):
-            return response.Response(status=status.HTTP_404_NOT_FOUND)
-
-        user = User.objects.filter(pk=user_pk).first()
-        if not form_permissions.can_fill_in(user, proposal):
-            logger.warning(
-                "Formbricks webhook refused: proposal %s is not a draft, or user "
-                "%s is no longer on its team (response %s).",
-                proposal.uuid.hex,
-                user_pk,
-                response_id,
-            )
-            return response.Response(status=status.HTTP_409_CONFLICT)
-
-        flow = serializers.get_call_form_flow(proposal.round.call)
-        step = flows.get_step_by_survey_id(flow.steps, survey_id) if flow else None
-        if step is None:
-            logger.warning(
-                "Formbricks webhook refused: survey %s is not part of the flow "
-                "of proposal %s's call.",
-                survey_id,
-                proposal.uuid.hex,
-            )
-            return response.Response(status=status.HTTP_404_NOT_FOUND)
-
-        try:
-            labels = client.get_survey(survey_id)
-        except client.FormbricksError as e:
-            # The answers matter more than their labels.
-            logger.warning("Formbricks question labels not fetched: %s", e)
-            labels = {}
-
-        # The token is a credential: it is not kept.
-        kept_answers = {k: v for k, v in answers.items() if k != "redirect_token"}
-        try:
-            with transaction.atomic():
-                proposal = proposal_models.Proposal.objects.select_for_update().get(
-                    pk=proposal.pk
-                )
-                if proposal.state != ProposalStates.DRAFT:
-                    return response.Response(status=status.HTTP_409_CONFLICT)
-                models.FormStepResponse.objects.update_or_create(
-                    proposal=proposal,
-                    step_key=step["key"],
-                    defaults={
-                        "survey_id": survey_id,
-                        "response_id": response_id,
-                        "raw_response": kept_answers,
-                        "question_labels": labels,
-                        "question_order": list(labels),
-                    },
-                )
-                mapper.apply_step(proposal, answers, step)
-        except mapper.FormbricksMappingError as e:
-            logger.error(
-                "Formbricks answers for proposal %s step %s not saved: %s",
-                proposal.uuid.hex,
-                step["key"],
-                e,
-            )
-            return response.Response(
-                {"detail": str(e)}, status=status.HTTP_422_UNPROCESSABLE_ENTITY
-            )
-        return response.Response(status=status.HTTP_200_OK)
+        outcome = responses.apply_response(record)
+        # Ignored responses are still acknowledged: resending them would not
+        # change the answer, and the reason is logged.
+        return response.Response({"detail": outcome}, status=status.HTTP_200_OK)

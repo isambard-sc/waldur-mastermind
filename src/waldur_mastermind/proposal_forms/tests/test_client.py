@@ -1,10 +1,9 @@
 import base64
 import time
+from urllib.parse import parse_qs, urlsplit
 
 from django.test import RequestFactory, TestCase
 
-from waldur_core.structure.tests import factories as structure_factories
-from waldur_mastermind.proposal.tests import factories as proposal_factories
 from waldur_mastermind.proposal_forms import client, models
 
 # The Standard Webhooks reference vector (also in Svix's documentation), which
@@ -136,42 +135,6 @@ class SignatureTest(TestCase):
         self.assertNotIn(VECTOR_SECRET[len("whsec_") :], output)
 
 
-class RedirectTokenTest(TestCase):
-    def setUp(self):
-        self.user = structure_factories.UserFactory()
-        self.proposal = proposal_factories.ProposalFactory()
-
-    def test_token_speaks_for_its_user_and_proposal(self):
-        token = client.build_redirect_token(self.user, self.proposal)
-        self.assertEqual(
-            client.verify_redirect_token(token, self.proposal.uuid.hex), self.user.pk
-        )
-        self.assertEqual(
-            client.verify_redirect_token(token, str(self.proposal.uuid)), self.user.pk
-        )
-
-    def test_token_for_another_proposal_refused(self):
-        other = proposal_factories.ProposalFactory()
-        token = client.build_redirect_token(self.user, other)
-        self.assertIsNone(client.verify_redirect_token(token, self.proposal.uuid.hex))
-
-    def test_tampered_token_refused(self):
-        token = client.build_redirect_token(self.user, self.proposal)
-        user_pk, proposal_hex, timestamp, signature = token.split(":")
-        other_user = ":".join(
-            [str(self.user.pk + 1), proposal_hex, timestamp, signature]
-        )
-        self.assertIsNone(
-            client.verify_redirect_token(other_user, self.proposal.uuid.hex)
-        )
-        bad_signature = token[:-1] + ("A" if token[-1] != "A" else "B")
-        self.assertIsNone(
-            client.verify_redirect_token(bad_signature, self.proposal.uuid.hex)
-        )
-        self.assertIsNone(client.verify_redirect_token("", self.proposal.uuid.hex))
-        self.assertIsNone(client.verify_redirect_token(None, self.proposal.uuid.hex))
-
-
 class PrefillTest(TestCase):
     def test_prefill_keeps_simple_answers_only(self):
         prefill = client.prefill_from_answers(
@@ -190,16 +153,18 @@ class PrefillTest(TestCase):
             {"q_text": "An answer", "q_number": 12, "q_multi": "Isambard-AI,Zenith"},
         )
 
-    def test_survey_url_hidden_fields_win_over_prefill(self):
-        models.FormbricksConnection.objects.update_or_create(
-            pk=1, defaults={"base_url": "https://forms.example.com/"}
+    def test_link_params_keep_the_links_own(self):
+        url = client.with_params(
+            "https://f.example.com/s/s1?suId=abc&suToken=t",
+            {"proposal_uuid": "p1", "suId": "forged", "q1": "a b"},
         )
-        url = client.build_survey_url(
-            "s1", {"proposal_uuid": "real"}, prefill={"proposal_uuid": "forged"}
-        )
-        self.assertTrue(url.startswith("https://forms.example.com/s/s1?"))
-        self.assertIn("proposal_uuid=real", url)
-        self.assertNotIn("forged", url)
+        params = parse_qs(urlsplit(url).query)
+        self.assertEqual(params["suId"], ["abc"])
+        self.assertEqual(params["suToken"], ["t"])
+        self.assertEqual(params["proposal_uuid"], ["p1"])
+        self.assertEqual(params["q1"], ["a b"])
+        self.assertTrue(url.startswith("https://f.example.com/s/s1?"))
+        self.assertEqual(client.single_use_id(url), "abc")
 
 
 class SurveyParsingTest(TestCase):

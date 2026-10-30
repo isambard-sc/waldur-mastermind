@@ -35,11 +35,6 @@ urlpatterns = [
         name="proposal-form-return",
     ),
     re_path(
-        r"^api/proposal-form-redirect/$",
-        views.ProposalFormRedirectView.as_view(),
-        name="proposal-form-redirect",
-    ),
-    re_path(
         r"^api/proposal-form-webhook/$",
         views.ProposalFormWebhookView.as_view(),
         name="proposal-form-webhook",

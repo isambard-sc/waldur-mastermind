@@ -1,8 +1,14 @@
-"""Talking to Formbricks: survey links, the Management API, webhook signatures.
+"""Talking to Formbricks: single-use links, the Management API, webhook
+signatures.
 
 Everything is read from the FormbricksConnection row, so the server, the API
 key and the webhook secret are set through the API rather than deployment
 settings.
+
+An applicant reaches a survey by a single-use link Waldur asks Formbricks for
+(one response per link; reopening it resumes that response). Waldur records
+the link's id against the proposal and form, and recognises the response by
+it - nothing else in the response is trusted.
 
 Formbricks signs webhooks per the Standard Webhooks spec. Checked against
 Formbricks' own source (apps/web/lib/crypto.ts and
@@ -20,10 +26,9 @@ import html
 import logging
 import re
 import time
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import requests
-from django.core import signing
 
 from waldur_core.core.models import is_feature_enabled
 
@@ -40,17 +45,6 @@ WEBHOOK_SIGNATURE_HEADER = "webhook-signature"
 # delivery retry, narrow enough that a captured request cannot be replayed
 # much later.
 WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS = 5 * 60
-
-# Signs redirect_token, the hidden field that carries "this user, this
-# proposal" through the chain of surveys and back. Formbricks' "Redirect to
-# URL" ending is a plain browser GET, which carries neither the frontend's
-# Authorization header nor a session, so this is how the redirect endpoint
-# knows who is applying - and, in the webhook, that the answers really are
-# for the proposal they name.
-REDIRECT_TOKEN_SALT = "waldur_mastermind.proposal_forms.redirect_token"
-# A survey link can sit in a browser tab for days; a round's application
-# window is the natural bound.
-REDIRECT_TOKEN_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 
 
 class FormbricksError(Exception):
@@ -71,64 +65,9 @@ def is_available() -> bool:
     return is_feature_enabled(FEATURE) and connection().is_active
 
 
-# --- redirect tokens ------------------------------------------------------
-
-
-def build_redirect_token(user, proposal) -> str:
-    """Sign (user, proposal) together, so a token only ever speaks for one
-    applicant on one proposal."""
-    return signing.TimestampSigner(salt=REDIRECT_TOKEN_SALT).sign(
-        f"{user.pk}:{proposal.uuid.hex}"
-    )
-
-
-def verify_redirect_token(token, proposal_uuid) -> int | None:
-    """The user's pk the token was issued to, if it is genuine, unexpired and
-    issued for this proposal; otherwise None."""
-    if not token or not proposal_uuid:
-        return None
-    try:
-        value = signing.TimestampSigner(salt=REDIRECT_TOKEN_SALT).unsign(
-            token, max_age=REDIRECT_TOKEN_MAX_AGE_SECONDS
-        )
-    except signing.BadSignature:
-        return None
-    user_pk, _, token_proposal = value.partition(":")
-    if token_proposal != _uuid_hex(proposal_uuid):
-        return None
-    try:
-        return int(user_pk)
-    except ValueError:
-        return None
-
-
-def _uuid_hex(value) -> str:
-    return str(value).replace("-", "").lower()
-
-
-# --- survey links ---------------------------------------------------------
-
-
-def hidden_fields(user, proposal) -> dict:
-    """The hidden fields every survey link carries.
-
-    Each survey in a flow must declare these as Hidden Fields in Formbricks,
-    or they are not passed on to its ending and the webhook. proposal_uuid
-    and redirect_token are what the webhook trusts; the lead's name and email
-    only help a call manager find responses inside Formbricks.
-    """
-    return {
-        "proposal_uuid": proposal.uuid.hex,
-        "call_uuid": proposal.round.call.uuid.hex,
-        "round_uuid": proposal.round.uuid.hex,
-        "redirect_token": build_redirect_token(user, proposal),
-        "lead_name": user.full_name,
-        "lead_email": user.email,
-    }
-
-
-# Hidden fields this app adds itself: echoed back as answers in the webhook,
-# but not something the applicant answered.
+# Hidden fields that are not answers: proposal_uuid, which Waldur sets as a
+# label for staff browsing Formbricks, and those an earlier version of this
+# integration set. Left out wherever answers are shown.
 HIDDEN_FIELD_KEYS = frozenset(
     {
         "proposal_uuid",
@@ -141,20 +80,13 @@ HIDDEN_FIELD_KEYS = frozenset(
 )
 
 
-def build_survey_url(survey_id, fields: dict, prefill: dict | None = None) -> str:
-    """A link to a survey, with hidden fields - and, to edit an earlier
-    answer, the answers to prefill - as query parameters."""
-    params = {**(prefill or {}), **{k: v for k, v in fields.items() if v is not None}}
-    return f"{connection().public_base_url}/s/{survey_id}?{urlencode(params)}"
-
-
 def prefill_from_answers(answers: dict) -> dict:
-    """Earlier answers as URL prefill parameters, for editing a step.
+    """Earlier answers as URL prefill parameters, for editing a form.
 
     Formbricks prefills a question from a query parameter named by its id;
     a multiple choice takes its labels comma-separated. Answers that cannot
     be prefilled (files, matrices, addresses) are left for the applicant to
-    give again, as are this app's own hidden fields, which are set afresh.
+    give again, as are hidden fields, which are set afresh.
     """
     prefill = {}
     for question_id, answer in answers.items():
@@ -167,6 +99,22 @@ def prefill_from_answers(answers: dict) -> dict:
         elif isinstance(answer, list) and all(isinstance(a, str) for a in answer):
             prefill[question_id] = ",".join(answer)
     return prefill
+
+
+def single_use_id(link_url) -> str:
+    """The suId a single-use link carries."""
+    values = parse_qs(urlsplit(link_url).query).get("suId") or [""]
+    return values[0]
+
+
+def with_params(link_url, params: dict) -> str:
+    """The link with more query parameters: the proposal_uuid hidden field
+    and, for an edit, the answers to prefill. The link's own (suId, and
+    suToken on newer Formbricks) are kept and win."""
+    parts = urlsplit(link_url)
+    own = {k: v[0] for k, v in parse_qs(parts.query).items()}
+    query = urlencode({**params, **own})
+    return parts._replace(query=query).geturl()
 
 
 # --- Management API -------------------------------------------------------
@@ -209,11 +157,6 @@ def check_connection(conn) -> dict:
     """What the Management API says about this key: raises FormbricksError if
     it cannot be reached or rejects the key."""
     return _get("/api/v1/management/me", conn)
-
-
-def get_response(response_id) -> dict:
-    """A response's current answers, {question_id: answer}."""
-    return _get(f"/api/v1/management/responses/{response_id}")["data"]["data"]
 
 
 def _strip_html(rich_text: str) -> str:
@@ -311,6 +254,59 @@ def list_surveys(conn=None) -> list:
         if len(page) < SURVEY_PAGE_SIZE:
             return surveys
         offset += SURVEY_PAGE_SIZE
+
+
+def mint_single_use_link(survey_id) -> str:
+    """A new single-use link to the survey, from Formbricks (which signs it
+    on versions that do). The survey must have single-use links on."""
+    links = _get(
+        f"/api/v1/management/surveys/{survey_id}/singleUseIds", params={"limit": 1}
+    )["data"]
+    if not links or not single_use_id(links[0]):
+        raise FormbricksError(f"Formbricks gave no single-use link for {survey_id}.")
+    return links[0]
+
+
+RESPONSE_PAGE_SIZE = 100
+# Responses come newest first; an open link's response is recent, so a fetch
+# looks no further back than this many.
+RESPONSE_PAGES_SCANNED = 20
+
+
+def iter_survey_responses(survey_id):
+    """A survey's responses, newest first, up to RESPONSE_PAGES_SCANNED
+    pages."""
+    for page_number in range(RESPONSE_PAGES_SCANNED):
+        offset = page_number * RESPONSE_PAGE_SIZE
+        page = _get(
+            "/api/v1/management/responses",
+            params={
+                "surveyId": survey_id,
+                "limit": RESPONSE_PAGE_SIZE,
+                # "skip" on Formbricks 4.9, "offset" later.
+                "skip": offset,
+                "offset": offset,
+            },
+        )["data"]
+        yield from page
+        if len(page) < RESPONSE_PAGE_SIZE:
+            return
+
+
+def get_response_record(response_id) -> dict:
+    """A whole response, as the webhook would carry it."""
+    return _get(f"/api/v1/management/responses/{response_id}")["data"]
+
+
+def delete_response(response_id):
+    """Delete a response Waldur recorded. A response already gone counts as
+    deleted."""
+    try:
+        _request("DELETE", f"/api/v1/management/responses/{response_id}")
+    except FormbricksError as e:
+        if "(404)" in str(e):
+            return
+        raise
 
 
 def update_survey(survey_id, changes: dict) -> dict:
