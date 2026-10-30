@@ -1,4 +1,4 @@
-<html>
+{% load tz %}<html>
 <head lang="en">
     <meta charset="UTF-8">
     <title>{% if extended %}New deadline to resubmit your proposal{% else %}Your proposal has been returned to you{% endif %}</title>
@@ -12,7 +12,7 @@
 <p><strong>Reason:</strong></p>
 <p style="white-space: pre-wrap;">{{ reason }}</p>
 {% endif %}
-<p>Please resubmit it by <strong>{{ resubmit_by }}</strong>: <a href="{{ proposal_url }}">{{ proposal_url }}</a></p>
+<p>Please resubmit it by <strong>{{ resubmit_by|utc|date:"j F Y, H:i" }} UTC</strong>: <a href="{{ proposal_url }}">{{ proposal_url }}</a></p>
 <p>If you have any questions, please contact the call's managers.</p>
 <p>This is an automated message from the {{ site_name }}. Please do not reply to this email.</p>
 </body>
