@@ -1,5 +1,6 @@
 import datetime
 import json
+import os
 import time
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -785,3 +786,101 @@ class SwitchedOffTest(FormsTestBase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+
+class RealPayloadTest(FormsTestBase):
+    """A responseFinished delivery captured from a live Formbricks, redacted
+    (tests/fixtures/formbricks_response_finished.json), replayed through the
+    webhook: the proposal and token are this test's, everything else is as
+    Formbricks sent it."""
+
+    FIXTURE = os.path.join(
+        os.path.dirname(__file__), "fixtures", "formbricks_response_finished.json"
+    )
+    LABELS = {
+        "cid9d22768jyf65hht3sakqq": "Project title",
+        "g81oicc5tihv86395lclkfpz": "Project duration, in months",
+        "j4b388ormyl4jiwajx158uel": "GPUh requested",
+        "tf4lhp5vsvc7993sx27q5ugd": "AIRR service requested",
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.flow.steps = flows.validate_steps(
+            [
+                {
+                    "key": "project_details",
+                    "label": "Project details",
+                    "survey_id": "t14sgutihynd7edwluh8trg1",
+                    "reviewer_visible": True,
+                    "field_map": {"cid9d22768jyf65hht3sakqq": "name"},
+                }
+            ]
+        )
+        self.flow.save()
+        patcher = mock.patch.object(client, "get_survey", return_value=self.LABELS)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def payload(self):
+        with open(self.FIXTURE, encoding="utf-8") as f:
+            payload = json.load(f)
+        answers = payload["data"]["data"]
+        answers["proposal_uuid"] = self.proposal.uuid.hex
+        answers["redirect_token"] = client.build_redirect_token(
+            self.applicant, self.proposal
+        )
+        return payload
+
+    def post(self, payload):
+        body = json.dumps(payload).encode()
+        timestamp = str(int(time.time()))
+        return self.client.generic(
+            "POST",
+            "/api/proposal-form-webhook/",
+            body,
+            content_type="application/json",
+            HTTP_WEBHOOK_ID="msg_real",
+            HTTP_WEBHOOK_TIMESTAMP=timestamp,
+            HTTP_WEBHOOK_SIGNATURE="v1,"
+            + client.sign(SECRET, "msg_real", timestamp, body),
+        )
+
+    def test_real_delivery_is_kept_and_mapped(self):
+        response = self.post(self.payload())
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+
+        self.proposal.refresh_from_db()
+        self.assertEqual(self.proposal.name, "My new project application")
+
+        stored = models.FormStepResponse.objects.get(proposal=self.proposal)
+        self.assertEqual(stored.step_key, "project_details")
+        self.assertEqual(stored.survey_id, "t14sgutihynd7edwluh8trg1")
+        self.assertEqual(stored.response_id, "cmvufemih0003u6014xwem7kl")
+        self.assertNotIn("redirect_token", stored.raw_response)
+        # Formbricks sends every answer as text.
+        self.assertEqual(stored.raw_response["j4b388ormyl4jiwajx158uel"], "1234")
+
+        self.client.force_authenticate(self.applicant)
+        response = self.client.get(f"/api/proposal-forms/{self.proposal.uuid.hex}/")
+        (answers,) = response.data["responses"]
+        self.assertEqual(
+            [(q["label"], q["answer"]) for q in answers["questions"]],
+            [
+                ("Project title", "My new project application"),
+                ("Project duration, in months", "5"),
+                ("GPUh requested", "1234"),
+                ("AIRR service requested", "Zenith"),
+            ],
+        )
+        self.assertTrue(response.data["steps"][0]["completed"])
+        self.assertIsNone(response.data["next_step"])
+
+    def test_real_delivery_replayed_for_another_proposal_refused(self):
+        # The captured body as delivered names a proposal it holds no valid
+        # token for: refused.
+        with open(self.FIXTURE, encoding="utf-8") as f:
+            payload = json.load(f)
+        response = self.post(payload)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(models.FormStepResponse.objects.exists())
