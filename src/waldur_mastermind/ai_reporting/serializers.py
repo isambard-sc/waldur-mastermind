@@ -47,3 +47,34 @@ class ReportingMessageSerializer(serializers.ModelSerializer):
             "created",
         ]
         read_only_fields = fields
+
+
+class UsageStatsDailySerializer(serializers.Serializer):
+    date = serializers.DateField()
+    input_tokens = serializers.IntegerField()
+    output_tokens = serializers.IntegerField()
+    requests = serializers.IntegerField()
+
+
+class UsageStatsByUserSerializer(serializers.Serializer):
+    user = serializers.UUIDField()
+    full_name = serializers.CharField()
+    username = serializers.CharField()
+    input_tokens = serializers.IntegerField()
+    output_tokens = serializers.IntegerField()
+    requests = serializers.IntegerField()
+
+
+class UsageStatsResponseSerializer(serializers.Serializer):
+    """See ReportingMessageViewSet.usage_stats - the one endpoint in this
+    viewset that is deliberately NOT scoped to the caller's own messages, for
+    staff/allocators to see actual site-wide AI reporting token consumption
+    rather than relying on perception (see PROJECT_LOG.md - harness repo -
+    section 22)."""
+
+    period_days = serializers.IntegerField()
+    total_input_tokens = serializers.IntegerField()
+    total_output_tokens = serializers.IntegerField()
+    total_requests = serializers.IntegerField()
+    daily = UsageStatsDailySerializer(many=True)
+    by_user = UsageStatsByUserSerializer(many=True)

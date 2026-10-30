@@ -233,3 +233,110 @@ class ReportingMessageViewSetTest(test.APITestCase):
             self.client.delete(detail_url).status_code,
             status.HTTP_405_METHOD_NOT_ALLOWED,
         )
+
+
+class UsageStatsTest(test.APITestCase):
+    """usage_stats is deliberately the one action in this viewset that is
+    NOT scoped to the caller's own messages - these tests specifically
+    confirm it sees every user's usage, unlike list/retrieve."""
+
+    def setUp(self):
+        self.staff = structure_factories.UserFactory(
+            is_staff=True, username="staffer", first_name="Stacy", last_name="Staff"
+        )
+        self.other_user = structure_factories.UserFactory(
+            username="other", first_name="Olly", last_name="Other"
+        )
+        self.client.force_authenticate(user=self.staff)
+        self.url = reverse("ai-reporting-message-usage-stats")
+
+    def _message(self, user, input_tokens, output_tokens):
+        session = ReportingSession.objects.create(user=user)
+        return ReportingMessage.objects.create(
+            session=session, prompt="x", status=ReportingMessage.Status.DONE,
+            input_tokens=input_tokens, output_tokens=output_tokens,
+        )
+
+    def test_regular_user_is_denied(self):
+        regular = structure_factories.UserFactory()
+        self.client.force_authenticate(user=regular)
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_totals_include_every_users_usage_not_just_the_callers(self):
+        self._message(self.staff, input_tokens=100, output_tokens=50)
+        self._message(self.other_user, input_tokens=200, output_tokens=75)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["total_input_tokens"], 300)
+        self.assertEqual(response.data["total_output_tokens"], 125)
+        self.assertEqual(response.data["total_requests"], 2)
+
+    def test_by_user_breaks_usage_down_per_person(self):
+        self._message(self.staff, input_tokens=100, output_tokens=50)
+        self._message(self.other_user, input_tokens=200, output_tokens=75)
+
+        response = self.client.get(self.url)
+
+        by_user = {row["username"]: row for row in response.data["by_user"]}
+        self.assertEqual(by_user["staffer"]["input_tokens"], 100)
+        self.assertEqual(by_user["staffer"]["full_name"], "Stacy Staff")
+        self.assertEqual(by_user["other"]["input_tokens"], 200)
+
+    def test_daily_groups_by_calendar_date(self):
+        import datetime
+
+        from django.utils import timezone
+
+        today_message = self._message(self.staff, input_tokens=10, output_tokens=5)
+        yesterday_message = self._message(self.staff, input_tokens=20, output_tokens=10)
+        ReportingMessage.objects.filter(pk=yesterday_message.pk).update(
+            created=timezone.now() - datetime.timedelta(days=1)
+        )
+
+        response = self.client.get(self.url, {"days": 7})
+
+        self.assertEqual(len(response.data["daily"]), 2)
+        self.assertEqual(response.data["period_days"], 7)
+        # response.data holds raw Python objects (DATE_FORMAT is None
+        # project-wide - see base_settings.py - so DateField passes the
+        # native date through unconverted here; actual JSON responses handle
+        # serialization separately), so compare against a date object too.
+        today_date = today_message.created.date()
+        by_date = {row["date"]: row for row in response.data["daily"]}
+        self.assertEqual(by_date[today_date]["input_tokens"], 10)
+
+    def test_days_outside_the_window_are_excluded(self):
+        import datetime
+
+        from django.utils import timezone
+
+        old_message = self._message(self.staff, input_tokens=999, output_tokens=999)
+        ReportingMessage.objects.filter(pk=old_message.pk).update(
+            created=timezone.now() - datetime.timedelta(days=40)
+        )
+
+        response = self.client.get(self.url, {"days": 30})
+
+        self.assertEqual(response.data["total_input_tokens"], 0)
+        self.assertEqual(response.data["total_requests"], 0)
+
+    def test_days_parameter_is_bounded(self):
+        response = self.client.get(self.url, {"days": 99999})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["period_days"], 365)
+
+        response = self.client.get(self.url, {"days": "not-a-number"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["period_days"], 30)
+
+    def test_empty_period_returns_zeros_not_an_error(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["total_input_tokens"], 0)
+        self.assertEqual(response.data["total_output_tokens"], 0)
+        self.assertEqual(response.data["total_requests"], 0)
+        self.assertEqual(response.data["daily"], [])
+        self.assertEqual(response.data["by_user"], [])
