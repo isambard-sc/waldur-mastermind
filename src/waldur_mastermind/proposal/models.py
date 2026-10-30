@@ -13,6 +13,7 @@ from django.db import models, transaction
 from django.db.models import Q
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from django.utils.translation import ngettext
 from model_utils import FieldTracker
 from model_utils.models import TimeStampedModel
 from model_utils.tracker import FieldInstanceTracker
@@ -297,6 +298,14 @@ class Call(
         ),
     )
 
+    minimum_number_of_documents = models.PositiveSmallIntegerField(
+        default=0,
+        help_text=(
+            "How many supporting documents a proposal must have before it can "
+            "be submitted. 0: none is required by number (the call's field "
+            "settings may still require supporting documentation)."
+        ),
+    )
     one_request_per_offering = models.BooleanField(
         default=False,
         help_text=(
@@ -1231,6 +1240,15 @@ class ProposalIDGenerator(models.Model):
         )
 
 
+def documents_missing_message(call) -> str:
+    required = call.minimum_number_of_documents
+    return ngettext(
+        "This call requires at least %(count)d supporting document.",
+        "This call requires at least %(count)d supporting documents.",
+        required,
+    ) % {"count": required}
+
+
 def has_proposal_manager_expression():
     """``Exists`` over a proposal's active proposal manager grants.
 
@@ -1540,10 +1558,21 @@ class Proposal(
                 "%(offerings)s."
             ) % {"offerings": ", ".join(missing_orders)}
 
+        documents_missing = self.documents_missing()
+        if documents_missing:
+            return False, documents_missing_message(self.round.call)
+
         if not self.has_proposal_manager():
             return False, MISSING_PROPOSAL_MANAGER_MESSAGE
 
         return True, None
+
+    def documents_missing(self) -> int:
+        """How many more supporting documents the call requires."""
+        required = self.round.call.minimum_number_of_documents
+        if not required:
+            return 0
+        return max(0, required - self.proposaldocumentation_set.count())
 
     def save(self, *args, **kwargs):
         if not self.slug:

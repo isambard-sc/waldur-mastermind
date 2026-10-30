@@ -234,6 +234,14 @@ def validate_project_details_complete(proposal):
         )
 
 
+def validate_documents_present(proposal):
+    """The call's minimum number of supporting documents is attached."""
+    if proposal.documents_missing():
+        raise exceptions.ValidationError(
+            models.documents_missing_message(proposal.round.call)
+        )
+
+
 def validate_purchase_orders_present(proposal):
     """Every requested resource whose call entry demands a purchase order has one.
 
@@ -3577,6 +3585,7 @@ class ProposalViewSet(
         core_validators.StateValidator(ProposalStates.DRAFT),
         validate_round_is_open,
         validate_project_details_complete,
+        validate_documents_present,
         validate_requested_amounts_present,
         validate_purchase_orders_present,
         validate_proposal_manager_present,
