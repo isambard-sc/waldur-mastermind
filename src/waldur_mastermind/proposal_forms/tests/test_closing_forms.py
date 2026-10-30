@@ -326,6 +326,20 @@ class DeletionTest(ClosingFormsBase):
         response = self.client.post(self.url("link"), {"step": "feedback"})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_proposal_still_reports_its_removed_project(self):
+        # HomePort finds a granted proposal's end-of-project answers through
+        # proposal.project, so the link must survive the project's removal.
+        CallRole.MANAGER.add_permission(PermissionEnum.LIST_PROPOSALS)
+        self.answer()
+        self.project.delete()
+        self.client.force_authenticate(self.call_manager)
+        response = self.client.get(f"/api/proposal-proposals/{self.proposal.uuid.hex}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertIn(self.project.uuid.hex, response.data["project"])
+        self.assertEqual(response.data["project_name"], self.project.name)
+        response = self.get(self.call_manager)
+        self.assertEqual(len(response.data["responses"]), 1)
+
     def test_deleting_the_project_row_deletes_them_everywhere(self):
         # A project no proposal created, so nothing protects its row.
         default = models.SiteClosingFormFlow.get()
