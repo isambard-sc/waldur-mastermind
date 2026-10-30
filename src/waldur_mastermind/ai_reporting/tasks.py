@@ -1,14 +1,22 @@
 import logging
+from datetime import timedelta
 
 import requests
 from celery import shared_task
 from constance import config
 from django.conf import settings
 from django.core.files.base import ContentFile
+from django.utils import timezone
 
 from waldur_mastermind.ai_reporting.models import ReportingFile, ReportingMessage
 
 logger = logging.getLogger(__name__)
+
+# Files are deleted one chunk at a time, unlike the message cleanup below -
+# each one also does real storage I/O (ReportingFile.file.delete(), via the
+# post_delete signal in handlers.py), not just a DB row, so a single huge
+# .delete() call would hold a long transaction open on top of lots of I/O.
+_FILE_CLEANUP_CHUNK_SIZE = 100
 
 # A single file fetch is just a read of bytes the harness already produced -
 # nowhere near as slow as a /query turn, but still bounded so one bad
@@ -138,3 +146,60 @@ def ask_harness(message_id: int):
 
     if message.new_files:
         _copy_files_from_harness(message, user, message.new_files)
+
+
+@shared_task(name="waldur_mastermind.ai_reporting.cleanup_old_reporting_messages")
+def cleanup_old_reporting_messages():
+    """Delete AI reporting questions/answers older than
+    AI_REPORTING_MESSAGE_RETENTION_DAYS. Cascades to any attached
+    ReportingFile rows; handlers.on_reporting_file_deleted frees their bytes
+    from storage too, so this doesn't orphan anything even for a message
+    whose files weren't already cleaned up by cleanup_old_reporting_files
+    below."""
+    retention_days = config.AI_REPORTING_MESSAGE_RETENTION_DAYS
+    if retention_days < 0:
+        logger.info("Reporting message cleanup skipped: retention is disabled")
+        return {"status": "disabled", "deleted_count": 0}
+
+    cutoff = timezone.now() - timedelta(days=retention_days)
+    old_messages = ReportingMessage.objects.filter(created__lt=cutoff)
+    count = old_messages.count()
+    if count:
+        old_messages.delete()
+
+    logger.info(
+        "Deleted %d AI reporting message(s) older than %d days (cutoff %s)",
+        count, retention_days, cutoff.date(),
+    )
+    return {"status": "ok", "deleted_count": count}
+
+
+@shared_task(name="waldur_mastermind.ai_reporting.cleanup_old_reporting_files")
+def cleanup_old_reporting_files():
+    """Delete just the generated files (charts, PDFs, CSVs) older than
+    AI_REPORTING_FILE_RETENTION_DAYS - normally shorter than the message
+    retention above, so a question's text/answer is kept around longer than
+    its (bigger, more expensive) attachments."""
+    retention_days = config.AI_REPORTING_FILE_RETENTION_DAYS
+    if retention_days < 0:
+        logger.info("Reporting file cleanup skipped: retention is disabled")
+        return {"status": "disabled", "deleted_count": 0}
+
+    cutoff = timezone.now() - timedelta(days=retention_days)
+    total_deleted = 0
+    while True:
+        pks = list(
+            ReportingFile.objects.filter(created__lt=cutoff)
+            .order_by()
+            .values_list("pk", flat=True)[:_FILE_CLEANUP_CHUNK_SIZE]
+        )
+        if not pks:
+            break
+        ReportingFile.objects.filter(pk__in=pks).delete()
+        total_deleted += len(pks)
+
+    logger.info(
+        "Deleted %d AI reporting file(s) older than %d days (cutoff %s)",
+        total_deleted, retention_days, cutoff.date(),
+    )
+    return {"status": "ok", "deleted_count": total_deleted}
