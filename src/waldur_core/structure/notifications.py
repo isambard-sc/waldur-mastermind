@@ -1090,12 +1090,27 @@ class ReviewRejectedContext(BaseModel):
     rejection_date: Any = Field(
         description="The timestamp when the review was rejected."
     )
+    rejection_reason: str = Field(
+        default="", description="Why the reviewer declined, if they said."
+    )
     create_review_link: str = Field(
         description="A URL for the manager to assign a new review."
     )
     submitted_reviews: int = Field(description="Number of reviews already submitted.")
     pending_reviews: int = Field(description="Number of reviews still pending.")
     rejected_reviews: int = Field(description="Number of rejected/cancelled reviews.")
+
+
+class ReviewReturnedContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    proposal_name: str = Field(description="Name of the proposal reviewed.")
+    call_name: str = Field(description="Name of the call.")
+    reason: str = Field(description="What the call managers ask to be changed.")
+    review_end_date: Any = Field(
+        description="When the review is now due, or None if the round sets no "
+        "review duration."
+    )
+    review_url: str = Field(description="A URL to the review.")
 
 
 class ProposalCancelledContext(BaseModel):
@@ -1505,6 +1520,14 @@ class ProposalSection(NotificationSection):
         key="review_rejected",
         description="A notification to the call managers about a rejected review.",
         context_model=ReviewRejectedContext,
+    )
+    review_returned = Notification(
+        key="review_returned",
+        description=(
+            "Tells a reviewer that the call managers have returned their "
+            "submitted review to them to change, and why."
+        ),
+        context_model=ReviewReturnedContext,
     )
     round_closing_for_managers = Notification(
         key="round_closing_for_managers",

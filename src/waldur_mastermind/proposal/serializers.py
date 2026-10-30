@@ -706,6 +706,8 @@ class ProposalReviewSerializer(
             "summary_public_comment",
             "summary_private_comment",
             "rejection_reason",
+            "returned_at",
+            "return_reason",
             "round_uuid",
             "round_name",
             "round_slug",
@@ -728,7 +730,13 @@ class ProposalReviewSerializer(
             "created",
             "modified",
         )
-        read_only_fields = ("coi_confirmed", "coi_confirmed_at", "rejection_reason")
+        read_only_fields = (
+            "coi_confirmed",
+            "coi_confirmed_at",
+            "rejection_reason",
+            "returned_at",
+            "return_reason",
+        )
         protected_fields = ("proposal", "reviewer")
         extra_kwargs = {
             "url": {
@@ -826,8 +834,12 @@ class ProposalReviewSerializer(
             # Show real reviewer info, hide anonymous identifier
             fields.pop("anonymous_reviewer_name", None)
 
-        # Always remove private comments for non-authorized users
+        # Always remove private comments for non-authorized users, and what
+        # passed between the reviewer and the call's managers.
         fields.pop("summary_private_comment", None)
+        fields.pop("rejection_reason", None)
+        fields.pop("returned_at", None)
+        fields.pop("return_reason", None)
 
         return fields
 
@@ -871,6 +883,13 @@ set_override(
         "summary_private_comment",
     ],
 )
+
+
+class ReturnToReviewerSerializer(serializers.Serializer):
+    reason = serializers.CharField(
+        max_length=2000,
+        help_text="What the reviewer is asked to change; sent to them.",
+    )
 
 
 class ReviewRejectSerializer(serializers.Serializer):

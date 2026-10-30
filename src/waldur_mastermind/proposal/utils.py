@@ -1416,6 +1416,57 @@ def extend_return(proposal, user, resubmit_by):
     return returned
 
 
+def return_review_to_reviewer(review, user, reason):
+    """Hand a submitted review back to its reviewer to change, while its
+    proposal is still undecided. It is in review again, due afresh from now
+    (Review.review_end_date), and the reviewer is told why."""
+    with transaction.atomic():
+        review = (
+            proposal_models.Review.objects.select_for_update(of=("self",))
+            .select_related("proposal")
+            .get(pk=review.pk)
+        )
+        proposal = review.proposal
+        if review.state != proposal_models.Review.States.SUBMITTED:
+            raise serializers.ValidationError(
+                "Only a submitted review can be returned to its reviewer."
+            )
+        if proposal.state not in (ProposalStates.SUBMITTED, ProposalStates.IN_REVIEW):
+            raise serializers.ValidationError(
+                "The proposal has been decided; its reviews can no longer change."
+            )
+        if proposal.decision_held:
+            raise serializers.ValidationError(
+                "This proposal has a decision held for publication; reopen the "
+                "decision before returning its reviews."
+            )
+        review.state = proposal_models.Review.States.IN_REVIEW
+        review.returned_at = timezone.now()
+        review.returned_by = user
+        review.return_reason = reason
+        review.save(
+            update_fields=[
+                "state",
+                "returned_at",
+                "returned_by",
+                "return_reason",
+                "modified",
+            ]
+        )
+        event_logger.emit(
+            "Review for {proposal_name} has been returned to its reviewer by "
+            "{returned_by}.",
+            event_type=EventType.REVIEW_RETURNED,
+            event_context={
+                "review": review,
+                "proposal_name": proposal.name,
+                "returned_by": user.full_name if user else "",
+            },
+            scopes=[_get_customer(review)],
+        )
+    return review
+
+
 def close_open_return(proposal):
     """The proposal was resubmitted: its return is done."""
     proposal_models.ProposalReturn.objects.filter(

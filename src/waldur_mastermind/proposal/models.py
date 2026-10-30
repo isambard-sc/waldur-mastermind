@@ -1965,6 +1965,23 @@ class Review(
         blank=True,
         help_text="Why the reviewer declined the review, for the call's managers.",
     )
+    returned_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the call's managers last returned the submitted review "
+        "to its reviewer. The review is then due afresh from this time.",
+    )
+    returned_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    return_reason = models.TextField(
+        blank=True,
+        help_text="What the call's managers asked the reviewer to change.",
+    )
     comment_project_title = models.CharField(max_length=255, null=True, blank=True)
     comment_project_summary = models.CharField(max_length=255, null=True, blank=True)
     comment_project_description = models.CharField(
@@ -2009,7 +2026,8 @@ class Review(
         if not self.proposal.round.review_duration_in_days:
             return None
 
-        end_date = self.created + timedelta(
+        # A review returned to its reviewer is due afresh from its return.
+        end_date = (self.returned_at or self.created) + timedelta(
             days=self.proposal.round.review_duration_in_days
         )
         try:

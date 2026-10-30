@@ -4848,6 +4848,36 @@ class ReviewViewSet(ActionsViewSet):
     ]
 
     @extend_schema(
+        description="Return a submitted review to its reviewer to change, while "
+        "the proposal is undecided. It is in review again, due afresh from now, "
+        "and the reviewer is emailed the reason. For those who may decide the "
+        "call's proposals.",
+        request=serializers.ReturnToReviewerSerializer,
+        responses={status.HTTP_200_OK: serializers.ProposalReviewSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def return_to_reviewer(self, request, uuid=None):
+        review: models.Review = self.get_object()
+        input_serializer = serializers.ReturnToReviewerSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        review = utils.return_review_to_reviewer(
+            review, request.user, input_serializer.validated_data["reason"]
+        )
+        transaction.on_commit(
+            lambda: tasks.notify_reviewer_about_returned_review.delay(review.uuid.hex)
+        )
+        return response.Response(
+            self.get_serializer(review).data, status=status.HTTP_200_OK
+        )
+
+    def can_decide_reviewed_proposal(request, view, obj=None):
+        proposal_permissions.can_decide_proposal(
+            request, view, obj.proposal if obj else None
+        )
+
+    return_to_reviewer_permissions = [can_decide_reviewed_proposal]
+
+    @extend_schema(
         description="Submit a review, changing its state to SUBMITTED.",
         request=ReviewSubmitSerializer,
         responses={status.HTTP_200_OK: None},
