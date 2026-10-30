@@ -3,6 +3,7 @@ from django.urls import reverse
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
+from waldur_core.core.models import is_feature_enabled
 from waldur_mastermind.proposal import models as proposal_models
 
 from . import client, flows, models
@@ -365,12 +366,14 @@ class CallFormFlowSummarySerializer(serializers.Serializer):
 
 @extend_schema_field(CallFormFlowSummarySerializer(allow_null=True))
 def _get_form_flow(serializer, call):
-    # Null while Formbricks forms are off, so the frontend offers Waldur's own
-    # form. Checked once per response, not once per call in a list.
+    # Null while the site has Formbricks forms switched off. Not while
+    # Formbricks is merely unreachable or the connection paused: the call
+    # still needs its forms answered before submission. Checked once per
+    # response, not once per call in a list.
     context = serializer.context
-    if "formbricks_available" not in context:
-        context["formbricks_available"] = client.is_available()
-    if not context["formbricks_available"]:
+    if "formbricks_forms_on" not in context:
+        context["formbricks_forms_on"] = is_feature_enabled(client.FEATURE)
+    if not context["formbricks_forms_on"]:
         return None
     flow = get_call_form_flow(call)
     if flow is None:

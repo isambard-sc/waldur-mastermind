@@ -424,7 +424,19 @@ class SubmitRuleTest(FormsResponseBase):
         self.answer("team_details", su="su-team", response_id="resp-team")
         handlers.validate_forms_answered(self.proposal)
 
-    def test_not_enforced_while_forms_are_off(self):
+    def test_enforced_while_formbricks_is_unavailable(self):
+        # A paused or unreachable Formbricks must not let a proposal through
+        # without its forms.
+        models.FormbricksConnection.objects.update(enabled=False)
+        with self.assertRaises(exceptions.ValidationError) as raised:
+            handlers.validate_forms_answered(self.proposal)
+        self.assertIn("cannot be opened just now", str(raised.exception.detail))
+        # Answers already in Waldur still count.
+        self.answer()
+        self.answer("team_details", su="su-team", response_id="resp-team")
+        handlers.validate_forms_answered(self.proposal)
+
+    def test_not_enforced_once_the_site_switches_forms_off(self):
         core_models.Feature.objects.filter(key=client.FEATURE).update(value=False)
         handlers.validate_forms_answered(self.proposal)
 

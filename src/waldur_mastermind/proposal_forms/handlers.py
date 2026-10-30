@@ -6,6 +6,7 @@ from django.db import transaction
 from django.db.models.signals import pre_delete
 from rest_framework import exceptions
 
+from waldur_core.core.models import is_feature_enabled
 from waldur_core.core.signals import pre_serializer_fields
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal import serializers as proposal_serializers
@@ -29,16 +30,22 @@ for call_serializer in (
 
 def validate_forms_answered(proposal):
     """A proposal whose call has forms is submitted only once every form is
-    answered. Not enforced while Formbricks forms are off: applicants then
-    see only Waldur's own form."""
+    answered, whether or not Formbricks can be reached: the answers checked
+    are Waldur's copy. Only switching the feature off (the site no longer
+    using Formbricks forms) lifts the rule."""
     flow = responses.call_flow(proposal)
-    if flow is None or not client.is_available():
+    if flow is None or not is_feature_enabled(client.FEATURE):
         return
     missing = responses.missing_steps(proposal, flow)
-    if missing:
-        raise exceptions.ValidationError(
-            {"forms": [f"Fill in these forms before submitting: {', '.join(missing)}."]}
+    if not missing:
+        return
+    message = f"Fill in these forms before submitting: {', '.join(missing)}."
+    if not client.is_available():
+        message += (
+            " The forms cannot be opened just now; please try again later, or "
+            "contact the call's managers if it keeps happening."
         )
+    raise exceptions.ValidationError({"forms": [message]})
 
 
 # Added to upstream's submit validators rather than editing its view.

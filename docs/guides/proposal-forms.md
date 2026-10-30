@@ -41,10 +41,16 @@ Two switches, both needed:
 - the connection's **`enabled`**, which staff can only set once the
   connection is configured.
 
-While either is off, calls report `form_flow: null`, a flow cannot be chosen
-for a call, no links are issued, submission is not held back by forms, and
-the webhook acknowledges (200) and ignores what it is sent. Staff can still
-configure the connection and the flows. Answers already given stay readable.
+While either is off, no links are issued, a flow cannot be chosen for a
+call, and the webhook acknowledges (200) and ignores what it is sent. Staff
+can still configure the connection and the flows. Answers already given stay
+readable.
+
+The two switches differ in one way. With the connection disabled (or
+Formbricks unreachable), a call with a flow still shows it and still refuses
+submission until every form is answered: applicants wait rather than submit
+without their forms. Only switching the feature off releases the rule: calls
+then report `form_flow: null` and are submitted with Waldur's form alone.
 
 ## Setting up
 

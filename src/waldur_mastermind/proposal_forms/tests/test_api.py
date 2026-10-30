@@ -371,6 +371,15 @@ class CallFlowApiTest(FormsTestBase):
         response = self.client.get(f"/api/proposal-public-calls/{other.uuid.hex}/")
         self.assertIsNone(response.data["form_flow"])
 
+    def test_call_keeps_its_flow_while_formbricks_is_unavailable(self):
+        # The forms are still required, so the frontend must still show them.
+        models.FormbricksConnection.objects.update(enabled=False)
+        self.client.force_authenticate(self.call_manager)
+        url = f"/api/proposal-protected-calls/{self.call.uuid.hex}/"
+        self.assertEqual(self.client.get(url).data["form_flow"]["key"], "airr-gw")
+        core_models.Feature.objects.filter(key=client.FEATURE).update(value=False)
+        self.assertIsNone(self.client.get(url).data["form_flow"])
+
     def test_call_manager_sets_flow_until_proposals_exist(self):
         call = proposal_factories.CallFactory(state=CallStates.ACTIVE)
         proposal_factories.RequestedOfferingFactory(call=call, offering=self.offering)

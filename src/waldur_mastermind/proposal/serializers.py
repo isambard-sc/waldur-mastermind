@@ -3044,7 +3044,6 @@ class ProposalSerializer(
             )
         return workflow_service.is_awaiting_manual_advance(obj)
 
-    @extend_schema_field(serializers.BooleanField(allow_null=True))
     @extend_schema_field(OpenReturnSerializer(allow_null=True))
     def get_open_return(self, obj):
         returned = models.get_open_return(obj)
@@ -3052,6 +3051,7 @@ class ProposalSerializer(
             return None
         return OpenReturnSerializer(returned).data
 
+    @extend_schema_field(serializers.BooleanField(allow_null=True))
     def get_decision_held(self, obj) -> bool | None:
         """Whether the allocation decision is made but held for the round.
 
