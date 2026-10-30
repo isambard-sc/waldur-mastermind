@@ -1,4 +1,9 @@
-from drf_spectacular.utils import extend_schema
+from datetime import timedelta
+
+from django.db.models import Count, Sum
+from django.db.models.functions import TruncDate
+from django.utils import timezone
+from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import decorators, status
 from rest_framework.exceptions import NotFound
 from rest_framework.permissions import IsAuthenticated
@@ -9,6 +14,9 @@ from waldur_core.core.views import ActionsViewSet, ConstanceCheckExtensionMixin
 from waldur_core.structure import permissions as structure_permissions
 from waldur_mastermind.ai_reporting import limits, serializers, tasks
 from waldur_mastermind.ai_reporting.models import ReportingMessage, ReportingSession
+
+_USAGE_STATS_MAX_DAYS = 365
+_USAGE_STATS_DEFAULT_DAYS = 30
 
 
 class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
@@ -121,3 +129,87 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
             serializers.ReportingMessageSerializer(message, context=context).data,
             status=status.HTTP_202_ACCEPTED,
         )
+
+    usage_stats_permissions = [structure_permissions.is_staff_or_support]
+    usage_stats_serializer_class = serializers.UsageStatsResponseSerializer
+
+    @extend_schema(
+        summary="Site-wide AI reporting token usage",
+        description=(
+            "Token usage totals and a daily trend across every user's AI reporting "
+            "questions - not scoped to the caller's own messages, unlike every other "
+            "action on this viewset. For staff/allocators to see actual usage, since "
+            "that's a more direct answer to 'does this cost a lot' than a policy limit "
+            "alone."
+        ),
+        parameters=[
+            OpenApiParameter(
+                "days", int, location=OpenApiParameter.QUERY,
+                description=f"Trailing window in days (1-{_USAGE_STATS_MAX_DAYS}, default {_USAGE_STATS_DEFAULT_DAYS}).",
+            ),
+        ],
+        responses={200: serializers.UsageStatsResponseSerializer},
+    )
+    @decorators.action(detail=False, methods=["get"])
+    def usage_stats(self, request):
+        try:
+            days = int(request.query_params.get("days", _USAGE_STATS_DEFAULT_DAYS))
+        except ValueError:
+            days = _USAGE_STATS_DEFAULT_DAYS
+        days = max(1, min(days, _USAGE_STATS_MAX_DAYS))
+        since = timezone.now() - timedelta(days=days)
+
+        # Deliberately not self.get_queryset() - that's filtered to the
+        # caller's own messages (see get_queryset's own docstring); this is
+        # the one action in this viewset that is site-wide by design.
+        queryset = ReportingMessage.objects.filter(created__gte=since)
+
+        totals = queryset.aggregate(
+            total_input_tokens=Sum("input_tokens"),
+            total_output_tokens=Sum("output_tokens"),
+            total_requests=Count("id"),
+        )
+
+        daily = list(
+            queryset
+            .annotate(date=TruncDate("created"))
+            .values("date")
+            .annotate(
+                input_tokens=Sum("input_tokens"),
+                output_tokens=Sum("output_tokens"),
+                requests=Count("id"),
+            )
+            .order_by("date")
+        )
+
+        by_user = [
+            {
+                "user": row["session__user__uuid"],
+                "full_name": f"{row['session__user__first_name']} {row['session__user__last_name']}".strip(),
+                "username": row["session__user__username"],
+                "input_tokens": row["input_tokens"],
+                "output_tokens": row["output_tokens"],
+                "requests": row["requests"],
+            }
+            for row in queryset
+            .values(
+                "session__user__uuid", "session__user__username",
+                "session__user__first_name", "session__user__last_name",
+            )
+            .annotate(
+                input_tokens=Sum("input_tokens"),
+                output_tokens=Sum("output_tokens"),
+                requests=Count("id"),
+            )
+            .order_by("-input_tokens")
+        ]
+
+        response_data = {
+            "period_days": days,
+            "total_input_tokens": totals["total_input_tokens"] or 0,
+            "total_output_tokens": totals["total_output_tokens"] or 0,
+            "total_requests": totals["total_requests"] or 0,
+            "daily": daily,
+            "by_user": by_user,
+        }
+        return Response(serializers.UsageStatsResponseSerializer(response_data).data)
