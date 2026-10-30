@@ -12,6 +12,7 @@ they cannot disagree.
 import logging
 
 from django.db import transaction
+from django.utils import timezone
 
 from waldur_mastermind.proposal.enums import ProposalStates
 
@@ -32,6 +33,13 @@ def call_flow(proposal):
 
 
 # --- issuing links ------------------------------------------------------------
+
+
+def _touch(proposal):
+    """Work on a proposal's forms is work on the proposal: it counts as a
+    change for the stale-draft clean-up. An update, so no other save logic
+    runs."""
+    type(proposal).objects.filter(pk=proposal.pk).update(modified=timezone.now())
 
 
 def issue_link(proposal, step, user) -> models.FormLink:
@@ -75,6 +83,7 @@ def issue_link(proposal, step, user) -> models.FormLink:
             "The form cannot be opened just now. Please try again later, or "
             "contact the call's managers if it keeps happening."
         ) from e
+    _touch(proposal)
     return models.FormLink.objects.create(
         single_use_id=client.single_use_id(minted),
         proposal=proposal,
@@ -191,6 +200,8 @@ def apply_response(record: dict) -> str:
         link.state = models.FormLink.States.ANSWERED
         link.response_id = response_id
         link.save(update_fields=["state", "response_id", "modified"])
+        if proposal.state == ProposalStates.DRAFT:
+            _touch(proposal)
 
         if previous_response_id and previous_response_id != response_id:
             # An edit: one copy of the answers in Formbricks, so the response

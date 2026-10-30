@@ -1247,6 +1247,32 @@ class ProposalReturnedContext(BaseModel):
     proposal_url: str = Field(description="A URL to the proposal details page.")
 
 
+class StaleProposalReminderContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    proposal_name: str = Field(description="Name of the draft proposal.")
+    call_name: str = Field(description="Name of the call.")
+    proposal_url: str = Field(description="A URL to the proposal details page.")
+    last_modified: str = Field(description="When the draft was last changed.")
+    days_since_modification: int = Field(
+        description="Days since the draft was last changed."
+    )
+    days_until_deletion: int = Field(
+        description="Days until the draft is deleted if it does not change."
+    )
+    deletion_date: str = Field(description="When the draft will be deleted.")
+
+
+class StaleProposalDeletedContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    proposal_name: str = Field(description="Name of the deleted draft.")
+    call_name: str = Field(description="Name of the call.")
+    last_modified: str = Field(description="When the draft was last changed.")
+    days_since_modification: int = Field(
+        description="Days the draft went without changes."
+    )
+    deletion_date: str = Field(description="When the draft was deleted.")
+
+
 class ReviewsCompleteContext(BaseModel):
     site_name: str = Field(description="The name of the site from settings.")
     proposal_name: str = Field(
@@ -1439,6 +1465,21 @@ class ProposalSection(NotificationSection):
             "if that deadline is extended."
         ),
         context_model=ProposalReturnedContext,
+    )
+    stale_proposal_reminder = Notification(
+        key="stale_proposal_reminder",
+        description=(
+            "Warns a draft proposal's team that it has not changed for "
+            "PROPOSAL_STALE_DRAFT_REMINDER_DAYS and will be deleted after "
+            "PROPOSAL_STALE_DRAFT_DELETION_DAYS more unless it is edited or "
+            "submitted."
+        ),
+        context_model=StaleProposalReminderContext,
+    )
+    stale_proposal_deleted = Notification(
+        key="stale_proposal_deleted",
+        description="Tells a draft proposal's team that it was deleted for lack of changes.",
+        context_model=StaleProposalDeletedContext,
     )
     proposal_submission_deadline_approaching = Notification(
         key="proposal_submission_deadline_approaching",

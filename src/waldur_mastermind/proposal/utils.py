@@ -838,6 +838,10 @@ def process_closed_round(
     their applicants, see ``carry_over_drafts``.
     """
     moved = carry_over_drafts(call_round, announce=announce)
+    if not call_round.call.cancel_drafts_at_cutoff:
+        # The call keeps its drafts: the stale-draft clean-up deals with them,
+        # with warning, rather than the cut-off without any.
+        return moved
 
     # Lock the drafts while reading them, so the proposals announced are exactly
     # the rows updated: a concurrent submit holds the same row lock, and if it

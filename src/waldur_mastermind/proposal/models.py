@@ -287,6 +287,15 @@ class Call(
             "later round the draft is cancelled either way."
         ),
     )
+    cancel_drafts_at_cutoff = models.BooleanField(
+        default=True,
+        help_text=(
+            "Whether a draft still open when its round's cut-off passes (and not "
+            "carried over) is cancelled. Off: it stays a draft, which can no "
+            "longer be submitted, until the stale-draft clean-up (site settings "
+            "PROPOSAL_STALE_DRAFT_*) warns its team and deletes it."
+        ),
+    )
 
     publish_results = models.CharField(
         max_length=20,
@@ -1308,6 +1317,15 @@ class Proposal(
 
     resources = models.ManyToManyField(RequestedOffering, through="RequestedResource")
     allocation_comment = models.CharField(blank=True, max_length=150, null=True)
+    stale_reminder_sent_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        editable=False,
+        help_text=(
+            "When the draft's team was warned it would be deleted for lack of "
+            "changes; cleared once it changes again."
+        ),
+    )
     science_sub_domain = models.ForeignKey(
         "structure.ScienceSubDomain",
         verbose_name=_("science sub-domain"),

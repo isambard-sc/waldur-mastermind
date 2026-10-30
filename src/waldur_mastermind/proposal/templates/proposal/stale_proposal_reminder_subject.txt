@@ -1,0 +1,1 @@
+Reminder: Submit your draft proposal "{{ proposal_name }}"
