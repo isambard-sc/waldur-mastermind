@@ -123,11 +123,17 @@ def ask_harness(message_id: int):
         message.save(update_fields=["status", "error_message", "modified"])
         return
 
+    usage = payload.get("usage") or {}
     message.status = ReportingMessage.Status.DONE
     message.answer = payload.get("answer", "")
     message.new_files = payload.get("new_files", [])
+    message.input_tokens = usage.get("input_tokens", 0)
+    message.output_tokens = usage.get("output_tokens", 0)
     message.save(
-        update_fields=["status", "answer", "new_files", "modified"]
+        update_fields=[
+            "status", "answer", "new_files",
+            "input_tokens", "output_tokens", "modified",
+        ]
     )
 
     if message.new_files:

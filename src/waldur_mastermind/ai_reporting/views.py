@@ -7,7 +7,7 @@ from rest_framework.response import Response
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core.views import ActionsViewSet, ConstanceCheckExtensionMixin
 from waldur_core.structure import permissions as structure_permissions
-from waldur_mastermind.ai_reporting import serializers, tasks
+from waldur_mastermind.ai_reporting import limits, serializers, tasks
 from waldur_mastermind.ai_reporting.models import ReportingMessage, ReportingSession
 
 
@@ -64,6 +64,14 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
     def ask(self, request):
         request_serializer = self.get_serializer(data=request.data)
         request_serializer.is_valid(raise_exception=True)
+
+        # Reject before creating anything if this would exceed a configured
+        # AI_REPORTING_TOKEN_LIMIT_*/GLOBAL_* Constance limit - see
+        # ai_reporting.limits. Raises rest_framework.exceptions.Throttled
+        # (429) directly; DRF's own exception handling turns that into the
+        # response.
+        limits.enforce_usage_limits(request.user)
+
         prompt = request_serializer.validated_data["prompt"]
         new_session = request_serializer.validated_data["new_session"]
         requested_session = request_serializer.validated_data["session"]

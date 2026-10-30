@@ -38,6 +38,35 @@ class FeatureEnabledSwitchTest(test.APITestCase):
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
 
 
+class AskUsageLimitTest(test.APITestCase):
+    """Confirms limits.enforce_usage_limits is actually wired into the ask
+    action (see ai_reporting.tests.test_limits for the limit logic itself) -
+    rejected before anything is created, not just logged after the fact."""
+
+    def setUp(self):
+        self.staff = structure_factories.UserFactory(is_staff=True)
+        self.client.force_authenticate(user=self.staff)
+        self.ask_url = reverse("ai-reporting-message-ask")
+
+    @override_constance_config(AI_REPORTING_TOKEN_LIMIT_DAILY=10)
+    def test_ask_is_rejected_once_the_daily_limit_is_reached(self):
+        session = ReportingSession.objects.create(user=self.staff)
+        ReportingMessage.objects.create(
+            session=session, prompt="earlier", status=ReportingMessage.Status.DONE,
+            input_tokens=6, output_tokens=5,  # 11 >= 10
+        )
+
+        with mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay") as mock_delay:
+            response = self.client.post(self.ask_url, {"prompt": "How many projects?"})
+
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        mock_delay.assert_not_called()
+        self.assertFalse(
+            ReportingMessage.objects.filter(prompt="How many projects?").exists(),
+            "a rejected request must not create a message at all",
+        )
+
+
 class AskPermissionTest(test.APITestCase):
     def setUp(self):
         self.ask_url = reverse("ai-reporting-message-ask")
