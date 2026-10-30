@@ -1742,6 +1742,64 @@ class AwardedResource(
         return f"{self.proposal.name} - {self.requested_offering.offering.name}"
 
 
+class ProposalReturn(core_models.UuidMixin, TimeStampedModel):
+    """A proposal handed back to its applicant to fix and resubmit.
+
+    The third decision beside accepting and rejecting: the proposal goes back
+    to draft, with the reason and a resubmission deadline the call manager
+    sets. While the return is open (not yet resubmitted) the proposal may be
+    submitted after its round's cut-off, up to the deadline, and the cut-off
+    sweep neither carries it over nor cancels it. Nothing happens on its own
+    when the deadline passes: the call manager follows it up.
+    """
+
+    proposal = models.ForeignKey(
+        Proposal, on_delete=models.CASCADE, related_name="returns"
+    )
+    returned_by = models.ForeignKey(
+        core_models.User, on_delete=models.SET_NULL, null=True, related_name="+"
+    )
+    reason = models.TextField(help_text=_("Why, as the applicant is told."))
+    resubmit_by = models.DateTimeField(
+        help_text=_("Resubmission is accepted until then; may be extended.")
+    )
+    previous_state = models.CharField(max_length=10)
+    workflow_history = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=_(
+            "The proposal's workflow steps as they stood when it was returned "
+            "(outcomes, reasons, internal notes): they are cleared so that "
+            "resubmission starts the workflow again."
+        ),
+    )
+    resubmitted_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("-created",)
+
+    def __str__(self):
+        return f"{self.proposal} returned {self.created:%Y-%m-%d}"
+
+    @property
+    def is_open(self) -> bool:
+        return self.resubmitted_at is None
+
+
+def open_return_proposal_ids():
+    """Proposals returned to their applicant and not yet resubmitted, as a
+    subquery: the cut-off sweep and reminders leave them alone."""
+    return ProposalReturn.objects.filter(resubmitted_at__isnull=True).values(
+        "proposal_id"
+    )
+
+
+def get_open_return(proposal) -> "ProposalReturn | None":
+    if proposal.state != ProposalStates.DRAFT:
+        return None
+    return proposal.returns.filter(resubmitted_at__isnull=True).first()
+
+
 class ProposalWorkflowStepInstance(
     TimeStampedModel,
     core_models.UuidMixin,

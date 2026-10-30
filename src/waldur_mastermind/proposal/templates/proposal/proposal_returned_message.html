@@ -1,0 +1,19 @@
+<html>
+<head lang="en">
+    <meta charset="UTF-8">
+    <title>{% if extended %}New deadline to resubmit your proposal{% else %}Your proposal has been returned to you{% endif %}</title>
+</head>
+<body>
+<p>Hello,</p>
+{% if extended %}
+<p>The deadline to resubmit your proposal "{{ proposal_name }}" in call "{{ call_name }}" has been extended.</p>
+{% else %}
+<p>The managers of call "{{ call_name }}" have returned your proposal "{{ proposal_name }}" to you so that it can be corrected and resubmitted. It is a draft again: you can edit it, including its forms.</p>
+<p><strong>Reason:</strong></p>
+<p style="white-space: pre-wrap;">{{ reason }}</p>
+{% endif %}
+<p>Please resubmit it by <strong>{{ resubmit_by }}</strong>: <a href="{{ proposal_url }}">{{ proposal_url }}</a></p>
+<p>If you have any questions, please contact the call's managers.</p>
+<p>This is an automated message from the {{ site_name }}. Please do not reply to this email.</p>
+</body>
+</html>

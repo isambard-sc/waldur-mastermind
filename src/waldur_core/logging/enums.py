@@ -277,6 +277,8 @@ class EventType(StrEnum):
     PROPOSAL_DOCUMENT_REMOVED = "proposal_document_removed"
     PROPOSAL_DECISION_REOPENED = "proposal_decision_reopened"
     PROPOSAL_REJECTED_AT_ROUND_COMPLETION = "proposal_rejected_at_round_completion"
+    PROPOSAL_RETURNED = "proposal_returned"
+    PROPOSAL_RETURN_EXTENDED = "proposal_return_extended"
     PROPOSAL_WORKFLOW_ADVANCED = "proposal_workflow_advanced"
     ROUND_CLOSED = "round_closed"
     ROUND_DECISION_STARTED = "round_decision_started"
@@ -672,6 +674,8 @@ EVENT_GROUP_MAPPING = {
         EventType.PROPOSAL_DRAFT_CARRIED_OVER,
         EventType.PROPOSAL_DECISION_REOPENED,
         EventType.PROPOSAL_REJECTED_AT_ROUND_COMPLETION,
+        EventType.PROPOSAL_RETURNED,
+        EventType.PROPOSAL_RETURN_EXTENDED,
         EventType.PROPOSAL_WORKFLOW_ADVANCED,
         EventType.ROUND_CLOSED,
         EventType.ROUND_DECISION_STARTED,

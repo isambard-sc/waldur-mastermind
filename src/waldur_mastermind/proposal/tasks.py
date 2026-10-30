@@ -12,6 +12,8 @@ from waldur_core.core import utils as core_utils
 from waldur_core.core.service_access import names_calls
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
+from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.utils import get_users
 from waldur_core.structure.permissions import _get_customer
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.proposal import models as proposal_models
@@ -62,6 +64,8 @@ def proposals_for_ended_rounds_should_be_cancelled():
             state=ProposalStates.DRAFT, round__cutoff_time__lt=date
         )
         .exclude(round_id__in=failed_round_ids)
+        # Returned to the applicant: theirs to resubmit by its own deadline.
+        .exclude(pk__in=proposal_models.open_return_proposal_ids())
         .select_related(
             # Each save publishes a proposal event whose scope chain walks these.
             "round__call__manager__customer"
@@ -745,11 +749,16 @@ def notify_manager_on_round_cutoff():
 )
 def notify_proposal_creator_on_submission_deadline_approaching():
     now = timezone.now()
-    proposals = proposal_models.Proposal.objects.filter(
-        state=ProposalStates.DRAFT,
-        round__call__state=CallStates.ACTIVE,
-        round__cutoff_time__gt=now,
-    ).select_related("round", "round__call", "created_by")
+    proposals = (
+        proposal_models.Proposal.objects.filter(
+            state=ProposalStates.DRAFT,
+            round__call__state=CallStates.ACTIVE,
+            round__cutoff_time__gt=now,
+        )
+        # A returned proposal's deadline is its own, not the round's.
+        .exclude(pk__in=proposal_models.open_return_proposal_ids())
+        .select_related("round", "round__call", "created_by")
+    )
 
     carries_over: dict[int, bool] = {}
     for proposal in proposals:
@@ -1478,3 +1487,42 @@ def send_workflow_step_deadline_reminders():
     if sent:
         logger.info("Sent %d workflow step deadline reminder(s)", sent)
     return sent
+
+
+@shared_task(name="waldur_mastermind.proposal.notify_team_about_returned_proposal")
+def notify_team_about_returned_proposal(return_uuid, extended):
+    """Tell a returned proposal's team why, and the deadline to resubmit; or,
+    when ``extended``, the new deadline."""
+    returned = (
+        proposal_models.ProposalReturn.objects.select_related(
+            "proposal__round__call", "proposal__created_by"
+        )
+        .filter(uuid=return_uuid)
+        .first()
+    )
+    if returned is None:
+        return
+    proposal = returned.proposal
+    recipients = set(get_users(proposal, PermissionEnum.MANAGE_PROPOSAL))
+    if proposal.created_by:
+        recipients.add(proposal.created_by)
+    emails = sorted({user.email for user in recipients if user.email})
+    if not emails:
+        logger.warning(
+            "Cannot tell the team of proposal %s it was returned: no email.",
+            proposal.uuid,
+        )
+        return
+    context = {
+        "site_name": config.SITE_NAME,
+        "proposal_name": proposal.name,
+        "call_name": proposal.round.call.name,
+        "reason": returned.reason,
+        "resubmit_by": returned.resubmit_by,
+        "extended": bool(extended),
+        "proposal_url": core_utils.format_homeport_link(
+            "proposals/{proposal_uuid}/",
+            proposal_uuid=proposal.uuid,
+        ),
+    }
+    core_utils.broadcast_mail("proposal", "proposal_returned", context, emails)

@@ -1,0 +1,14 @@
+Hello,
+{% if extended %}
+The deadline to resubmit your proposal "{{ proposal_name }}" in call "{{ call_name }}" has been extended.
+{% else %}
+The managers of call "{{ call_name }}" have returned your proposal "{{ proposal_name }}" to you so that it can be corrected and resubmitted. It is a draft again: you can edit it, including its forms.
+
+Reason:
+{{ reason }}
+{% endif %}
+Please resubmit it by {{ resubmit_by }}: {{ proposal_url }}
+
+If you have any questions, please contact the call's managers.
+
+This is an automated message from the {{ site_name }}. Please do not reply to this email.

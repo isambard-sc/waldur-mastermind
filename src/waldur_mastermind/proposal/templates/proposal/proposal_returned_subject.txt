@@ -1,0 +1,1 @@
+{% if extended %}New deadline to resubmit your proposal {{ proposal_name }}{% else %}Your proposal {{ proposal_name }} has been returned to you{% endif %}

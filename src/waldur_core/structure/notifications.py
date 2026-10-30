@@ -1232,6 +1232,21 @@ class ProposalDraftCarriedOverContext(BaseModel):
     proposal_url: str = Field(description="A URL to the proposal details page.")
 
 
+class ProposalReturnedContext(BaseModel):
+    site_name: str = Field(description="Name of the site from settings.")
+    proposal_name: str = Field(description="Name of the proposal.")
+    call_name: str = Field(description="Name of the call for proposals.")
+    reason: str = Field(description="Why the proposal was returned.")
+    resubmit_by: Any = Field(
+        description="Deadline to resubmit the proposal; may be extended later."
+    )
+    extended: bool = Field(
+        description="True when this message announces a new deadline for a "
+        "proposal already returned, rather than the return itself."
+    )
+    proposal_url: str = Field(description="A URL to the proposal details page.")
+
+
 class ReviewsCompleteContext(BaseModel):
     site_name: str = Field(description="The name of the site from settings.")
     proposal_name: str = Field(
@@ -1415,6 +1430,15 @@ class ProposalSection(NotificationSection):
             "round's cut-off passed, has moved on to the call's next round."
         ),
         context_model=ProposalDraftCarriedOverContext,
+    )
+    proposal_returned = Notification(
+        key="proposal_returned",
+        description=(
+            "Tells a proposal's team that the call managers have returned it to "
+            "draft to be fixed, why, and the deadline to resubmit it; and again "
+            "if that deadline is extended."
+        ),
+        context_model=ProposalReturnedContext,
     )
     proposal_submission_deadline_approaching = Notification(
         key="proposal_submission_deadline_approaching",
