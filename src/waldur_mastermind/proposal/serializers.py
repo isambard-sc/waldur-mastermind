@@ -705,6 +705,7 @@ class ProposalReviewSerializer(
             "summary_score",
             "summary_public_comment",
             "summary_private_comment",
+            "rejection_reason",
             "round_uuid",
             "round_name",
             "round_slug",
@@ -727,7 +728,7 @@ class ProposalReviewSerializer(
             "created",
             "modified",
         )
-        read_only_fields = ("coi_confirmed", "coi_confirmed_at")
+        read_only_fields = ("coi_confirmed", "coi_confirmed_at", "rejection_reason")
         protected_fields = ("proposal", "reviewer")
         extra_kwargs = {
             "url": {
@@ -870,6 +871,15 @@ set_override(
         "summary_private_comment",
     ],
 )
+
+
+class ReviewRejectSerializer(serializers.Serializer):
+    reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=2000,
+        help_text="Why the reviewer declines; sent to the call's managers.",
+    )
 
 
 class ReviewSubmitSerializer(serializers.ModelSerializer):

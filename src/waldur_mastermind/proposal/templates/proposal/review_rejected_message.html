@@ -14,6 +14,12 @@
         - Assigned date: {{ assign_date }}<br>
         - Rejected date: {{ rejection_date }}
     </p>
+{% if rejection_reason %}
+    <p>
+        <strong>Reason given by the reviewer:</strong><br>
+        {{ rejection_reason|linebreaksbr }}
+    </p>
+{% endif %}
 
     <p>
         <strong style="color: #d9534f;">ACTION REQUIRED:</strong> Please assign a new reviewer to maintain the minimum required number of reviews for this proposal.

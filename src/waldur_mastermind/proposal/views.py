@@ -4824,14 +4824,18 @@ class ReviewViewSet(ActionsViewSet):
         raise exceptions.PermissionDenied()
 
     @extend_schema(
-        description="Reject a review, changing its state to REJECTED.",
-        request=None,
+        description="Reject a review, changing its state to REJECTED. The "
+        "reviewer may say why; the reason is sent to the call's managers.",
+        request=serializers.ReviewRejectSerializer,
         responses={status.HTTP_200_OK: None},
     )
     @decorators.action(detail=True, methods=["post"])
     def reject(self, request, uuid=None):
         review: models.Review = self.get_object()
+        serializer = serializers.ReviewRejectSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         review.state = models.Review.States.REJECTED
+        review.rejection_reason = serializer.validated_data.get("reason", "")
         review.save()
         tasks.notify_call_managers_about_rejected_review.delay(review.uuid)
         return response.Response(

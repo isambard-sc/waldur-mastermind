@@ -1961,6 +1961,10 @@ class Review(
     summary_score = models.PositiveSmallIntegerField(blank=True, default=0)
     summary_public_comment = models.TextField(blank=True)
     summary_private_comment = models.TextField(blank=True)
+    rejection_reason = models.TextField(
+        blank=True,
+        help_text="Why the reviewer declined the review, for the call's managers.",
+    )
     comment_project_title = models.CharField(max_length=255, null=True, blank=True)
     comment_project_summary = models.CharField(max_length=255, null=True, blank=True)
     comment_project_description = models.CharField(
