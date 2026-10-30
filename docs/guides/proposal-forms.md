@@ -79,8 +79,12 @@ configure the connection and the flows. Answers already given stay readable.
    then makes each survey ready, changing only:
    - single-use links: on, unencrypted;
    - the `proposal_uuid` hidden field (other hidden fields are kept);
-   - every ending: a redirect back to the proposal, keeping its id;
-   - "anonymize responses", on Formbricks versions that have it (after 4.9).
+   - every ending: a redirect back to the proposal, keeping its id.
+
+   On Formbricks versions that have it, also turn on "Anonymize responses"
+   in the survey's settings by hand (Formbricks then keeps no page URL,
+   browser or country with each response). Sync leaves it alone: Formbricks
+   4.9 reports the setting but does not keep it.
 
    Formbricks merges an update into the survey, so nothing else is written.
    Only surveys that are a step of a flow are ever changed. Sync also stores
@@ -130,8 +134,9 @@ so HomePort can fetch on the applicant's return.
   Webhooks: the secret is base64-decoded, with or without `whsec_`; the
   timestamp must be within five minutes). With no secret set, every webhook
   is refused. Neither the secret nor the expected signature is logged.
-- No personal data goes in survey links. With anonymised responses on,
-  Formbricks keeps no page URL, browser or country either.
+- No personal data goes in survey links. With "Anonymize responses" on (by
+  hand, where Formbricks has it), Formbricks keeps no page URL, browser or
+  country either.
 - Waldur deletes in Formbricks only responses whose ids it recorded from its
   own links (superseded by an edit, or of a deleted draft), and never
   surveys. Every survey change is logged.

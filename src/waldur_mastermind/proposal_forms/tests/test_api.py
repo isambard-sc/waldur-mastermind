@@ -278,7 +278,12 @@ class FlowApiTest(FormsTestBase):
 
     def test_sync_writes_only_what_is_missing_and_stores_questions(self):
         surveys = {
-            "survey1": self.ready_survey("survey1", isAnonymizeResponsesEnabled=False),
+            "survey1": self.ready_survey(
+                "survey1",
+                hiddenFields={"enabled": True, "fieldIds": []},
+                # Never touched: Formbricks 4.9 reports it but does not keep it.
+                isAnonymizeResponsesEnabled=False,
+            ),
             "survey2": self.ready_survey("survey2"),
         }
 
@@ -293,7 +298,10 @@ class FlowApiTest(FormsTestBase):
         ):
             response = self.client.post(self.detail(self.flow) + "sync/")
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
-        upd.assert_called_once_with("survey1", {"isAnonymizeResponsesEnabled": True})
+        upd.assert_called_once_with(
+            "survey1",
+            {"hiddenFields": {"enabled": True, "fieldIds": ["proposal_uuid"]}},
+        )
         self.assertTrue(response.data["in_sync"])
         self.flow.refresh_from_db()
         self.assertEqual(

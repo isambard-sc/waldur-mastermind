@@ -62,8 +62,9 @@ class PlanTest(SimpleTestCase):
                 {"id": "e2", "type": "redirectToUrl", "url": URL, "label": "Go"},
             ],
         )
-        self.assertTrue(changes["isAnonymizeResponsesEnabled"])
-        self.assertEqual(len(planned["notes"]), 4)
+        # Not Sync's: Formbricks 4.9 reports it but does not keep it.
+        self.assertNotIn("isAnonymizeResponsesEnabled", changes)
+        self.assertEqual(len(planned["notes"]), 3)
         self.assertEqual(planned["problems"], [])
 
     def test_encrypted_single_use_turned_off_keeping_messages(self):
@@ -83,11 +84,6 @@ class PlanTest(SimpleTestCase):
         self.assertEqual(ending["type"], "redirectToUrl")
         self.assertEqual(ending["url"], URL)
         self.assertRegex(ending["id"], r"^c[a-z0-9]{23}$")
-
-    def test_formbricks_without_anonymising_is_not_asked_to(self):
-        survey = self.survey()
-        del survey["isAnonymizeResponsesEnabled"]
-        self.assertEqual(sync.plan(survey, URL)["changes"], {})
 
     def test_what_waldur_cannot_fix_is_reported(self):
         planned = sync.plan(self.survey(type="app", status="draft"), URL)

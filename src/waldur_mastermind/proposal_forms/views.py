@@ -157,8 +157,8 @@ class FormFlowViewSet(ActionsViewSet):
         request=None,
         responses=serializers.FormFlowCheckSerializer,
         description="Make each step's survey ready in Formbricks: single-use "
-        "links, the proposal_uuid hidden field, endings back to the proposal, "
-        "anonymised responses. Only those settings are written. Returns the "
+        "links, the proposal_uuid hidden field, endings back to the proposal. "
+        "Only those settings are written. Returns the "
         "check after the changes.",
     )
     @decorators.action(detail=True, methods=["post"])
