@@ -65,9 +65,10 @@ def is_available() -> bool:
     return is_feature_enabled(FEATURE) and connection().is_active
 
 
-# Hidden fields that are not answers: proposal_uuid, which Waldur sets as a
-# label for staff browsing Formbricks, and those an earlier version of this
-# integration set. Left out wherever answers are shown.
+# Hidden fields that are not answers: proposal_uuid, call_uuid and
+# round_uuid, which Waldur sets as labels for staff browsing Formbricks, and
+# those an earlier version of this integration set. Left out wherever
+# answers are shown.
 HIDDEN_FIELD_KEYS = frozenset(
     {
         "proposal_uuid",
@@ -108,8 +109,7 @@ def single_use_id(link_url) -> str:
 
 
 def with_params(link_url, params: dict) -> str:
-    """The link with more query parameters: the proposal_uuid hidden field
-    and, for an edit, the answers to prefill. The link's own (suId, and
+    """The link with more query parameters: the hidden fields and, for an edit, the answers to prefill. The link's own (suId, and
     suToken on newer Formbricks) are kept and win."""
     parts = urlsplit(link_url)
     own = {k: v[0] for k, v in parse_qs(parts.query).items()}

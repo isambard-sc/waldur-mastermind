@@ -15,9 +15,11 @@ Everything is configured through the API: there are no deployment settings.
 2. If the call has a **form flow**, the proposal page lists its forms. "Fill
    in" asks Waldur for a link: Waldur gets a **single-use link** from
    Formbricks and records its id against the proposal and form.
-3. The survey carries one hidden field, `proposal_uuid`, only as a label for
-   staff browsing Formbricks. It ends by sending the applicant back to the
-   proposal in HomePort.
+3. The survey carries three hidden fields, `proposal_uuid`, `call_uuid` and
+   `round_uuid`, only as labels for staff browsing or analysing responses in
+   Formbricks (an applicant can edit them in the link, so Waldur never reads
+   them back). It ends by sending the applicant back to the proposal in
+   HomePort.
 4. The response reaches Waldur by **webhook** and by **fetching** (when the
    applicant comes back, from a "Fetch responses" button, and every 15
    minutes for links still waiting). Either way it is matched to the
@@ -84,7 +86,8 @@ then report `form_flow: null` and are submitted with Waldur's form alone.
    survey, not published, unreachable by the key). `POST .../sync/` (staff)
    then makes each survey ready, changing only:
    - single-use links: on, unencrypted;
-   - the `proposal_uuid` hidden field (other hidden fields are kept);
+   - the `proposal_uuid`, `call_uuid` and `round_uuid` hidden fields (other
+     hidden fields are kept);
    - every ending: a redirect back to the proposal, keeping its id.
 
    On Formbricks versions that have it, also turn on "Anonymize responses"

@@ -4,8 +4,9 @@ For each survey a flow uses, Waldur needs:
 
 - single-use links on, unencrypted: Waldur mints one link per applicant and
   form, and recognises the response by the link's id;
-- the hidden field `proposal_uuid`, so staff browsing Formbricks can see
-  whose response is whose (Waldur itself trusts only the link);
+- the hidden fields `proposal_uuid`, `call_uuid` and `round_uuid`, so staff
+  browsing Formbricks can see whose response is whose, and filter by call
+  and round (Waldur itself trusts only the link);
 - every ending redirecting back to the proposal in Waldur.
 
 ("Anonymize responses", which stops Formbricks keeping the page URL, browser
@@ -30,6 +31,9 @@ from . import client
 logger = logging.getLogger(__name__)
 
 PROPOSAL_HIDDEN_FIELD = "proposal_uuid"
+# Set on every link Waldur issues. Labels only: an applicant can edit them in
+# the link, so Waldur never reads them back.
+HIDDEN_FIELDS = (PROPOSAL_HIDDEN_FIELD, "call_uuid", "round_uuid")
 RETURN_LABEL = "Back to your proposal"
 
 
@@ -82,11 +86,17 @@ def plan(survey: dict, ending_url: str) -> dict:
 
     hidden = survey.get("hiddenFields") or {}
     field_ids = list(hidden.get("fieldIds") or [])
-    if not hidden.get("enabled") or PROPOSAL_HIDDEN_FIELD not in field_ids:
-        if PROPOSAL_HIDDEN_FIELD not in field_ids:
-            field_ids.append(PROPOSAL_HIDDEN_FIELD)
-        changes["hiddenFields"] = {**hidden, "enabled": True, "fieldIds": field_ids}
-        notes.append(f"Add the hidden field {PROPOSAL_HIDDEN_FIELD}.")
+    missing_fields = [f for f in HIDDEN_FIELDS if f not in field_ids]
+    if not hidden.get("enabled") or missing_fields:
+        changes["hiddenFields"] = {
+            **hidden,
+            "enabled": True,
+            "fieldIds": field_ids + missing_fields,
+        }
+        if missing_fields:
+            notes.append(f"Add the hidden fields {', '.join(missing_fields)}.")
+        else:
+            notes.append("Turn on hidden fields.")
 
     endings = survey.get("endings") or []
     new_endings = []

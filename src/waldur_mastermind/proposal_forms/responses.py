@@ -74,6 +74,8 @@ def issue_link(proposal, step, user) -> models.FormLink:
                 logger.warning("Could not fetch Formbricks response to prefill: %s", e)
         params.update(client.prefill_from_answers(answers))
     params["proposal_uuid"] = proposal.uuid.hex
+    params["call_uuid"] = proposal.round.call.uuid.hex
+    params["round_uuid"] = proposal.round.uuid.hex
 
     try:
         minted = client.mint_single_use_link(step["survey_id"])

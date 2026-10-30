@@ -11,7 +11,10 @@ class PlanTest(SimpleTestCase):
             "type": "link",
             "status": "inProgress",
             "singleUse": {"enabled": True, "isEncrypted": False, "heading": "Used"},
-            "hiddenFields": {"enabled": True, "fieldIds": ["proposal_uuid"]},
+            "hiddenFields": {
+                "enabled": True,
+                "fieldIds": ["proposal_uuid", "call_uuid", "round_uuid"],
+            },
             "endings": [{"id": "e1", "type": "redirectToUrl", "url": URL}],
             "isAnonymizeResponsesEnabled": True,
         }
@@ -47,7 +50,10 @@ class PlanTest(SimpleTestCase):
         # Other hidden fields are kept.
         self.assertEqual(
             changes["hiddenFields"],
-            {"enabled": True, "fieldIds": ["other", "proposal_uuid"]},
+            {
+                "enabled": True,
+                "fieldIds": ["other", "proposal_uuid", "call_uuid", "round_uuid"],
+            },
         )
         # Ending ids are kept, so survey logic that jumps to them still works.
         self.assertEqual(
@@ -66,6 +72,24 @@ class PlanTest(SimpleTestCase):
         self.assertNotIn("isAnonymizeResponsesEnabled", changes)
         self.assertEqual(len(planned["notes"]), 3)
         self.assertEqual(planned["problems"], [])
+
+    def test_only_the_missing_hidden_fields_are_added(self):
+        planned = sync.plan(
+            self.survey(hiddenFields={"enabled": True, "fieldIds": ["proposal_uuid"]}),
+            URL,
+        )
+        self.assertEqual(
+            planned["changes"],
+            {
+                "hiddenFields": {
+                    "enabled": True,
+                    "fieldIds": ["proposal_uuid", "call_uuid", "round_uuid"],
+                }
+            },
+        )
+        self.assertEqual(
+            planned["notes"], ["Add the hidden fields call_uuid, round_uuid."]
+        )
 
     def test_encrypted_single_use_turned_off_keeping_messages(self):
         planned = sync.plan(

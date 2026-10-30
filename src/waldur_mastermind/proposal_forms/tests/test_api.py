@@ -223,7 +223,10 @@ class FlowApiTest(FormsTestBase):
             "type": "link",
             "status": "inProgress",
             "singleUse": {"enabled": True, "isEncrypted": False},
-            "hiddenFields": {"enabled": True, "fieldIds": ["proposal_uuid"]},
+            "hiddenFields": {
+                "enabled": True,
+                "fieldIds": ["proposal_uuid", "call_uuid", "round_uuid"],
+            },
             "endings": [{"id": "e1", "type": "redirectToUrl", "url": url}],
             "isAnonymizeResponsesEnabled": True,
             "blocks": [
@@ -280,7 +283,7 @@ class FlowApiTest(FormsTestBase):
         surveys = {
             "survey1": self.ready_survey(
                 "survey1",
-                hiddenFields={"enabled": True, "fieldIds": []},
+                hiddenFields={"enabled": True, "fieldIds": ["proposal_uuid"]},
                 # Never touched: Formbricks 4.9 reports it but does not keep it.
                 isAnonymizeResponsesEnabled=False,
             ),
@@ -300,7 +303,12 @@ class FlowApiTest(FormsTestBase):
         self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
         upd.assert_called_once_with(
             "survey1",
-            {"hiddenFields": {"enabled": True, "fieldIds": ["proposal_uuid"]}},
+            {
+                "hiddenFields": {
+                    "enabled": True,
+                    "fieldIds": ["proposal_uuid", "call_uuid", "round_uuid"],
+                }
+            },
         )
         self.assertTrue(response.data["in_sync"])
         self.flow.refresh_from_db()

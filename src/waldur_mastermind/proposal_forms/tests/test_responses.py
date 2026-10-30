@@ -85,8 +85,12 @@ class LinkTest(FormsResponseBase):
         params = parse_qs(urlsplit(response.data["survey_url"]).query)
         self.assertEqual(params["suId"], ["su-new"])
         self.assertEqual(params["proposal_uuid"], [self.proposal.uuid.hex])
+        self.assertEqual(params["call_uuid"], [self.proposal.round.call.uuid.hex])
+        self.assertEqual(params["round_uuid"], [self.proposal.round.uuid.hex])
         # No name, email or token in the link any more.
-        self.assertEqual(set(params), {"suId", "proposal_uuid"})
+        self.assertEqual(
+            set(params), {"suId", "proposal_uuid", "call_uuid", "round_uuid"}
+        )
         link = models.FormLink.objects.get(single_use_id="su-new")
         self.assertEqual(link.proposal, self.proposal)
         self.assertEqual(link.step_key, "project_details")

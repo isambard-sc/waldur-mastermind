@@ -157,9 +157,9 @@ class FormFlowViewSet(ActionsViewSet):
         request=None,
         responses=serializers.FormFlowCheckSerializer,
         description="Make each step's survey ready in Formbricks: single-use "
-        "links, the proposal_uuid hidden field, endings back to the proposal. "
-        "Only those settings are written. Returns the "
-        "check after the changes.",
+        "links, the proposal_uuid, call_uuid and round_uuid hidden fields, "
+        "endings back to the proposal. Only those settings are written. "
+        "Returns the check after the changes.",
     )
     @decorators.action(detail=True, methods=["post"])
     def sync(self, request, uuid=None):
