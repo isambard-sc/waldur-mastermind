@@ -1,11 +1,12 @@
 from unittest import mock
 
 import requests
+from constance.test.unittest import override_config as override_constance_config
 from rest_framework import test
 
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.ai_reporting.models import ReportingMessage, ReportingSession
-from waldur_mastermind.ai_reporting.tasks import ask_harness
+from waldur_mastermind.ai_reporting.tasks import _harness_overrides, ask_harness
 
 
 class AskHarnessTaskTest(test.APITestCase):
@@ -75,3 +76,79 @@ class AskHarnessTaskTest(test.APITestCase):
 
     def test_missing_message_does_not_raise(self):
         ask_harness(999999)  # just must not blow up the Celery worker
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    @override_constance_config(AI_REPORTING_REQUEST_TIMEOUT_SECONDS=42)
+    def test_request_timeout_is_constance_driven(self, mock_post):
+        mock_post.return_value = mock.Mock(
+            status_code=200, json=lambda: {"answer": "ok", "new_files": []}
+        )
+        mock_post.return_value.raise_for_status = mock.Mock()
+
+        ask_harness(self.message.pk)
+
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs["timeout"], 42)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    @override_constance_config(
+        AI_REPORTING_MODEL="custom-model", AI_REPORTING_NAME="Bristol Bot",
+        AI_REPORTING_CUSTOM_INSTRUCTIONS="Be terse.",
+        AI_REPORTING_MAX_TURNS=5, AI_REPORTING_HISTORY_LIMIT=10,
+    )
+    def test_configured_overrides_are_sent_in_the_request_body(self, mock_post):
+        mock_post.return_value = mock.Mock(
+            status_code=200, json=lambda: {"answer": "ok", "new_files": []}
+        )
+        mock_post.return_value.raise_for_status = mock.Mock()
+
+        ask_harness(self.message.pk)
+
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs["json"]["model"], "custom-model")
+        self.assertEqual(kwargs["json"]["name"], "Bristol Bot")
+        self.assertEqual(kwargs["json"]["custom_instructions"], "Be terse.")
+        self.assertEqual(kwargs["json"]["max_turns"], 5)
+        self.assertEqual(kwargs["json"]["history_limit"], 10)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_default_config_sends_only_the_name_override(self, mock_post):
+        """Model/custom_instructions/max_turns/history_limit all default to
+        "no override" (empty string / -1) and must be omitted. Name is the
+        one exception: its Constance default is a real, non-empty value
+        (deliberately kept identical to run_agent.DEFAULT_ASSISTANT_NAME, so
+        sending it is always a harmless no-op) - it's only actually omitted
+        once an admin clears it to "" to explicitly defer to the harness's
+        own default instead."""
+        mock_post.return_value = mock.Mock(
+            status_code=200, json=lambda: {"answer": "ok", "new_files": []}
+        )
+        mock_post.return_value.raise_for_status = mock.Mock()
+
+        ask_harness(self.message.pk)
+
+        _, kwargs = mock_post.call_args
+        self.assertEqual(
+            kwargs["json"],
+            {"prompt": self.message.prompt, "name": "Isambard Reporting Assistant"},
+        )
+
+
+class HarnessOverridesTest(test.APITestCase):
+    @override_constance_config(
+        AI_REPORTING_MODEL="", AI_REPORTING_NAME="",
+        AI_REPORTING_CUSTOM_INSTRUCTIONS="",
+        AI_REPORTING_MAX_TURNS=-1, AI_REPORTING_HISTORY_LIMIT=-1,
+    )
+    def test_empty_defaults_produce_no_overrides(self):
+        self.assertEqual(_harness_overrides(), {})
+
+    @override_constance_config(AI_REPORTING_MODEL="anthropic.claude-opus-5-5", AI_REPORTING_NAME="")
+    def test_model_override_included_when_set(self):
+        self.assertEqual(_harness_overrides(), {"model": "anthropic.claude-opus-5-5"})
+
+    @override_constance_config(AI_REPORTING_MAX_TURNS=0, AI_REPORTING_NAME="")
+    def test_max_turns_zero_is_a_real_override_not_treated_as_unset(self):
+        """0 is a valid (if extreme) turn limit - only -1 means 'no
+        override', so this must not be confused with the unset sentinel."""
+        self.assertEqual(_harness_overrides(), {"max_turns": 0})

@@ -1,10 +1,41 @@
 from unittest import mock
 
+from constance.test.unittest import override_config as override_constance_config
 from django.urls import reverse
 from rest_framework import status, test
 
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.ai_reporting.models import ReportingMessage, ReportingSession
+
+
+class FeatureEnabledSwitchTest(test.APITestCase):
+    """AI_REPORTING_ENABLED (ConstanceCheckExtensionMixin, same mechanism the
+    chat app's AI_ASSISTANT_ENABLED uses) must gate the whole viewset, not
+    just ask - list/retrieve included, matching chat's own MessageViewSet
+    convention of treating the feature as entirely unavailable when off."""
+
+    def setUp(self):
+        self.staff = structure_factories.UserFactory(is_staff=True)
+        self.client.force_authenticate(user=self.staff)
+        self.ask_url = reverse("ai-reporting-message-ask")
+        self.list_url = reverse("ai-reporting-message-list")
+
+    @override_constance_config(AI_REPORTING_ENABLED=False)
+    def test_ask_is_rejected_while_disabled(self):
+        response = self.client.post(self.ask_url, {"prompt": "How many projects?"})
+        self.assertEqual(response.status_code, status.HTTP_424_FAILED_DEPENDENCY)
+
+    @override_constance_config(AI_REPORTING_ENABLED=False)
+    def test_list_is_rejected_while_disabled(self):
+        response = self.client.get(self.list_url)
+        self.assertEqual(response.status_code, status.HTTP_424_FAILED_DEPENDENCY)
+
+    def test_ask_works_normally_once_enabled_again(self):
+        # Default is True - no override needed, just confirming the baseline
+        # the two tests above are deviating from.
+        with mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay"):
+            response = self.client.post(self.ask_url, {"prompt": "How many projects?"})
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
 
 
 class AskPermissionTest(test.APITestCase):
