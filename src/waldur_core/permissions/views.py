@@ -895,8 +895,17 @@ class UserRoleMixin:
         )
         serializer.is_valid(raise_exception=True)
 
-        target_user = serializer.validated_data["user"]
-        role = serializer.validated_data["role"]
+        perm = self.grant_validated_role(scope, serializer.validated_data)
+        return Response(
+            status=status.HTTP_201_CREATED,
+            data={"expiration_time": perm.expiration_time},
+        )
+
+    def grant_validated_role(self, scope, validated_data):
+        """Grant a role validated by UserRoleCreateSerializer, after the
+        site's email policy. For add_user and any action built on it."""
+        target_user = validated_data["user"]
+        role = validated_data["role"]
 
         if Feature.objects.filter(
             key="project.enforce_allowed_domains", value=True
@@ -909,18 +918,12 @@ class UserRoleMixin:
             check_managed_project_membership_control(scope, "membership")
             assert_email_allowed_for_project(scope, target_user.email)
 
-        expiration_time = serializer.validated_data.get("expiration_time")
-
-        perm = add_user(
+        return add_user(
             scope,
             target_user,
             role,
-            created_by=request.user,
-            expiration_time=expiration_time,
-        )
-        return Response(
-            status=status.HTTP_201_CREATED,
-            data={"expiration_time": perm.expiration_time},
+            created_by=self.request.user,
+            expiration_time=validated_data.get("expiration_time"),
         )
 
     @extend_schema(

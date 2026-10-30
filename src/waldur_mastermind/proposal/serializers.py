@@ -885,6 +885,37 @@ set_override(
 )
 
 
+class AddUserByEmailSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    first_name = serializers.CharField(
+        max_length=100,
+        required=False,
+        allow_blank=True,
+        help_text="Used only when the account is created.",
+    )
+    last_name = serializers.CharField(
+        max_length=100,
+        required=False,
+        allow_blank=True,
+        help_text="Used only when the account is created.",
+    )
+    role = serializers.CharField()
+    expiration_time = serializers.DateTimeField(
+        required=False, allow_null=True, input_formats=["%Y-%m-%d", "iso-8601"]
+    )
+
+    def validate_email(self, value):
+        return value.strip().lower()
+
+
+class AddUserByEmailResultSerializer(serializers.Serializer):
+    user_uuid = serializers.UUIDField()
+    created = serializers.BooleanField(
+        help_text="Whether the account was created by this request."
+    )
+    expiration_time = serializers.DateTimeField(allow_null=True)
+
+
 class ReturnToReviewerSerializer(serializers.Serializer):
     reason = serializers.CharField(
         max_length=2000,

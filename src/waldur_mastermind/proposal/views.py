@@ -38,7 +38,7 @@ from waldur_core.checklist.enums import ChecklistTypes
 from waldur_core.checklist.mixins import ReviewerChecklistMixin, UserChecklistMixin
 from waldur_core.core import validators as core_validators
 from waldur_core.core.exceptions import IncorrectStateException
-from waldur_core.core.models import User
+from waldur_core.core.models import User, is_feature_enabled
 from waldur_core.core.utils import SubqueryCount
 from waldur_core.core.views import (
     ActionMethodMixin,
@@ -51,11 +51,12 @@ from waldur_core.logging.enums import EventType
 from waldur_core.permissions import utils as permissions_utils
 from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.permissions.fixtures import CallRole, ProposalRole
+from waldur_core.permissions.serializers import UserRoleCreateSerializer
 from waldur_core.permissions.utils import (
     has_permission,
     permission_factory,
 )
-from waldur_core.permissions.views import UserRoleMixin
+from waldur_core.permissions.views import UserRoleMixin, validate_scope_not_soft_deleted
 from waldur_core.structure import filters as structure_filters
 from waldur_core.structure.managers import (
     filter_queryset_for_user,
@@ -4047,6 +4048,71 @@ class ProposalViewSet(
     complete_workflow_step_permissions = [
         proposal_permissions.can_act_on_active_workflow_step
     ]
+
+    @extend_schema(
+        request=serializers.AddUserByEmailSerializer,
+        responses={status.HTTP_201_CREATED: serializers.AddUserByEmailResultSerializer},
+        description="Add someone to the proposal's team by email, creating their "
+        "account (the email is its username) if there is none, so they need "
+        "not accept an invitation. Checked exactly as add_user is; a refused "
+        "grant creates no account. Only while the site allows user creation "
+        "(feature user.allow_user_creation).",
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def add_user_by_email(self, request, uuid=None):
+        if not is_feature_enabled("user.allow_user_creation"):
+            raise exceptions.PermissionDenied(
+                _("Adding team members by email is not enabled on this site.")
+            )
+        proposal = self.get_object()
+        validate_scope_not_soft_deleted(proposal)
+        input_serializer = serializers.AddUserByEmailSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        data = input_serializer.validated_data
+        email = data["email"]
+
+        with transaction.atomic():
+            user = (
+                User.objects.filter(email__iexact=email).order_by("date_joined").first()
+                or User.objects.filter(username__iexact=email).first()
+            )
+            created = user is None
+            if created:
+                user = User.objects.create_user(
+                    username=email,
+                    email=email,
+                    first_name=data.get("first_name", ""),
+                    last_name=data.get("last_name", ""),
+                    registration_method="proposal",
+                )
+                user.set_unusable_password()
+                user.save()
+            role_serializer = UserRoleCreateSerializer(
+                data={
+                    "user": user.uuid.hex,
+                    "role": data["role"],
+                    "expiration_time": data.get("expiration_time"),
+                },
+                context={"scope": proposal, "request": request, "view": self},
+            )
+            # Raised inside the transaction: a refused grant leaves no account.
+            role_serializer.is_valid(raise_exception=True)
+            perm = self.grant_validated_role(proposal, role_serializer.validated_data)
+
+        if created:
+            logger.info(
+                "Created user %s by email for the team of proposal %s.",
+                user.uuid.hex,
+                proposal.uuid.hex,
+            )
+        result = serializers.AddUserByEmailResultSerializer(
+            {
+                "user_uuid": user.uuid,
+                "created": created,
+                "expiration_time": perm.expiration_time,
+            }
+        )
+        return response.Response(result.data, status=status.HTTP_201_CREATED)
 
     @extend_schema(
         description=(
