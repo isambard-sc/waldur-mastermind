@@ -11,6 +11,7 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import MinValueValidator
 from django.db import models, transaction
 from django.db.models import Q
+from django.db.models.functions import Coalesce, Greatest
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext
@@ -1266,6 +1267,24 @@ def documents_missing_message(call) -> str:
     ) % {"count": required}
 
 
+def documents_missing_expression():
+    """How many supporting documents each proposal still lacks for its call's
+    minimum, for querysets that serialise ``can_submit`` for many proposals at
+    once; ``Proposal.documents_missing`` reads the annotation when present."""
+    attached = (
+        ProposalDocumentation.objects.filter(proposal=models.OuterRef("pk"))
+        .order_by()
+        .values("proposal")
+        .annotate(count=models.Count("pk"))
+        .values("count")
+    )
+    return Greatest(
+        models.F("round__call__minimum_number_of_documents")
+        - Coalesce(models.Subquery(attached), 0),
+        0,
+    )
+
+
 def has_proposal_manager_expression():
     """``Exists`` over a proposal's active proposal manager grants.
 
@@ -1586,6 +1605,9 @@ class Proposal(
 
     def documents_missing(self) -> int:
         """How many more supporting documents the call requires."""
+        annotated = getattr(self, "_documents_missing", None)
+        if annotated is not None:
+            return annotated
         required = self.round.call.minimum_number_of_documents
         if not required:
             return 0

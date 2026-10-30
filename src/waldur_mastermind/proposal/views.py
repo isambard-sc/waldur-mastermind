@@ -3373,6 +3373,7 @@ class ProposalViewSet(
                 _latest_step_status=Subquery(latest_step_status),
                 # Read by can_submit.
                 _has_proposal_manager=models.has_proposal_manager_expression(),
+                _documents_missing=models.documents_missing_expression(),
             )
             # ProposalSerializer.can_submit reads every requested resource, its
             # call entry and the offering's components. Prefetched here for the
