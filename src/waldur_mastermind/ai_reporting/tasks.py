@@ -2,6 +2,7 @@ import logging
 
 import requests
 from celery import shared_task
+from constance import config
 from django.conf import settings
 from django.core.files.base import ContentFile
 
@@ -9,15 +10,32 @@ from waldur_mastermind.ai_reporting.models import ReportingFile, ReportingMessag
 
 logger = logging.getLogger(__name__)
 
-# Generous but bounded - run_agent.run() can take minutes across many tool-use
-# turns (see harness_manual_loop/run_agent.py's MAX_TURNS), but a hung harness
-# call must not tie up a Celery worker slot forever.
-_HARNESS_REQUEST_TIMEOUT_SECONDS = 600
-
 # A single file fetch is just a read of bytes the harness already produced -
 # nowhere near as slow as a /query turn, but still bounded so one bad
-# download can't hold up the task indefinitely.
+# download can't hold up the task indefinitely. Not Constance-driven like the
+# /query timeout below - it's a much smaller, less variable operation with no
+# admin-facing reason to tune it separately.
 _HARNESS_FILE_TIMEOUT_SECONDS = 60
+
+
+def _harness_overrides() -> dict:
+    """The admin-configurable AI_REPORTING_* Constance overrides, as the
+    optional fields http_service.py's /query accepts - only included when
+    set away from their "no override" default (empty string / -1), so an
+    admin who hasn't touched a setting gets exactly today's harness
+    behavior, not a value that happens to match its own hardcoded default."""
+    overrides = {}
+    if config.AI_REPORTING_MODEL:
+        overrides["model"] = config.AI_REPORTING_MODEL
+    if config.AI_REPORTING_NAME:
+        overrides["name"] = config.AI_REPORTING_NAME
+    if config.AI_REPORTING_CUSTOM_INSTRUCTIONS:
+        overrides["custom_instructions"] = config.AI_REPORTING_CUSTOM_INSTRUCTIONS
+    if config.AI_REPORTING_MAX_TURNS != -1:
+        overrides["max_turns"] = config.AI_REPORTING_MAX_TURNS
+    if config.AI_REPORTING_HISTORY_LIMIT != -1:
+        overrides["history_limit"] = config.AI_REPORTING_HISTORY_LIMIT
+    return overrides
 
 
 def _copy_files_from_harness(message: ReportingMessage, user, filenames: list[str]) -> None:
@@ -82,8 +100,8 @@ def ask_harness(message_id: int):
                 "X-Waldur-User-Id": str(user.uuid),
                 "X-Waldur-Session-Id": str(message.session.uuid),
             },
-            json={"prompt": message.prompt},
-            timeout=_HARNESS_REQUEST_TIMEOUT_SECONDS,
+            json={"prompt": message.prompt, **_harness_overrides()},
+            timeout=config.AI_REPORTING_REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         payload = response.json()

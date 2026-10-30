@@ -5,19 +5,28 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from waldur_core.core import permissions as core_permissions
-from waldur_core.core.views import ActionsViewSet
+from waldur_core.core.views import ActionsViewSet, ConstanceCheckExtensionMixin
 from waldur_core.structure import permissions as structure_permissions
 from waldur_mastermind.ai_reporting import serializers, tasks
 from waldur_mastermind.ai_reporting.models import ReportingMessage, ReportingSession
 
 
-class ReportingMessageViewSet(ActionsViewSet):
+class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
     """Ask the AI reporting harness a question and poll for its answer.
 
     Messages are created only via `ask` - direct create/update/destroy are
     disabled so a client can never fabricate a message's status/answer or
     bypass the harness call entirely.
+
+    ConstanceCheckExtensionMixin (same mechanism the chat app's
+    LLMConfigurationMixin uses for AI_ASSISTANT_ENABLED) raises a 424 for
+    every action - list and retrieve included, not just ask - while
+    AI_REPORTING_ENABLED is off, matching that app's own convention of
+    treating the whole feature as unavailable, not just the ability to ask
+    something new.
     """
+
+    extension_name = "AI_REPORTING"
 
     queryset = ReportingMessage.objects.all().select_related("session__user")
     serializer_class = serializers.ReportingMessageSerializer
