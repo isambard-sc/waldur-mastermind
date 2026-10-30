@@ -32,6 +32,16 @@ class ProposalExtension(WaldurExtension):
                 "schedule": timedelta(hours=1),
                 "args": (),
             },
+            "send-stale-proposal-reminders": {
+                "task": "waldur_mastermind.proposal.send_stale_proposal_reminders",
+                "schedule": timedelta(hours=6),
+                "args": (),
+            },
+            "delete-stale-proposals": {
+                "task": "waldur_mastermind.proposal.delete_stale_proposals",
+                "schedule": timedelta(hours=6),
+                "args": (),
+            },
             "expired-reviews-should-be-cancelled": {
                 "task": "waldur_mastermind.proposal.expired_reviews_should_be_cancelled",
                 "schedule": timedelta(hours=1),

@@ -2070,6 +2070,7 @@ class ProtectedCallSerializer(PublicCallSerializer):
             "order_author_user_uuid",
             "order_author_user_name",
             "carry_over_drafts",
+            "cancel_drafts_at_cutoff",
             "undecided_at_round_completion",
         )
         view_name = "proposal-protected-call-detail"
@@ -2668,6 +2669,60 @@ class ProposalCanSubmitResponseSerializer(serializers.Serializer):
     error = serializers.CharField(allow_null=True)
 
 
+class ProposalReturnSerializer(serializers.ModelSerializer):
+    """A time the proposal was returned to its applicant."""
+
+    returned_by_name = serializers.ReadOnlyField(source="returned_by.full_name")
+    is_open = serializers.BooleanField(
+        read_only=True,
+        help_text="Waiting for the applicant to resubmit.",
+    )
+    workflow_history = serializers.SerializerMethodField(
+        help_text="The workflow steps as they stood when it was returned, "
+        "including internal notes: only for those who may read internal notes."
+    )
+
+    class Meta:
+        model = models.ProposalReturn
+        fields = (
+            "uuid",
+            "created",
+            "returned_by_name",
+            "reason",
+            "resubmit_by",
+            "previous_state",
+            "resubmitted_at",
+            "is_open",
+            "workflow_history",
+        )
+        read_only_fields = fields
+
+    def get_workflow_history(self, returned) -> list[dict] | None:
+        if not self.context.get("include_history"):
+            return None
+        return returned.workflow_history
+
+
+class ReturnToApplicantSerializer(serializers.Serializer):
+    reason = serializers.CharField(
+        help_text="Why the proposal is returned: sent to the applicant."
+    )
+    resubmit_by = serializers.DateTimeField(
+        help_text="Until when the applicant may resubmit, whatever the round's cut-off."
+    )
+
+
+class ExtendReturnSerializer(serializers.Serializer):
+    resubmit_by = serializers.DateTimeField()
+
+
+class OpenReturnSerializer(serializers.Serializer):
+    uuid = serializers.UUIDField()
+    created = serializers.DateTimeField()
+    reason = serializers.CharField()
+    resubmit_by = serializers.DateTimeField()
+
+
 class ProposalSerializer(
     core_serializers.AugmentedSerializerMixin,
     serializers.HyperlinkedModelSerializer,
@@ -2775,6 +2830,10 @@ class ProposalSerializer(
     can_submit = serializers.SerializerMethodField()
     awaiting_manual_advance = serializers.SerializerMethodField()
     decision_held = serializers.SerializerMethodField()
+    open_return = serializers.SerializerMethodField(
+        help_text="Set while the proposal is back with its applicant after a "
+        "call manager returned it: why, and the deadline to resubmit."
+    )
 
     class Meta:
         model = models.Proposal
@@ -2838,6 +2897,7 @@ class ProposalSerializer(
             "can_submit",
             "awaiting_manual_advance",
             "decision_held",
+            "open_return",
             "workflow_step",
         ]
         read_only_fields = (
@@ -2983,6 +3043,13 @@ class ProposalSerializer(
                 and obj._latest_step_status == WorkflowStepInstanceStatuses.COMPLETED
             )
         return workflow_service.is_awaiting_manual_advance(obj)
+
+    @extend_schema_field(OpenReturnSerializer(allow_null=True))
+    def get_open_return(self, obj):
+        returned = models.get_open_return(obj)
+        if returned is None:
+            return None
+        return OpenReturnSerializer(returned).data
 
     @extend_schema_field(serializers.BooleanField(allow_null=True))
     def get_decision_held(self, obj) -> bool | None:

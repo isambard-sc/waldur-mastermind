@@ -56,6 +56,21 @@ def oversees_proposal_call(request_or_user, proposal) -> bool:
     )
 
 
+def can_decide_proposal(request, view, obj=None):
+    """Return a proposal to its applicant: those who may approve and reject
+    proposals in its call (CALL.APPROVE_AND_REJECT_PROPOSALS on the call or
+    its managing organisation), and staff."""
+    if obj is None:
+        return
+    if not has_permission_on_any_source(
+        request,
+        PermissionEnum.APPROVE_AND_REJECT_PROPOSALS,
+        obj.round.call,
+        CALL_PERMISSION_SOURCES,
+    ):
+        raise exceptions.PermissionDenied()
+
+
 def _holds_on_proposal(request, permission, proposal) -> bool:
     user = request.user
     return (

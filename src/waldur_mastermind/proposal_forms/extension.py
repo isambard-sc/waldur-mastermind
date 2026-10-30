@@ -29,6 +29,23 @@ class ProposalFormsExtension(WaldurExtension):
         return urlpatterns
 
     @staticmethod
+    def celery_tasks():
+        from datetime import timedelta
+
+        return {
+            "waldur-proposal-forms-fetch-open-form-responses": {
+                "task": "waldur_mastermind.proposal_forms.fetch_open_form_responses",
+                "schedule": timedelta(minutes=15),
+                "args": (),
+            },
+            "waldur-proposal-forms-process-formbricks-deletions": {
+                "task": "waldur_mastermind.proposal_forms.process_formbricks_deletions",
+                "schedule": timedelta(minutes=30),
+                "args": (),
+            },
+        }
+
+    @staticmethod
     def rest_urls():
         from .urls import register_in
 

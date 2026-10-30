@@ -1,16 +1,41 @@
 # Proposal application forms (Formbricks)
 
-Fork-only. The `waldur_mastermind.proposal_forms` app lets a call take its
-applications through a chain of [Formbricks](https://formbricks.com) surveys,
-a **flow**, instead of Waldur's own proposal form. Answers come back by
-webhook and are kept per step; a step can also copy answers onto the proposal
-(its name, summary) and request resources from the call's offerings.
+Fork-only. The `waldur_mastermind.proposal_forms` app adds extra application
+forms to a call, kept in [Formbricks](https://formbricks.com): compliance,
+team details, technical assessment questions and the like. Everything Waldur
+itself reads (applicant, title, summary, resources, duration) stays in
+Waldur's own proposal form; the Formbricks forms are stored and shown, never
+copied onto the proposal.
 
 Everything is configured through the API: there are no deployment settings.
 
+## How it works
+
+1. The applicant creates a proposal with Waldur's normal form.
+2. If the call has a **form flow**, the proposal page lists its forms. "Fill
+   in" asks Waldur for a link: Waldur gets a **single-use link** from
+   Formbricks and records its id against the proposal and form.
+3. The survey carries three hidden fields, `proposal_uuid`, `call_uuid` and
+   `round_uuid`, only as labels for staff browsing or analysing responses in
+   Formbricks (an applicant can edit them in the link, so Waldur never reads
+   them back). It ends by sending the applicant back to the proposal in
+   HomePort.
+4. The response reaches Waldur by **webhook** and by **fetching** (when the
+   applicant comes back, from a "Fetch responses" button, and every 15
+   minutes for links still waiting). Either way it is matched to the
+   proposal and form **only by its single-use link id**.
+5. Reopening a link resumes a form left half-done. Editing an answered form
+   gets a new link, prefilled; once the new response is in Waldur, the old
+   one is deleted in Formbricks (one copy of the answers there, one here).
+6. A proposal cannot be submitted until every form is answered. After
+   submission no links are issued and applicants see their answers
+   read-only. A correction made in Formbricks by staff still reaches Waldur
+   (Formbricks is the source of truth).
+7. Deleting a draft proposal deletes its responses in Formbricks.
+
 ## Switching it on
 
-Two switches, both needed before any call can take applications this way:
+Two switches, both needed:
 
 - the feature **`proposal.formbricks_forms`** (staff, in the features admin):
   HomePort shows the Formbricks settings, the flows and each call's flow
@@ -18,16 +43,16 @@ Two switches, both needed before any call can take applications this way:
 - the connection's **`enabled`**, which staff can only set once the
   connection is configured.
 
-While either is off, calls report `form_flow: null` (so applicants get
-Waldur's own form), a flow cannot be chosen for a call, starting or editing an
-application is refused, the survey-ending redirect returns the applicant to
-the proposal, and the webhook acknowledges (200) and ignores what it is sent,
-so Formbricks neither retries nor fails its endpoint test. Staff
-can still configure the connection and the flows, so a site can be set up
-before it is switched on. Answers already given stay readable.
+While either is off, no links are issued, a flow cannot be chosen for a
+call, and the webhook acknowledges (200) and ignores what it is sent. Staff
+can still configure the connection and the flows. Answers already given stay
+readable.
 
-Each call then opts in by choosing a flow; without one it keeps Waldur's own
-form.
+The two switches differ in one way. With the connection disabled (or
+Formbricks unreachable), a call with a flow still shows it and still refuses
+submission until every form is answered: applicants wait rather than submit
+without their forms. Only switching the feature off releases the rule: calls
+then report `form_flow: null` and are submitted with Waldur's form alone.
 
 ## Setting up
 
@@ -35,95 +60,92 @@ form.
 
     | Field | Meaning |
     |-------|---------|
-    | `base_url` | Formbricks as applicants' browsers reach it; survey links are built from it |
+    | `base_url` | Formbricks as applicants' browsers reach it |
     | `management_api_url` | Formbricks as this server reaches it, if different (e.g. `http://formbricks:3000`) |
-    | `api_key` | Management API key with read access to the flows' surveys and responses |
+    | `api_key` | A **write**-scoped Management API key for the project and environment holding the surveys |
     | `webhook_secret` | The signing secret Formbricks shows for the webhook (`whsec_...`) |
     | `enabled` | Refused until the URL, key and secret are all set |
 
     The key and secret are write-only, encrypted at rest, and reported only as
-    `api_key_set` / `webhook_secret_set`. Leave one out to keep it; send `""` to
-    clear it. `POST /api/formbricks-connection/test/` checks the key works.
+    `api_key_set` / `webhook_secret_set`. `POST /api/formbricks-connection/test/`
+    checks the key and says how many surveys it can see.
 
-2. **Add the webhook in Formbricks** for the environment holding the surveys:
-   the URL is `webhook_url` from the connection, with the trigger
-   "Response finished". Copy its signing secret into `webhook_secret`.
-   Formbricks' "Test endpoint" button posts `{"event": "testEndpoint"}`,
-   signed with a secret it only shows after saving, so Waldur acknowledges
-   that test without checking it. The URL must be one Formbricks' server can
-   reach: from inside a Formbricks container, `localhost` is Formbricks
-   itself (a POST there answers 405).
+2. **Add the webhook in Formbricks** in the same environment as the surveys:
+   the URL is `webhook_url` from the connection, triggers "Response
+   finished" and "Response updated", all surveys. Copy its signing secret
+   into `webhook_secret`. Its "Test endpoint" button is always answered 200.
 
-3. **Create the flows.** Through `POST /api/form-flows/`, or from YAML with
+3. **Create a flow**: `POST /api/form-flows/`, choosing surveys from
+   `GET /api/formbricks-surveys/`; or from YAML with
    `waldur import_form_flows <file> [--dry-run]` (`export_form_flows` writes
-   the same format). `proposal_forms/examples/airr_form_flows.yaml` has the
-   AIRR flows, with the development instance's survey ids.
+   the same format; `proposal_forms/examples/airr_form_flows.yaml` has the
+   AIRR flows).
 
-4. **Check each flow** with `POST /api/form-flows/<uuid>/check/`. It reports,
-   per step, whether the survey exists, declares the hidden fields, and has
-   every question the step maps, and gives the `ending_url` to set as the
-   survey's ending ("Redirect to URL").
+4. **Check, then sync it.** `GET /api/form-flows/<uuid>/check/` reports, per
+   survey, what Waldur would change and anything it cannot fix (not a link
+   survey, not published, unreachable by the key). `POST .../sync/` (staff)
+   then makes each survey ready, changing only:
+   - single-use links: on, unencrypted;
+   - the `proposal_uuid`, `call_uuid` and `round_uuid` hidden fields (other
+     hidden fields are kept);
+   - every ending: a redirect back to the proposal, keeping its id.
 
-5. **Switch on** the `proposal.formbricks_forms` feature and the
-   connection's `enabled`.
+   On Formbricks versions that have it, also turn on "Anonymize responses"
+   in the survey's settings by hand (Formbricks then keeps no page URL,
+   browser or country with each response). Sync leaves it alone: Formbricks
+   4.9 reports the setting but does not keep it.
 
-6. **Choose a call's flow:** `PUT /api/proposal-form-calls/<call_uuid>/` with
-   `{"flow": "<flow uuid>"}` (or `null` for Waldur's own form). Anyone who may
-   update the call may do this until the call has proposals. The flow's
-   resource choices must name offerings the call requests.
+   Formbricks merges an update into the survey, so nothing else is written.
+   Only surveys that are a step of a flow are ever changed. Sync also stores
+   each survey's questions on the flow.
 
-### What each survey needs
+5. **Switch on** the feature and the connection's `enabled`.
 
-- **Hidden fields** `proposal_uuid` and `redirect_token` (and optionally
-  `call_uuid`, `round_uuid`, `lead_name`, `lead_email`, which help find
-  responses inside Formbricks).
-- **Ending**: "Redirect to URL" set to the step's `ending_url` from the flow
-  check, which takes the applicant on to the next unanswered step and finally
-  back to the proposal in HomePort.
+6. **Choose a call's flow:** `PUT /api/proposal-form-calls/<call_uuid>/`
+   with `{"flow": "<flow uuid>"}` (or `null`), by anyone who may update the
+   call, until the call has proposals.
 
 ## Flow steps
 
 ```yaml
-- key: project_details          # stable id; answers are filed under it
-  label: Project details        # shown to applicants and reviewers
-  survey_id: cmt4q1c400004qe01zta9vmnm
-  reviewer_visible: true        # reviewers may read this step's answers
-  field_map:                    # question id -> name | description | project_summary
-    fjxcnvv5q1ny48q2wazmq2eb: name
-  resources:                    # at most one step per flow
-    question_id: peoi4op1vjaws6c2dvigbahe
-    options:
-      - label: Isambard-AI      # the choice's text in Formbricks, exactly
-        offering_slug: isambard-a-1
-        attribute_map: {u3bpmiiaumhqqhjk9yrdet6u: allocation}
+- key: compliance          # stable id; answers are filed under it
+  label: Compliance        # shown to applicants and reviewers
+  survey_id: ope97ipn9deow44v0icbkgtl
+  reviewer_visible: false  # may reviewers read these answers?
 ```
 
-Unknown keys are refused, so a misspelling cannot be silently ignored. A step
-that applicants have answered cannot be removed or renamed; its survey id can
-change.
+Unknown keys are refused. A step that applicants have answered cannot be
+removed or renamed; its survey id can change.
 
 ## Applying
 
 | Call | Who | What |
 |------|-----|------|
-| `POST /api/proposal-forms/start/` `{round_uuid}` | anyone eligible for the call | Creates a draft proposal with the caller as manager; returns the first survey link |
-| `GET /api/proposal-forms/<proposal_uuid>/` | anyone who can see the proposal | Steps done, the next survey link (for the team, while a draft), and the answers |
-| `GET /api/proposal-forms/<proposal_uuid>/edit-link/?step=` | the team, while a draft | A survey link prefilled with the current answers |
+| `GET /api/proposal-forms/<proposal_uuid>/` | anyone who can see the proposal | Each form's state (`completed`, `submitted_at`, `in_progress`), `missing`, `can_fill_in`, and the answers |
+| `POST /api/proposal-forms/<proposal_uuid>/link/` `{step}` | the team, while a draft | A single-use link to fill in, resume or edit the form |
+| `POST /api/proposal-forms/<proposal_uuid>/fetch/` | anyone who can see the proposal | Bring the answers up to date from Formbricks |
 
-Reviewers see only `reviewer_visible` steps; the proposal's team, those
-overseeing the call, staff and support see them all. The proposal is then
-submitted as any other.
+Reviewers see only `reviewer_visible` forms; the team, those overseeing the
+call, staff and support see them all. Submission is refused with
+`{"forms": [...]}` naming the forms still to answer.
+
+Survey endings point at `/api/proposal-form-return/?survey=...&proposal_uuid=...`,
+which redirects to `<HomePort>/proposals/<uuid>/?form_survey=<survey id>`,
+so HomePort can fetch on the applicant's return.
 
 ## Security
 
+- A response is trusted only through its single-use link id, issued by
+  Waldur for one proposal and form and recorded: hidden fields, which anyone
+  can type into a survey link, are never trusted. Each link takes one
+  response.
 - The webhook is refused unless signed with the configured secret (Standard
   Webhooks: the secret is base64-decoded, with or without `whsec_`; the
-  timestamp must be within five minutes). With no secret set, every webhook is
-  refused.
-- A signature only proves the request came through Formbricks, where anyone
-  can fill in a survey. So the answers must also carry a `redirect_token`
-  issued by Waldur for that proposal to someone still on its team, and the
-  proposal must still be a draft. The token is not stored with the answers.
-- The redirect endpoint authenticates only by that token, and the token
-  authenticates nothing else.
-- Neither the secret nor the signature expected is ever logged.
+  timestamp must be within five minutes). With no secret set, every webhook
+  is refused. Neither the secret nor the expected signature is logged.
+- No personal data goes in survey links. With "Anonymize responses" on (by
+  hand, where Formbricks has it), Formbricks keeps no page URL, browser or
+  country either.
+- Waldur deletes in Formbricks only responses whose ids it recorded from its
+  own links (superseded by an edit, or of a deleted draft), and never
+  surveys. Every survey change is logged.

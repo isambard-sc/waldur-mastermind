@@ -3,9 +3,10 @@ from django.urls import reverse
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
+from waldur_core.core.models import is_feature_enabled
 from waldur_mastermind.proposal import models as proposal_models
 
-from . import client, flows, mapper, models
+from . import client, flows, models
 
 # --- connection -------------------------------------------------------------
 
@@ -97,42 +98,13 @@ class FormbricksConnectionTestSerializer(serializers.Serializer):
 # --- flows --------------------------------------------------------------------
 
 
-class FormFlowResourceOptionSerializer(serializers.Serializer):
-    label = serializers.CharField(
-        help_text="The choice's text in the Formbricks question, exactly."
-    )
-    offering_slug = serializers.CharField(
-        help_text="Slug of the offering the call requests for this choice."
-    )
-    attribute_map = serializers.DictField(
-        child=serializers.CharField(),
-        required=False,
-        help_text="Question id -> requested resource attribute, e.g. "
-        "{'u3bp...': 'allocation'}.",
-    )
-    default_attributes = serializers.DictField(required=False)
-
-
-class FormFlowResourcesSerializer(serializers.Serializer):
-    question_id = serializers.CharField(
-        help_text="The multiple-choice question naming the resources wanted."
-    )
-    options = FormFlowResourceOptionSerializer(many=True)
-
-
 class FormFlowStepSerializer(serializers.Serializer):
-    key = serializers.SlugField(help_text="Stable id of the step, e.g. 'team'.")
+    key = serializers.SlugField(help_text="Stable id of the step, e.g. 'compliance'.")
     label = serializers.CharField(help_text="What applicants and reviewers see.")
     survey_id = serializers.CharField(help_text="The Formbricks survey id.")
     reviewer_visible = serializers.BooleanField(
         required=False, help_text="Whether reviewers may read this step's answers."
     )
-    field_map = serializers.DictField(
-        child=serializers.ChoiceField(choices=flows.MAPPABLE_PROPOSAL_FIELDS),
-        required=False,
-        help_text="Question id -> proposal field the answer is copied onto.",
-    )
-    resources = FormFlowResourcesSerializer(required=False, allow_null=True)
 
 
 @extend_schema_field(FormFlowStepSerializer(many=True))
@@ -140,13 +112,6 @@ class FormFlowStepsField(serializers.JSONField):
     """The steps as JSON, checked by flows.validate_steps rather than by
     nested serializers, so one set of rules serves the API, the import
     command and the webhook. Typed in the schema all the same."""
-
-
-def _flow_problems_for_linked_calls(flow, steps):
-    problems = []
-    for link in flow.call_links.select_related("call"):
-        problems.extend(mapper.call_offering_problems(link.call, steps))
-    return problems
 
 
 class FormFlowSerializer(serializers.HyperlinkedModelSerializer):
@@ -203,9 +168,6 @@ class FormFlowSerializer(serializers.HyperlinkedModelSerializer):
                     "renamed."
                 }
             )
-        problems = _flow_problems_for_linked_calls(flow, steps)
-        if problems:
-            raise serializers.ValidationError({"steps": problems})
         return attrs
 
 
@@ -295,10 +257,6 @@ class CallFormFlowSerializer(serializers.Serializer):
                     "call cannot use a form flow."
                 }
             )
-        if flow is not None:
-            problems = mapper.call_offering_problems(call, flow.steps)
-            if problems:
-                raise serializers.ValidationError({"flow": problems})
         return attrs
 
     def update(self, call, validated_data):
@@ -328,18 +286,17 @@ def get_call_form_flow(call):
 # --- applying -----------------------------------------------------------------
 
 
-class ProposalFormStartSerializer(serializers.Serializer):
-    round_uuid = serializers.UUIDField()
+class ProposalFormLinkRequestSerializer(serializers.Serializer):
+    step = serializers.CharField(help_text="Key of the form to open.")
 
 
-class ProposalFormSurveyLinkSerializer(serializers.Serializer):
+class ProposalFormLinkSerializer(serializers.Serializer):
     step_key = serializers.CharField()
     step_label = serializers.CharField()
-    survey_url = serializers.URLField()
-
-
-class ProposalFormStartResponseSerializer(ProposalFormSurveyLinkSerializer):
-    proposal_uuid = serializers.UUIDField()
+    survey_url = serializers.URLField(
+        help_text="A single-use link to the form. Reopening it resumes a form "
+        "left half-done; for an answered form it is prefilled to edit."
+    )
 
 
 class ProposalFormStepStatusSerializer(serializers.Serializer):
@@ -347,6 +304,10 @@ class ProposalFormStepStatusSerializer(serializers.Serializer):
     label = serializers.CharField()
     completed = serializers.BooleanField()
     submitted_at = serializers.DateTimeField(allow_null=True)
+    in_progress = serializers.BooleanField(
+        help_text="A link to it was opened and its response has not arrived "
+        "(still being filled in, or the webhook was missed: fetch)."
+    )
 
 
 class FormResponseQuestionSerializer(serializers.Serializer):
@@ -366,23 +327,32 @@ class FormStepResponseSerializer(serializers.Serializer):
 
 
 class ProposalFormSerializer(serializers.Serializer):
-    """A proposal's progress through its call's flow, and the answers the
-    viewer may read."""
+    """A proposal's forms: which are answered, and the answers the viewer
+    may read."""
 
     proposal_uuid = serializers.UUIDField()
     flow_key = serializers.CharField()
     flow_name = serializers.CharField()
+    available = serializers.BooleanField(
+        help_text="Whether Formbricks forms are on for this site now."
+    )
     can_fill_in = serializers.BooleanField(
-        help_text="Whether the viewer may fill in or edit steps now: a member "
-        "of the proposal's team, while it is a draft."
+        help_text="Whether the viewer may open and edit the forms now: a member "
+        "of the proposal's team, while it is a draft (including returned to "
+        "the applicant), with forms available."
     )
     steps = ProposalFormStepStatusSerializer(many=True)
-    next_step = ProposalFormSurveyLinkSerializer(
-        allow_null=True,
-        help_text="The first step not yet answered, with a fresh survey link; "
-        "null once all are answered or if the viewer cannot fill in.",
+    missing = serializers.ListField(
+        child=serializers.CharField(),
+        help_text="Labels of the forms still to answer before submitting.",
     )
     responses = FormStepResponseSerializer(many=True)
+
+
+class ProposalFormFetchResultSerializer(ProposalFormSerializer):
+    fetched = serializers.IntegerField(
+        help_text="How many responses this fetch brought in or updated."
+    )
 
 
 # --- fields added to upstream's call serializers ------------------------------
@@ -396,12 +366,14 @@ class CallFormFlowSummarySerializer(serializers.Serializer):
 
 @extend_schema_field(CallFormFlowSummarySerializer(allow_null=True))
 def _get_form_flow(serializer, call):
-    # Null while Formbricks forms are off, so the frontend offers Waldur's own
-    # form. Checked once per response, not once per call in a list.
+    # Null while the site has Formbricks forms switched off. Not while
+    # Formbricks is merely unreachable or the connection paused: the call
+    # still needs its forms answered before submission. Checked once per
+    # response, not once per call in a list.
     context = serializer.context
-    if "formbricks_available" not in context:
-        context["formbricks_available"] = client.is_available()
-    if not context["formbricks_available"]:
+    if "formbricks_forms_on" not in context:
+        context["formbricks_forms_on"] = is_feature_enabled(client.FEATURE)
+    if not context["formbricks_forms_on"]:
         return None
     flow = get_call_form_flow(call)
     if flow is None:

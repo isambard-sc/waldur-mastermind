@@ -4,6 +4,7 @@ import logging
 
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
+from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 
 from waldur_core.checklist import models as checklist_models
@@ -381,3 +382,15 @@ def seed_proposal_field_config(sender, instance, created, **kwargs):
     models.CallProposalFieldConfig.objects.get_or_create(
         call=instance, defaults=columns
     )
+
+
+def touch_draft_on_related_change(sender, instance, **kwargs):
+    """Editing a draft's requested resources or documents is editing the
+    draft: it counts as a change for the stale-draft clean-up. An update, so
+    no other save logic runs."""
+    proposal_id = getattr(instance, "proposal_id", None)
+    if proposal_id is None:
+        return
+    models.Proposal.objects.filter(
+        pk=proposal_id, state=enums.ProposalStates.DRAFT
+    ).update(modified=timezone.now())

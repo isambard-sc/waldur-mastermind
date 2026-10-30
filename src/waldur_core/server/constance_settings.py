@@ -958,6 +958,17 @@ CONSTANCE_CONFIG = {
         "How many days ahead the call manager dashboard looks for review "
         "deadlines. Past-due reviews are always included.",
     ),
+    "PROPOSAL_STALE_DRAFT_REMINDER_DAYS": (
+        0,
+        "Days without changes after which a draft proposal's team is told it "
+        "will be deleted unless it is edited or submitted. 0 turns stale-draft "
+        "clean-up off. Drafts returned to their applicant are exempt.",
+    ),
+    "PROPOSAL_STALE_DRAFT_DELETION_DAYS": (
+        14,
+        "Days after that reminder, still without changes, at which the draft "
+        "is deleted and its team told.",
+    ),
     # ORCID integration settings
     "ORCID_CLIENT_ID": (
         "",
@@ -2174,6 +2185,8 @@ CONSTANCE_CONFIG_FIELDSETS = {
     "Proposal settings": (
         "PROPOSAL_REVIEW_DURATION",
         "PROPOSAL_DASHBOARD_REVIEWS_DUE_WITHIN_DAYS",
+        "PROPOSAL_STALE_DRAFT_REMINDER_DAYS",
+        "PROPOSAL_STALE_DRAFT_DELETION_DAYS",
         "DEFAULT_PROPOSAL_REQUIRED_FIELDS",
         "DEFAULT_PROPOSAL_HIDDEN_FIELDS",
         "REVIEWER_PROFILES_ENABLED",

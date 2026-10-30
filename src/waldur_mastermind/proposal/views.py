@@ -133,7 +133,20 @@ def validate_round_is_open(proposal):
     instances and moved a late proposal into review. The deadline is enforced
     here, at the door: ``proposals_for_ended_rounds_should_be_cancelled`` only
     sweeps up the drafts left behind, never a proposal that was sent.
+
+    A proposal returned to its applicant answers to the deadline the call
+    manager set instead, whatever its round's dates.
     """
+    returned = models.get_open_return(proposal)
+    if returned is not None:
+        if timezone.now() > returned.resubmit_by:
+            raise exceptions.ValidationError(
+                _(
+                    "The deadline to resubmit this returned proposal has passed. "
+                    "Ask the call's managers to extend it."
+                )
+            )
+        return
     round_status = proposal.round.status
     if round_status == RoundStatuses.SCHEDULED:
         raise exceptions.ValidationError(
@@ -3457,6 +3470,14 @@ class ProposalViewSet(
     completion_review_status_permissions = [_compliance_checklist_permission]
 
     destroy_permissions = [proposal_permissions.can_manage_proposal]
+
+    def perform_destroy(self, instance):
+        # A draft has reviews only if it was returned to its applicant; they
+        # would otherwise stop the deletion (Review.proposal is PROTECT).
+        with transaction.atomic():
+            instance.review_set.all().delete()
+            instance.delete()
+
     update_project_details_permissions = [proposal_permissions.can_update_proposal]
 
     destroy_validators = update_project_details_validators = [
@@ -3531,6 +3552,7 @@ class ProposalViewSet(
             # update_fields and would drop anything set beforehand.
             proposal.submitted_at = timezone.now()
             proposal.save(update_fields=["submitted_at"])
+            utils.close_open_return(proposal)
 
             workflow_service.create_step_instances(proposal)
             started = None
@@ -4016,6 +4038,86 @@ class ProposalViewSet(
     complete_workflow_step_permissions = [
         proposal_permissions.can_act_on_active_workflow_step
     ]
+
+    @extend_schema(
+        description=(
+            "Return a submitted or in-review proposal to its applicant to fix "
+            "and resubmit, with a reason and a resubmission deadline. Open "
+            "reviews are cancelled and the workflow starts again on "
+            "resubmission."
+        ),
+        request=serializers.ReturnToApplicantSerializer,
+        responses={status.HTTP_200_OK: serializers.ProposalReturnSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def return_to_applicant(self, request, uuid=None):
+        proposal = self.get_object()
+        input_serializer = serializers.ReturnToApplicantSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        returned = utils.return_to_applicant(
+            proposal,
+            request.user,
+            input_serializer.validated_data["reason"],
+            input_serializer.validated_data["resubmit_by"],
+        )
+        transaction.on_commit(
+            lambda: tasks.notify_team_about_returned_proposal.delay(
+                returned.uuid.hex, False
+            )
+        )
+        return response.Response(
+            serializers.ProposalReturnSerializer(returned).data,
+            status=status.HTTP_200_OK,
+        )
+
+    return_to_applicant_serializer_class = serializers.ReturnToApplicantSerializer
+    return_to_applicant_permissions = [proposal_permissions.can_decide_proposal]
+
+    @extend_schema(
+        description="Move the resubmission deadline of a returned proposal.",
+        request=serializers.ExtendReturnSerializer,
+        responses={status.HTTP_200_OK: serializers.ProposalReturnSerializer},
+    )
+    @decorators.action(detail=True, methods=["post"])
+    def extend_return(self, request, uuid=None):
+        proposal = self.get_object()
+        input_serializer = serializers.ExtendReturnSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        returned = utils.extend_return(
+            proposal, request.user, input_serializer.validated_data["resubmit_by"]
+        )
+        transaction.on_commit(
+            lambda: tasks.notify_team_about_returned_proposal.delay(
+                returned.uuid.hex, True
+            )
+        )
+        return response.Response(
+            serializers.ProposalReturnSerializer(returned).data,
+            status=status.HTTP_200_OK,
+        )
+
+    extend_return_serializer_class = serializers.ExtendReturnSerializer
+    extend_return_permissions = [proposal_permissions.can_decide_proposal]
+
+    @extend_schema(
+        description="The times the proposal was returned to its applicant, newest "
+        "first.",
+        responses={status.HTTP_200_OK: serializers.ProposalReturnSerializer(many=True)},
+    )
+    @decorators.action(detail=True, methods=["get"])
+    def returns(self, request, uuid=None):
+        proposal = self.get_object()
+        # The history holds the workflow's internal notes: the same readers.
+        include_history = proposal_permissions.user_can_view_internal_notes(
+            request.user, proposal
+        )
+        return response.Response(
+            serializers.ProposalReturnSerializer(
+                proposal.returns.select_related("returned_by"),
+                many=True,
+                context={"include_history": include_history},
+            ).data
+        )
 
     @extend_schema(
         description="Reject the proposal at the current workflow step.",

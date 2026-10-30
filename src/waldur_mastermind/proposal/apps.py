@@ -39,6 +39,17 @@ class ProposalConfig(AppConfig):
         register_expiration_guard(handlers.is_submitted_proposal_role)
 
         # Register signal handlers
+        for related_model in (models.RequestedResource, models.ProposalDocumentation):
+            for signal in (signals.post_save, signals.post_delete):
+                signal.connect(
+                    handlers.touch_draft_on_related_change,
+                    sender=related_model,
+                    dispatch_uid=(
+                        "waldur_mastermind.proposal.touch_draft_on_"
+                        f"{'save' if signal is signals.post_save else 'delete'}_"
+                        f"{related_model.__name__}"
+                    ),
+                )
         signals.post_save.connect(
             handlers.create_checklist_completion,
             sender=models.Proposal,

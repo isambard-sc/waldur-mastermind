@@ -5,13 +5,15 @@ from typing import Any, cast
 from celery import shared_task
 from constance import config
 from django.db import transaction
-from django.db.models import Avg, Count, Q
+from django.db.models import Avg, Count, F, Q
 from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.service_access import names_calls
 from waldur_core.logging import event_logger
 from waldur_core.logging.enums import EventType
+from waldur_core.permissions.enums import PermissionEnum
+from waldur_core.permissions.utils import get_users
 from waldur_core.structure.permissions import _get_customer
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.proposal import models as proposal_models
@@ -62,6 +64,10 @@ def proposals_for_ended_rounds_should_be_cancelled():
             state=ProposalStates.DRAFT, round__cutoff_time__lt=date
         )
         .exclude(round_id__in=failed_round_ids)
+        # Returned to the applicant: theirs to resubmit by its own deadline.
+        .exclude(pk__in=proposal_models.open_return_proposal_ids())
+        # The call keeps its drafts for the stale-draft clean-up instead.
+        .exclude(round__call__cancel_drafts_at_cutoff=False)
         .select_related(
             # Each save publishes a proposal event whose scope chain walks these.
             "round__call__manager__customer"
@@ -745,11 +751,16 @@ def notify_manager_on_round_cutoff():
 )
 def notify_proposal_creator_on_submission_deadline_approaching():
     now = timezone.now()
-    proposals = proposal_models.Proposal.objects.filter(
-        state=ProposalStates.DRAFT,
-        round__call__state=CallStates.ACTIVE,
-        round__cutoff_time__gt=now,
-    ).select_related("round", "round__call", "created_by")
+    proposals = (
+        proposal_models.Proposal.objects.filter(
+            state=ProposalStates.DRAFT,
+            round__call__state=CallStates.ACTIVE,
+            round__cutoff_time__gt=now,
+        )
+        # A returned proposal's deadline is its own, not the round's.
+        .exclude(pk__in=proposal_models.open_return_proposal_ids())
+        .select_related("round", "round__call", "created_by")
+    )
 
     carries_over: dict[int, bool] = {}
     for proposal in proposals:
@@ -1478,3 +1489,167 @@ def send_workflow_step_deadline_reminders():
     if sent:
         logger.info("Sent %d workflow step deadline reminder(s)", sent)
     return sent
+
+
+@shared_task(name="waldur_mastermind.proposal.notify_team_about_returned_proposal")
+def notify_team_about_returned_proposal(return_uuid, extended):
+    """Tell a returned proposal's team why, and the deadline to resubmit; or,
+    when ``extended``, the new deadline."""
+    returned = (
+        proposal_models.ProposalReturn.objects.select_related(
+            "proposal__round__call", "proposal__created_by"
+        )
+        .filter(uuid=return_uuid)
+        .first()
+    )
+    if returned is None:
+        return
+    proposal = returned.proposal
+    recipients = set(get_users(proposal, PermissionEnum.MANAGE_PROPOSAL))
+    if proposal.created_by:
+        recipients.add(proposal.created_by)
+    emails = sorted({user.email for user in recipients if user.email})
+    if not emails:
+        logger.warning(
+            "Cannot tell the team of proposal %s it was returned: no email.",
+            proposal.uuid,
+        )
+        return
+    context = {
+        "site_name": config.SITE_NAME,
+        "proposal_name": proposal.name,
+        "call_name": proposal.round.call.name,
+        "reason": returned.reason,
+        "resubmit_by": returned.resubmit_by,
+        "extended": bool(extended),
+        "proposal_url": core_utils.format_homeport_link(
+            "proposals/{proposal_uuid}/",
+            proposal_uuid=proposal.uuid,
+        ),
+    }
+    core_utils.broadcast_mail("proposal", "proposal_returned", context, emails)
+
+
+# --- stale drafts ---------------------------------------------------------------
+
+
+def _stale_draft_team_emails(proposal):
+    recipients = set(get_users(proposal, PermissionEnum.MANAGE_PROPOSAL))
+    if proposal.created_by:
+        recipients.add(proposal.created_by)
+    return sorted({user.email for user in recipients if user.email})
+
+
+def _stale_drafts():
+    """Drafts whose team may be warned or whose draft deleted: not those
+    returned to their applicant, which the call manager follows up."""
+    return (
+        proposal_models.Proposal.objects.filter(state=ProposalStates.DRAFT)
+        .exclude(pk__in=proposal_models.open_return_proposal_ids())
+        .select_related("round__call", "created_by")
+    )
+
+
+def _date(value):
+    return value.strftime("%B %d, %Y")
+
+
+@shared_task(name="waldur_mastermind.proposal.send_stale_proposal_reminders")
+def send_stale_proposal_reminders():
+    """Warn the team of each draft unchanged for
+    PROPOSAL_STALE_DRAFT_REMINDER_DAYS that it will be deleted
+    PROPOSAL_STALE_DRAFT_DELETION_DAYS later unless it changes."""
+    reminder_days = config.PROPOSAL_STALE_DRAFT_REMINDER_DAYS
+    if reminder_days <= 0:
+        return
+    deletion_days = config.PROPOSAL_STALE_DRAFT_DELETION_DAYS
+    now = timezone.now()
+    threshold = now - timedelta(days=reminder_days)
+
+    # A draft changed since its warning is no longer stale. An update, so
+    # that clearing the mark does not count as a change itself.
+    proposal_models.Proposal.objects.filter(
+        state=ProposalStates.DRAFT,
+        stale_reminder_sent_at__isnull=False,
+        modified__gt=F("stale_reminder_sent_at"),
+    ).update(stale_reminder_sent_at=None)
+
+    for proposal in _stale_drafts().filter(
+        modified__lte=threshold, stale_reminder_sent_at__isnull=True
+    ):
+        emails = _stale_draft_team_emails(proposal)
+        # Marked even without anyone to tell, so the deletion still follows.
+        proposal_models.Proposal.objects.filter(pk=proposal.pk).update(
+            stale_reminder_sent_at=now
+        )
+        if not emails:
+            logger.warning(
+                "Stale draft %s: no one to warn before it is deleted.", proposal.uuid
+            )
+            continue
+        context = {
+            "site_name": config.SITE_NAME,
+            "proposal_name": proposal.name,
+            "call_name": proposal.round.call.name,
+            "proposal_url": core_utils.format_homeport_link(
+                "proposals/{proposal_uuid}/", proposal_uuid=proposal.uuid
+            ),
+            "last_modified": _date(proposal.modified),
+            "days_since_modification": (now - proposal.modified).days,
+            "days_until_deletion": deletion_days,
+            "deletion_date": _date(now + timedelta(days=deletion_days)),
+        }
+        core_utils.broadcast_mail(
+            "proposal", "stale_proposal_reminder", context, emails
+        )
+        logger.info(
+            "Warned the team of stale draft %s (%s recipient(s)).",
+            proposal.uuid,
+            len(emails),
+        )
+
+
+@shared_task(name="waldur_mastermind.proposal.delete_stale_proposals")
+def delete_stale_proposals():
+    """Delete each draft still unchanged PROPOSAL_STALE_DRAFT_DELETION_DAYS
+    after its team was warned, and tell them."""
+    if config.PROPOSAL_STALE_DRAFT_REMINDER_DAYS <= 0:
+        return
+    now = timezone.now()
+    threshold = now - timedelta(days=config.PROPOSAL_STALE_DRAFT_DELETION_DAYS)
+    for proposal in _stale_drafts().filter(
+        stale_reminder_sent_at__lte=threshold,
+        # Not changed since the warning.
+        modified__lte=F("stale_reminder_sent_at"),
+    ):
+        emails = _stale_draft_team_emails(proposal)
+        context = {
+            "site_name": config.SITE_NAME,
+            "proposal_name": proposal.name,
+            "call_name": proposal.round.call.name,
+            "last_modified": _date(proposal.modified),
+            "days_since_modification": (now - proposal.modified).days,
+            "deletion_date": _date(now),
+        }
+        proposal_uuid = proposal.uuid
+        customer = _get_customer(proposal)
+        with transaction.atomic():
+            # A draft deleted by its team gets no reviews; one returned and
+            # left would have been exempt above.
+            proposal.review_set.all().delete()
+            proposal.delete()
+        event_logger.emit(
+            "Draft proposal {proposal_name} was deleted after "
+            "{days_since_modification} days without changes.",
+            event_type=EventType.PROPOSAL_STALE_DELETED,
+            event_context={
+                "proposal_name": context["proposal_name"],
+                "days_since_modification": context["days_since_modification"],
+            },
+            scopes=[customer],
+        )
+        logger.info("Deleted stale draft %s.", proposal_uuid)
+        if emails:
+            core_utils.broadcast_mail(
+                "proposal", "stale_proposal_deleted", context, emails
+            )

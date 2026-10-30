@@ -28,8 +28,7 @@ from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import permissions as marketplace_permissions
 from waldur_mastermind.marketplace import utils as marketplace_utils
 from waldur_mastermind.marketplace.enums import OrderStates
-from waldur_mastermind.proposal import award_ids
-from waldur_mastermind.proposal import event_publishing
+from waldur_mastermind.proposal import award_ids, event_publishing
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal.enums import (
     AllocationTimes,
@@ -794,6 +793,9 @@ def carry_over_drafts(
         drafts = list(
             call_round.proposal_set.select_for_update(of=("self",))
             .filter(state=ProposalStates.DRAFT)
+            # Returned to the applicant: theirs to resubmit by the deadline
+            # the call manager set, whatever the round does.
+            .exclude(pk__in=proposal_models.open_return_proposal_ids())
             .select_related("round__call__manager__customer")
             # One lock order for every multi-row lock on proposals.
             .order_by("pk")
@@ -836,6 +838,10 @@ def process_closed_round(
     their applicants, see ``carry_over_drafts``.
     """
     moved = carry_over_drafts(call_round, announce=announce)
+    if not call_round.call.cancel_drafts_at_cutoff:
+        # The call keeps its drafts: the stale-draft clean-up deals with them,
+        # with warning, rather than the cut-off without any.
+        return moved
 
     # Lock the drafts while reading them, so the proposals announced are exactly
     # the rows updated: a concurrent submit holds the same row lock, and if it
@@ -845,6 +851,7 @@ def process_closed_round(
         drafts = list(
             call_round.proposal_set.select_for_update(of=("self",))
             .filter(state=ProposalStates.DRAFT)
+            .exclude(pk__in=proposal_models.open_return_proposal_ids())
             .select_related("round__call__manager__customer")
             .order_by("pk")
         )
@@ -1232,3 +1239,140 @@ def disclosed_proposal_fields(
         "proposal_slug": proposal.slug,
         "proposal_summary": (proposal.project_summary or "") if show_summary else "",
     }
+
+
+# --- returning a proposal to its applicant ------------------------------------
+
+
+RETURNABLE_STATES = (ProposalStates.SUBMITTED, ProposalStates.IN_REVIEW)
+
+
+def _workflow_snapshot(proposal) -> list:
+    return [
+        {
+            "step": instance.step,
+            "status": instance.status,
+            "outcome": instance.outcome,
+            "outcome_reason": instance.outcome_reason,
+            "started_at": instance.started_at.isoformat()
+            if instance.started_at
+            else None,
+            "completed_at": instance.completed_at.isoformat()
+            if instance.completed_at
+            else None,
+            "completed_by": instance.completed_by.uuid.hex
+            if instance.completed_by
+            else None,
+            "internal_notes": instance.internal_notes,
+        }
+        for instance in proposal.workflow_step_instances.select_related("completed_by")
+    ]
+
+
+def return_to_applicant(proposal, user, reason, resubmit_by):
+    """Hand a submitted proposal back to its applicant to fix and resubmit.
+
+    Back to draft, with the reason and deadline recorded; open reviews are
+    cancelled (kept, as rejected, so who reviewed what is not lost); the
+    workflow is cleared, its state kept on the return, so resubmission starts
+    it again. Returns the ProposalReturn. Raises ValidationError when the
+    proposal cannot be returned.
+    """
+    with transaction.atomic():
+        proposal = proposal_models.Proposal.objects.select_for_update().get(
+            pk=proposal.pk
+        )
+        if proposal.state not in RETURNABLE_STATES:
+            raise serializers.ValidationError(
+                "Only a submitted or in-review proposal can be returned to its "
+                "applicant."
+            )
+        if proposal.decision_held:
+            raise serializers.ValidationError(
+                "This proposal has a decision held for publication; reopen the "
+                "decision before returning it."
+            )
+        if resubmit_by <= timezone.now():
+            raise serializers.ValidationError(
+                {"resubmit_by": "The deadline must be in the future."}
+            )
+
+        previous_state = proposal.state
+        returned = proposal_models.ProposalReturn.objects.create(
+            proposal=proposal,
+            returned_by=user,
+            reason=reason,
+            resubmit_by=resubmit_by,
+            previous_state=previous_state,
+            workflow_history=_workflow_snapshot(proposal),
+        )
+
+        open_reviews = list(
+            proposal.review_set.filter(state=proposal_models.Review.States.IN_REVIEW)
+        )
+        for review in open_reviews:
+            review.state = proposal_models.Review.States.REJECTED
+            review.save(update_fields=["state"])
+            event_logger.emit(
+                "Review for {proposal_name} has been canceled: the proposal was "
+                "returned to its applicant.",
+                event_type=EventType.REVIEW_CANCELED,
+                event_context={"review": review, "proposal_name": proposal.name},
+                scopes=[_get_customer(review)],
+            )
+
+        proposal.workflow_step_instances.all().delete()
+        proposal.workflow_step = None
+        proposal.submitted_at = None
+        proposal.state = ProposalStates.DRAFT
+        proposal.save(update_fields=["workflow_step", "submitted_at", "state"])
+
+        event_logger.emit(
+            "Proposal {proposal_name} has been returned to its applicant by "
+            "{returned_by}, to resubmit by {resubmit_by}.",
+            event_type=EventType.PROPOSAL_RETURNED,
+            event_context={
+                "proposal": proposal,
+                "proposal_name": proposal.name,
+                "returned_by": user.full_name if user else "",
+                "resubmit_by": resubmit_by.isoformat(),
+            },
+            scopes=[_get_customer(proposal)],
+        )
+    # The state change is published by the proposal's post_save handler.
+    return returned
+
+
+def extend_return(proposal, user, resubmit_by):
+    """Move a returned proposal's resubmission deadline."""
+    returned = proposal_models.get_open_return(proposal)
+    if returned is None:
+        raise serializers.ValidationError(
+            "The proposal is not waiting to be resubmitted."
+        )
+    if resubmit_by <= timezone.now():
+        raise serializers.ValidationError(
+            {"resubmit_by": "The deadline must be in the future."}
+        )
+    returned.resubmit_by = resubmit_by
+    returned.save(update_fields=["resubmit_by", "modified"])
+    event_logger.emit(
+        "The deadline to resubmit proposal {proposal_name} has been moved to "
+        "{resubmit_by} by {extended_by}.",
+        event_type=EventType.PROPOSAL_RETURN_EXTENDED,
+        event_context={
+            "proposal": proposal,
+            "proposal_name": proposal.name,
+            "extended_by": user.full_name if user else "",
+            "resubmit_by": resubmit_by.isoformat(),
+        },
+        scopes=[_get_customer(proposal)],
+    )
+    return returned
+
+
+def close_open_return(proposal):
+    """The proposal was resubmitted: its return is done."""
+    proposal_models.ProposalReturn.objects.filter(
+        proposal=proposal, resubmitted_at__isnull=True
+    ).update(resubmitted_at=timezone.now())
