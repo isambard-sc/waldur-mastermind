@@ -1,0 +1,7 @@
+Hello,
+
+Your project "{{ project_name }}" ends on {{ end_date|date:"j F Y" }}. Its end-of-project forms are now open: please fill them in from the project's page.
+
+{{ project_url }}
+
+This is an automated message from the {{ site_name }}. Please do not reply to this email.

@@ -8,6 +8,7 @@ from rest_framework import exceptions
 
 from waldur_core.core.models import is_feature_enabled
 from waldur_core.core.signals import pre_serializer_fields
+from waldur_core.structure import models as structure_models
 from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal import serializers as proposal_serializers
 from waldur_mastermind.proposal import views as proposal_views
@@ -61,7 +62,9 @@ def delete_draft_responses(sender, instance, **kwargs):
         return
     if not instance.form_links.exclude(response_id="").exists():
         return
-    responses.queue_proposal_deletions(instance)
+    responses.queue_subject_deletions(
+        instance, f"draft proposal {instance.uuid.hex} deleted"
+    )
     transaction.on_commit(tasks.process_formbricks_deletions.delay)
 
 
@@ -69,4 +72,25 @@ pre_delete.connect(
     delete_draft_responses,
     sender=proposal_models.Proposal,
     dispatch_uid="proposal_forms.delete_draft_responses",
+)
+
+
+def delete_project_responses(sender, instance, **kwargs):
+    """A project is deleted (projects are soft-deleted, which sends this
+    signal but cascades nothing): its end-of-project answers go, in Waldur
+    and, once the deletion has committed, in Formbricks."""
+    links = responses.subject_links(instance)
+    answers = responses.subject_responses(instance)
+    if not links.exists() and not answers.exists():
+        return
+    responses.queue_subject_deletions(instance, f"project {instance.uuid.hex} deleted")
+    answers.delete()
+    links.delete()
+    transaction.on_commit(tasks.process_formbricks_deletions.delay)
+
+
+pre_delete.connect(
+    delete_project_responses,
+    sender=structure_models.Project,
+    dispatch_uid="proposal_forms.delete_project_responses",
 )

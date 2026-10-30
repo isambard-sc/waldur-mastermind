@@ -11,6 +11,7 @@ def register_in(router):
     router.register(
         r"proposal-forms", views.ProposalFormViewSet, basename="proposal-form"
     )
+    router.register(r"project-forms", views.ProjectFormViewSet, basename="project-form")
 
 
 urlpatterns = [
@@ -28,6 +29,11 @@ urlpatterns = [
         r"^api/formbricks-surveys/$",
         views.FormbricksSurveyListView.as_view(),
         name="formbricks-surveys",
+    ),
+    re_path(
+        r"^api/site-closing-form-flow/$",
+        views.SiteClosingFormFlowView.as_view(),
+        name="site-closing-form-flow",
     ),
     re_path(
         r"^api/proposal-form-return/$",

@@ -4,10 +4,16 @@ For each survey a flow uses, Waldur needs:
 
 - single-use links on, unencrypted: Waldur mints one link per applicant and
   form, and recognises the response by the link's id;
-- the hidden fields `proposal_uuid`, `call_uuid` and `round_uuid`, so staff
-  browsing Formbricks can see whose response is whose, and filter by call
-  and round (Waldur itself trusts only the link);
-- every ending redirecting back to the proposal in Waldur.
+- the hidden fields `proposal_uuid`, `call_uuid` and `round_uuid` (and, for
+  an end-of-project flow, `project_uuid`), so staff browsing Formbricks can
+  see whose response is whose, and filter by call and round (Waldur itself
+  trusts only the link);
+- every ending redirecting back to the proposal in Waldur (for an
+  end-of-project flow, the project).
+
+A survey's endings can return to one kind of page only, so a survey that is
+a step of both an application flow and an end-of-project flow is reported
+as a problem and left alone.
 
 ("Anonymize responses", which stops Formbricks keeping the page URL, browser
 and country with each response, is worth turning on by hand where a
@@ -26,25 +32,46 @@ import string
 
 from django.urls import reverse
 
-from . import client
+from . import client, models
 
 logger = logging.getLogger(__name__)
 
 PROPOSAL_HIDDEN_FIELD = "proposal_uuid"
-# Set on every link Waldur issues. Labels only: an applicant can edit them in
-# the link, so Waldur never reads them back.
-HIDDEN_FIELDS = (PROPOSAL_HIDDEN_FIELD, "call_uuid", "round_uuid")
-RETURN_LABEL = "Back to your proposal"
+PROJECT_HIDDEN_FIELD = "project_uuid"
+Purposes = models.FormFlow.Purposes
+
+# Set on every link Waldur issues, by what the flow is for. Labels only: the
+# person filling in can edit them in the link, so Waldur never reads them back.
+HIDDEN_FIELDS = {
+    Purposes.APPLICATION: (PROPOSAL_HIDDEN_FIELD, "call_uuid", "round_uuid"),
+    Purposes.CLOSING: (
+        PROJECT_HIDDEN_FIELD,
+        PROPOSAL_HIDDEN_FIELD,
+        "call_uuid",
+        "round_uuid",
+    ),
+}
+# The hidden field naming the page an ending returns to.
+RETURN_FIELD = {
+    Purposes.APPLICATION: PROPOSAL_HIDDEN_FIELD,
+    Purposes.CLOSING: PROJECT_HIDDEN_FIELD,
+}
+RETURN_LABEL = {
+    Purposes.APPLICATION: "Back to your proposal",
+    Purposes.CLOSING: "Back to your project",
+}
 
 
-def return_url(api_base_url, survey_id) -> str:
-    """Where a survey's endings send the applicant: Waldur's return endpoint,
-    which takes them on to the proposal in HomePort. Formbricks fills in the
-    #recall:...# part from the hidden field when the survey ends."""
+def return_url(api_base_url, survey_id, purpose=Purposes.APPLICATION) -> str:
+    """Where a survey's endings send whoever filled it in: Waldur's return
+    endpoint, which takes them on to the proposal (or, for an end-of-project
+    form, the project) in HomePort. Formbricks fills in the #recall:...# part
+    from the hidden field when the survey ends."""
     path = reverse("proposal-form-return")
+    field = RETURN_FIELD[purpose]
     return (
         f"{api_base_url.rstrip('/')}{path}?survey={survey_id}"
-        f"&{PROPOSAL_HIDDEN_FIELD}=#recall:{PROPOSAL_HIDDEN_FIELD}/fallback:#"
+        f"&{field}=#recall:{field}/fallback:#"
     )
 
 
@@ -55,7 +82,7 @@ def _new_ending_id() -> str:
     return "c" + "".join(secrets.choice(alphabet) for _ in range(23))
 
 
-def plan(survey: dict, ending_url: str) -> dict:
+def plan(survey: dict, ending_url: str, purpose=Purposes.APPLICATION) -> dict:
     """What has to change in a survey: {"changes": {setting: new value},
     "notes": [what each change does, readably], "problems": [what Waldur
     cannot fix itself]}."""
@@ -86,7 +113,7 @@ def plan(survey: dict, ending_url: str) -> dict:
 
     hidden = survey.get("hiddenFields") or {}
     field_ids = list(hidden.get("fieldIds") or [])
-    missing_fields = [f for f in HIDDEN_FIELDS if f not in field_ids]
+    missing_fields = [f for f in HIDDEN_FIELDS[purpose] if f not in field_ids]
     if not hidden.get("enabled") or missing_fields:
         changes["hiddenFields"] = {
             **hidden,
@@ -109,7 +136,7 @@ def plan(survey: dict, ending_url: str) -> dict:
                 "id": ending["id"],
                 "type": "redirectToUrl",
                 "url": ending_url,
-                "label": ending.get("label") or RETURN_LABEL,
+                "label": ending.get("label") or RETURN_LABEL[purpose],
             }
         )
     if not new_endings:
@@ -118,7 +145,7 @@ def plan(survey: dict, ending_url: str) -> dict:
                 "id": _new_ending_id(),
                 "type": "redirectToUrl",
                 "url": ending_url,
-                "label": RETURN_LABEL,
+                "label": RETURN_LABEL[purpose],
             }
         )
     if new_endings != endings:
@@ -135,6 +162,26 @@ def plan(survey: dict, ending_url: str) -> dict:
     return {"changes": changes, "notes": notes, "problems": problems}
 
 
+def _purpose_conflict(flow, survey_id) -> str:
+    """Why the survey cannot be set up for this flow, if it is also a step of
+    a flow for the other purpose; empty otherwise."""
+    others = [
+        other.key
+        for other in models.FormFlow.objects.exclude(purpose=flow.purpose)
+        if any(step["survey_id"] == survey_id for step in other.steps)
+    ]
+    if not others:
+        return ""
+    return (
+        "The survey is also a step of "
+        + ", ".join(sorted(others))
+        + ", which is for "
+        + ("end of project" if flow.purpose == Purposes.APPLICATION else "applications")
+        + "; its endings can return to only one kind of page. Use a copy of "
+        "the survey for one of them."
+    )
+
+
 def check_flow(flow, api_base_url) -> list:
     """Each step's survey as Formbricks has it now, and what Sync would
     change. Reads only."""
@@ -148,12 +195,19 @@ def check_flow(flow, api_base_url) -> list:
             "problems": [],
             "questions": [],
         }
+        conflict = _purpose_conflict(flow, step["survey_id"])
         try:
             survey = client.get_survey_definition(step["survey_id"])
         except client.FormbricksError as e:
             result["problems"].append(str(e))
         else:
-            planned = plan(survey, return_url(api_base_url, step["survey_id"]))
+            planned = plan(
+                survey,
+                return_url(api_base_url, step["survey_id"], flow.purpose),
+                flow.purpose,
+            )
+            if conflict:
+                planned = {"notes": [], "problems": [conflict]}
             result["survey_name"] = survey.get("name") or ""
             result["changes"] = planned["notes"]
             result["problems"] = planned["problems"]
@@ -175,8 +229,10 @@ def sync_flow(flow, api_base_url, user=None) -> list:
             survey = client.get_survey_definition(survey_id)
         except client.FormbricksError:
             continue  # reported by the check below
-        planned = plan(survey, return_url(api_base_url, survey_id))
-        if planned["changes"]:
+        planned = plan(
+            survey, return_url(api_base_url, survey_id, flow.purpose), flow.purpose
+        )
+        if planned["changes"] and not _purpose_conflict(flow, survey_id):
             survey = client.update_survey(survey_id, planned["changes"])
             logger.info(
                 "Formbricks survey %s updated by %s: %s",

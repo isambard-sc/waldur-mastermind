@@ -1,19 +1,24 @@
-"""Applicants' answers: issuing links, taking in responses, keeping Waldur's
+"""Answers to the forms: issuing links, taking in responses, keeping Waldur's
 copy in step with Formbricks.
 
-Formbricks holds the forms' answers (the source of truth); Waldur keeps one
-copy per proposal and form (FormStepResponse), for showing in the proposal
-and for reviewers. A response is matched to its proposal and form only by
-its single-use link id, which Waldur recorded when it issued the link
+A form belongs to a *subject*: a proposal (its application forms, from the
+call's flow) or a project (its end-of-project forms, from the closing flow
+of the call that granted it). Formbricks holds the answers (the source of
+truth); Waldur keeps one copy per subject and form (FormStepResponse), for
+showing them. A response is matched to its subject and form only by its
+single-use link id, which Waldur recorded when it issued the link
 (FormLink): a webhook and a fetch go through the same apply_response, so
-they cannot disagree.
+they cannot disagree, and application and end-of-project answers never mix.
 """
 
+import datetime
 import logging
 
 from django.db import transaction
 from django.utils import timezone
 
+from waldur_core.structure import models as structure_models
+from waldur_mastermind.proposal import models as proposal_models
 from waldur_mastermind.proposal.enums import ProposalStates
 
 from . import client, flows, models
@@ -32,6 +37,112 @@ def call_flow(proposal):
         return None
 
 
+# --- subjects -----------------------------------------------------------------
+
+
+def is_project(subject) -> bool:
+    return isinstance(subject, structure_models.Project)
+
+
+def _subject_filter(subject) -> dict:
+    return {"project": subject} if is_project(subject) else {"proposal": subject}
+
+
+def subject_links(subject):
+    return models.FormLink.objects.filter(**_subject_filter(subject))
+
+
+def subject_responses(subject):
+    return models.FormStepResponse.objects.filter(**_subject_filter(subject))
+
+
+def project_proposal(project):
+    """The proposal that created the project, through which it belongs to a
+    call; None for projects no proposal created."""
+    return (
+        proposal_models.Proposal.objects.filter(project=project)
+        .select_related("round__call")
+        .order_by("-created")
+        .first()
+    )
+
+
+def closing_setting(project):
+    """Where the project's end-of-project forms come from, as
+    (flow, days_before_end): the call that granted it, if that call has an
+    end-of-project flow; otherwise the site's, if it applies to the
+    project's organisation. None: the project has no end-of-project forms."""
+    proposal = project_proposal(project)
+    if proposal is not None:
+        link = (
+            models.CallFormFlow.objects.filter(
+                call=proposal.round.call, closing_flow__isnull=False
+            )
+            .select_related("closing_flow")
+            .first()
+        )
+        if link is not None:
+            return link.closing_flow, link.closing_forms_open_days_before_end
+    default = models.SiteClosingFormFlow.get()
+    if default.applies_to(project):
+        return default.flow, default.closing_forms_open_days_before_end
+    return None
+
+
+def closing_flow(project):
+    setting = closing_setting(project)
+    return setting[0] if setting else None
+
+
+def flow_for(subject):
+    return closing_flow(subject) if is_project(subject) else call_flow(subject)
+
+
+def max_closing_open_days() -> int:
+    """The most days before a project's end any end-of-project forms open."""
+    days = [
+        link.closing_forms_open_days_before_end
+        for link in models.CallFormFlow.objects.filter(closing_flow__isnull=False)
+    ]
+    default = models.SiteClosingFormFlow.get()
+    if default.flow_id:
+        days.append(default.closing_forms_open_days_before_end)
+    return max(days, default=0)
+
+
+def closing_forms_open_on(project) -> datetime.date | None:
+    """The day the project's end-of-project forms open: some days before its
+    end date, as the call says. None if it has no end date or no such forms."""
+    setting = closing_setting(project)
+    if setting is None or project.end_date is None:
+        return None
+    return project.end_date - datetime.timedelta(days=setting[1])
+
+
+def closing_forms_open(project) -> bool:
+    opens_on = closing_forms_open_on(project)
+    return (
+        opens_on is not None
+        and not project.is_removed
+        and timezone.localdate() >= opens_on
+    )
+
+
+def subject_ids(subject) -> dict:
+    """The hidden fields a link carries: IDs only, never anything personal."""
+    if is_project(subject):
+        proposal = project_proposal(subject)
+        ids = {"project_uuid": subject.uuid.hex}
+    else:
+        proposal = subject
+        ids = {}
+    if proposal is not None:
+        ids["proposal_uuid"] = proposal.uuid.hex
+        ids["call_uuid"] = proposal.round.call.uuid.hex
+        ids["round_uuid"] = proposal.round.uuid.hex
+    return ids
+
+
 # --- issuing links ------------------------------------------------------------
 
 
@@ -42,7 +153,7 @@ def _touch(proposal):
     type(proposal).objects.filter(pk=proposal.pk).update(modified=timezone.now())
 
 
-def issue_link(proposal, step, user) -> models.FormLink:
+def issue_link(subject, step, user) -> models.FormLink:
     """The link the applicant should use for a form now.
 
     An open link (handed out, not yet finished) is reused, so a form left
@@ -51,7 +162,8 @@ def issue_link(proposal, step, user) -> models.FormLink:
     before, it is prefilled with the current answers (an edit).
     """
     open_link = (
-        proposal.form_links.filter(
+        subject_links(subject)
+        .filter(
             step_key=step["key"],
             survey_id=step["survey_id"],
             state=models.FormLink.States.ISSUED,
@@ -63,7 +175,7 @@ def issue_link(proposal, step, user) -> models.FormLink:
         return open_link
 
     params = {}
-    current = proposal.form_step_responses.filter(step_key=step["key"]).first()
+    current = subject_responses(subject).filter(step_key=step["key"]).first()
     if current is not None:
         answers = current.raw_response
         if current.response_id:
@@ -73,9 +185,7 @@ def issue_link(proposal, step, user) -> models.FormLink:
                 # The answers as last received are the next best thing.
                 logger.warning("Could not fetch Formbricks response to prefill: %s", e)
         params.update(client.prefill_from_answers(answers))
-    params["proposal_uuid"] = proposal.uuid.hex
-    params["call_uuid"] = proposal.round.call.uuid.hex
-    params["round_uuid"] = proposal.round.uuid.hex
+    params.update(subject_ids(subject))
 
     try:
         minted = client.mint_single_use_link(step["survey_id"])
@@ -85,10 +195,11 @@ def issue_link(proposal, step, user) -> models.FormLink:
             "The form cannot be opened just now. Please try again later, or "
             "contact the call's managers if it keeps happening."
         ) from e
-    _touch(proposal)
+    if not is_project(subject):
+        _touch(subject)
     return models.FormLink.objects.create(
         single_use_id=client.single_use_id(minted),
-        proposal=proposal,
+        **_subject_filter(subject),
         step_key=step["key"],
         survey_id=step["survey_id"],
         url=client.with_params(minted, params),
@@ -134,8 +245,8 @@ def apply_response(record: dict) -> str:
 
     with transaction.atomic():
         link = (
-            models.FormLink.objects.select_for_update()
-            .select_related("proposal__round__call")
+            models.FormLink.objects.select_for_update(of=("self",))
+            .select_related("proposal__round__call", "project")
             .filter(single_use_id=su_id, survey_id=record.get("surveyId"))
             .first()
         )
@@ -147,26 +258,34 @@ def apply_response(record: dict) -> str:
                 su_id,
             )
             return "unknown-link"
-        proposal = link.proposal
-        flow = call_flow(proposal)
+        subject = link.subject
+        flow = flow_for(subject)
         step = flows.get_step(flow.steps, link.step_key) if flow else None
         if step is None or step["survey_id"] != link.survey_id:
             logger.warning(
-                "Formbricks response %s ignored: form %s is no longer in proposal "
-                "%s's call.",
+                "Formbricks response %s ignored: form %s is no longer one of "
+                "%s %s's forms.",
                 response_id,
                 link.step_key,
-                proposal.uuid.hex,
+                "project" if is_project(subject) else "proposal",
+                subject.uuid.hex,
             )
             return "step-removed"
 
         current = (
-            models.FormStepResponse.objects.select_for_update()
-            .filter(proposal=proposal, step_key=link.step_key)
+            subject_responses(subject)
+            .select_for_update()
+            .filter(step_key=link.step_key)
             .first()
         )
         is_current = current is not None and current.response_id == response_id
-        if proposal.state != ProposalStates.DRAFT and not is_current:
+        # A proposal's answers are fixed at submission; a project's stay
+        # open, as its team keeps access after the end date.
+        if (
+            not is_project(subject)
+            and subject.state != ProposalStates.DRAFT
+            and not is_current
+        ):
             # Answers are fixed at submission. A correction to the submitted
             # response itself (made in Formbricks) is still taken, below.
             if link.state == models.FormLink.States.ISSUED:
@@ -177,7 +296,7 @@ def apply_response(record: dict) -> str:
                 "Formbricks response %s for proposal %s arrived after submission; "
                 "not applied.",
                 response_id,
-                proposal.uuid.hex,
+                subject.uuid.hex,
             )
             return "late"
 
@@ -188,7 +307,7 @@ def apply_response(record: dict) -> str:
         labels = _labels_for(flow, link.survey_id)
         previous_response_id = current.response_id if current else ""
         models.FormStepResponse.objects.update_or_create(
-            proposal=proposal,
+            **_subject_filter(subject),
             step_key=link.step_key,
             defaults={
                 "survey_id": link.survey_id,
@@ -202,21 +321,21 @@ def apply_response(record: dict) -> str:
         link.state = models.FormLink.States.ANSWERED
         link.response_id = response_id
         link.save(update_fields=["state", "response_id", "modified"])
-        if proposal.state == ProposalStates.DRAFT:
-            _touch(proposal)
+        if not is_project(subject) and subject.state == ProposalStates.DRAFT:
+            _touch(subject)
 
         if previous_response_id and previous_response_id != response_id:
             # An edit: one copy of the answers in Formbricks, so the response
             # it replaced goes, now that the new one is safely here.
-            models.FormLink.objects.filter(
-                proposal=proposal, response_id=previous_response_id
-            ).update(state=models.FormLink.States.SUPERSEDED)
+            subject_links(subject).filter(response_id=previous_response_id).update(
+                state=models.FormLink.States.SUPERSEDED
+            )
             queue_deletion(previous_response_id, "replaced by an edit")
         return "updated" if is_current else "applied"
 
 
-def fetch_for_proposal(proposal) -> dict:
-    """Bring Waldur's copy of a proposal's answers up to date from
+def fetch_for_subject(subject) -> dict:
+    """Bring Waldur's copy of a proposal's (or project's) answers up to date from
     Formbricks: responses to its open links, and changes to its current
     answers. For when a webhook was missed. Returns {outcome: count}."""
     outcomes = {}
@@ -225,7 +344,7 @@ def fetch_for_proposal(proposal) -> dict:
         outcomes[outcome] = outcomes.get(outcome, 0) + 1
 
     open_links = {}
-    for link in proposal.form_links.filter(state=models.FormLink.States.ISSUED):
+    for link in subject_links(subject).filter(state=models.FormLink.States.ISSUED):
         open_links.setdefault(link.survey_id, set()).add(link.single_use_id)
     for survey_id, wanted in open_links.items():
         for record in client.iter_survey_responses(survey_id):
@@ -236,7 +355,7 @@ def fetch_for_proposal(proposal) -> dict:
             if not wanted:
                 break
 
-    for current in proposal.form_step_responses.exclude(response_id=""):
+    for current in subject_responses(subject).exclude(response_id=""):
         try:
             record = client.get_response_record(current.response_id)
         except client.FormbricksError as e:
@@ -257,20 +376,20 @@ def queue_deletion(response_id, reason):
     )
 
 
-def queue_proposal_deletions(proposal):
-    """A draft proposal is being deleted: its responses in Formbricks go too.
-    Only responses Waldur recorded from its own links."""
+def queue_subject_deletions(subject, reason):
+    """A draft proposal or a project is being deleted: its responses in
+    Formbricks go too. Only responses Waldur recorded from its own links."""
     response_ids = set(
-        proposal.form_links.exclude(response_id="").values_list(
-            "response_id", flat=True
-        )
+        subject_links(subject)
+        .exclude(response_id="")
+        .values_list("response_id", flat=True)
     ) | set(
-        proposal.form_step_responses.exclude(response_id="").values_list(
-            "response_id", flat=True
-        )
+        subject_responses(subject)
+        .exclude(response_id="")
+        .values_list("response_id", flat=True)
     )
     for response_id in response_ids:
-        queue_deletion(response_id, f"draft proposal {proposal.uuid.hex} deleted")
+        queue_deletion(response_id, reason)
 
 
 MAX_DELETION_ATTEMPTS = 50
@@ -300,13 +419,13 @@ def process_deletions():
 # --- reading answers ----------------------------------------------------------
 
 
-def missing_steps(proposal, flow) -> list:
+def missing_steps(subject, flow) -> list:
     """The labels of the forms not yet answered."""
-    answered = set(proposal.form_step_responses.values_list("step_key", flat=True))
+    answered = set(subject_responses(subject).values_list("step_key", flat=True))
     return [step["label"] for step in flow.steps if step["key"] not in answered]
 
 
-def serialize_form_responses(proposal, steps, step_keys=None) -> list:
+def serialize_form_responses(subject, steps, step_keys=None) -> list:
     """Each stored form's answers as labelled questions, in the order the
     flow asks them, for reading in the proposal.
 
@@ -314,7 +433,7 @@ def serialize_form_responses(proposal, steps, step_keys=None) -> list:
     the reviewer-visible ones). A form no longer in the flow is listed last,
     under its key.
     """
-    stored = proposal.form_step_responses.all()
+    stored = subject_responses(subject)
     if step_keys is not None:
         stored = stored.filter(step_key__in=step_keys)
 

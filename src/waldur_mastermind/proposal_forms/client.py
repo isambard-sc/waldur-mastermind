@@ -65,18 +65,24 @@ def is_available() -> bool:
     return is_feature_enabled(FEATURE) and connection().is_active
 
 
-# Hidden fields that are not answers: proposal_uuid, call_uuid and
-# round_uuid, which Waldur sets as labels for staff browsing Formbricks, and
-# those an earlier version of this integration set. Left out wherever
-# answers are shown.
+# Hidden fields that are not answers: the IDs Waldur sets as labels for
+# staff browsing Formbricks, and those earlier versions of this integration
+# (and HomePort's first end-of-project survey) set. Left out wherever answers
+# are shown.
 HIDDEN_FIELD_KEYS = frozenset(
     {
         "proposal_uuid",
+        "project_uuid",
         "call_uuid",
         "round_uuid",
         "redirect_token",
         "lead_name",
         "lead_email",
+        "project_name",
+        "project_slug",
+        "user_name",
+        "user_email",
+        "call_reference",
     }
 )
 
