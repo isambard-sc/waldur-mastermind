@@ -1,10 +1,16 @@
+import base64
+import json
 from unittest import mock
 
 import requests
 from constance.test.unittest import override_config as override_constance_config
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from django.test import override_settings
 from rest_framework import test
 
 from waldur_core.structure.tests import factories as structure_factories
+from waldur_mastermind.ai_reporting import signing
 from waldur_mastermind.ai_reporting.models import ReportingMessage, ReportingSession
 from waldur_mastermind.ai_reporting.tasks import _harness_overrides, ask_harness
 
@@ -76,6 +82,53 @@ class AskHarnessTaskTest(test.APITestCase):
         )
 
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    @override_settings(AI_REPORTING_SIGNING_PRIVATE_KEY="")
+    def test_request_is_unsigned_when_no_signing_key_configured(self, mock_post):
+        mock_post.return_value = mock.Mock(
+            status_code=200, json=lambda: {"answer": "ok", "new_files": []}
+        )
+        mock_post.return_value.raise_for_status = mock.Mock()
+
+        ask_harness(self.message.pk)
+
+        _, kwargs = mock_post.call_args
+        self.assertNotIn("X-Waldur-Signature", kwargs["headers"])
+        self.assertNotIn("X-Waldur-Signature-Timestamp", kwargs["headers"])
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_request_is_signed_when_a_signing_key_is_configured(self, mock_post):
+        private_key = Ed25519PrivateKey.generate()
+        private_b64 = base64.b64encode(
+            private_key.private_bytes(
+                serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                serialization.NoEncryption(),
+            )
+        ).decode()
+
+        mock_post.return_value = mock.Mock(
+            status_code=200, json=lambda: {"answer": "ok", "new_files": []}
+        )
+        mock_post.return_value.raise_for_status = mock.Mock()
+
+        with override_settings(AI_REPORTING_SIGNING_PRIVATE_KEY=private_b64):
+            ask_harness(self.message.pk)
+
+        _, kwargs = mock_post.call_args
+        self.assertIn("X-Waldur-Signature", kwargs["headers"])
+        self.assertIn("X-Waldur-Signature-Timestamp", kwargs["headers"])
+        # The signed body must be exactly the bytes actually sent (data=),
+        # not some other representation - otherwise the harness's
+        # independently-recomputed signature would never match.
+        public_key = private_key.public_key()
+        message = signing._canonical_message(
+            kwargs["headers"]["X-Waldur-Signature-Timestamp"],
+            str(self.user.uuid), "/query", kwargs["data"],
+        )
+        public_key.verify(
+            base64.b64decode(kwargs["headers"]["X-Waldur-Signature"]), message
+        )
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
     def test_network_failure_marks_failed_not_stuck_pending(self, mock_post):
         mock_post.side_effect = requests.ConnectionError("connection refused")
 
@@ -127,11 +180,12 @@ class AskHarnessTaskTest(test.APITestCase):
         ask_harness(self.message.pk)
 
         _, kwargs = mock_post.call_args
-        self.assertEqual(kwargs["json"]["model"], "custom-model")
-        self.assertEqual(kwargs["json"]["name"], "Bristol Bot")
-        self.assertEqual(kwargs["json"]["custom_instructions"], "Be terse.")
-        self.assertEqual(kwargs["json"]["max_turns"], 5)
-        self.assertEqual(kwargs["json"]["history_limit"], 10)
+        body = json.loads(kwargs["data"])
+        self.assertEqual(body["model"], "custom-model")
+        self.assertEqual(body["name"], "Bristol Bot")
+        self.assertEqual(body["custom_instructions"], "Be terse.")
+        self.assertEqual(body["max_turns"], 5)
+        self.assertEqual(body["history_limit"], 10)
 
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
     def test_default_config_sends_only_the_name_override(self, mock_post):
@@ -151,7 +205,7 @@ class AskHarnessTaskTest(test.APITestCase):
 
         _, kwargs = mock_post.call_args
         self.assertEqual(
-            kwargs["json"],
+            json.loads(kwargs["data"]),
             {"prompt": self.message.prompt, "name": "Isambard Reporting Assistant"},
         )
 

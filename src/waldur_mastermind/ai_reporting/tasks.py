@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import timedelta
 
@@ -8,6 +9,7 @@ from django.conf import settings
 from django.core.files.base import ContentFile
 from django.utils import timezone
 
+from waldur_mastermind.ai_reporting import signing
 from waldur_mastermind.ai_reporting.models import ReportingFile, ReportingMessage
 
 logger = logging.getLogger(__name__)
@@ -54,15 +56,17 @@ def _copy_files_from_harness(message: ReportingMessage, user, filenames: list[st
     chart didn't copy across.
     """
     for filename in filenames:
+        path = f"/files/{filename}"
         try:
             response = requests.get(
-                f"{settings.AI_REPORTING_HARNESS_URL}/files/{filename}",
+                f"{settings.AI_REPORTING_HARNESS_URL}{path}",
                 # Same headers as the /query call above - the harness keys
                 # its conversation store on the user id alone today, but
                 # sending both keeps this call consistent with that one.
                 headers={
                     "X-Waldur-User-Id": str(user.uuid),
                     "X-Waldur-Session-Id": str(message.session.uuid),
+                    **signing.sign_request(str(user.uuid), path, b""),
                 },
                 timeout=_HARNESS_FILE_TIMEOUT_SECONDS,
             )
@@ -96,6 +100,11 @@ def ask_harness(message_id: int):
     user = message.session.user
 
     try:
+        # Built and encoded by hand (not requests' own json= convenience) so
+        # the exact bytes being sent are known up front - signing has to sign
+        # precisely what goes over the wire, not whatever requests happens to
+        # produce internally.
+        body = json.dumps({"prompt": message.prompt, **_harness_overrides()}).encode("utf-8")
         response = requests.post(
             f"{settings.AI_REPORTING_HARNESS_URL}/query",
             headers={
@@ -107,8 +116,10 @@ def ask_harness(message_id: int):
                 # useful in the harness's own logs.
                 "X-Waldur-User-Id": str(user.uuid),
                 "X-Waldur-Session-Id": str(message.session.uuid),
+                "Content-Type": "application/json",
+                **signing.sign_request(str(user.uuid), "/query", body),
             },
-            json={"prompt": message.prompt, **_harness_overrides()},
+            data=body,
             timeout=config.AI_REPORTING_REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()

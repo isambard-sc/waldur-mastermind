@@ -278,6 +278,28 @@ AI_REPORTING_HARNESS_URL = os.environ.get(
     "http://waldur-harness.waldur-harness.svc.cluster.local:8000",
 )
 
+# Base64-encoded raw Ed25519 private key bytes, used to sign every call to
+# the AI reporting harness (see waldur_mastermind.ai_reporting.signing) so it
+# can verify a request genuinely came from Waldur, not just from something
+# that reached its NetworkPolicy-restricted port. Empty (the default) means
+# signing is off - local/dev environments and any deployment that hasn't
+# generated a keypair yet send requests unsigned, exactly as before this
+# existed. Generate a real keypair with:
+#   python -c "
+#   from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+#   from cryptography.hazmat.primitives import serialization
+#   import base64
+#   k = Ed25519PrivateKey.generate()
+#   priv = k.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+#   pub = k.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+#   print('private (Waldur, keep secret):', base64.b64encode(priv).decode())
+#   print('public (harness, not secret): ', base64.b64encode(pub).decode())
+#   "
+# The private half goes here (as a Secret, never committed); the public half
+# goes to the harness's WALDUR_SIGNING_PUBLIC_KEY - see request_signing.py in
+# the waldur-ai-harness repo.
+AI_REPORTING_SIGNING_PRIVATE_KEY = os.environ.get("AI_REPORTING_SIGNING_PRIVATE_KEY", "")
+
 FIELD_ENCRYPTION_KEY = os.environ.get("FIELD_ENCRYPTION_KEY", "")
 # Rotating the encryption key: to replace FIELD_ENCRYPTION_KEY, set the new key
 # as the primary and move the OLD key(s) here (comma-separated). New writes use
