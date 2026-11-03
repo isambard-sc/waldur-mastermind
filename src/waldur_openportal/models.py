@@ -2141,6 +2141,30 @@ class ManagedProject(ReviewMixin, models.Model):
         help_text=_("The local project identifier in this portal."),
     )
 
+    # The credits of an allocation increase waiting for a local admin. Set
+    # only while the award is pending because of that increase, so a pending
+    # award with this set is still live: every other change is applied.
+    pending_allocation = models.DecimalField(
+        max_digits=22,
+        decimal_places=7,
+        verbose_name=_("pending allocation"),
+        help_text=_("Credits of an allocation increase awaiting approval."),
+        blank=True,
+        null=True,
+    )
+
+    # The credits last approved by a local admin, or within the project
+    # class's approval limit. Small increases are measured against this, so
+    # a series of them cannot add up to an unreviewed large one.
+    approved_credits = models.DecimalField(
+        max_digits=22,
+        decimal_places=7,
+        verbose_name=_("approved credits"),
+        help_text=_("Credits last approved, by a local admin or by policy."),
+        blank=True,
+        null=True,
+    )
+
     def get_destination(self) -> openportal.Destination:
         """
         Get the destination for this project.
@@ -2965,8 +2989,30 @@ class ManagedProjectAuditEntry(models.Model):
         For events that carry new_details, the entry is skipped if new_details
         is identical to the most recent entry for this project, preventing
         duplicate records when the remote portal repeatedly sends the same
-        unchanged request.
+        unchanged request. Likewise a note-only entry (no details) is skipped
+        if the most recent entry for this project is the same event with the
+        same note by the same user, e.g. "not applied: project is in its
+        grace period" on every resend.
         """
+        if note and new_details is None and previous_details is None:
+            last = (
+                cls.objects.filter(
+                    identifier=managed_project.identifier,
+                    destination=managed_project.destination,
+                )
+                .order_by("-timestamp", "-id")
+                .first()
+            )
+            if (
+                last is not None
+                and last.event_type == event_type
+                and last.note == note
+                and last.new_details is None
+                and last.previous_details is None
+                and last.performed_by_id == getattr(performed_by, "pk", None)
+            ):
+                return None
+
         if new_details is not None and event_type in (
             ManagedProjectAuditEventType.CREATED,
             ManagedProjectAuditEventType.DETAILS_UPDATED,

@@ -35,6 +35,13 @@ class OpenPortalExtension(WaldurExtension):
                 "schedule": crontab(minute=20, hour=2),
                 "args": (),
             },
+            # Rejects awards still waiting for approval, with no project,
+            # once their end date has passed (e.g. embargoed awards).
+            "waldur-openportal-reject-ended-waiting-awards": {
+                "task": "waldur_openportal.reject_ended_waiting_awards",
+                "schedule": crontab(minute=40, hour=2),
+                "args": (),
+            },
             # This task re-tries to add or remove local users in case
             # user management failed when called directly
             "waldur-openportal-sync-local-users": {

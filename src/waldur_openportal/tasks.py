@@ -10,7 +10,7 @@ from celery import shared_task
 from constance import config as constance_config
 
 from waldur_core.core import utils as core_utils
-from waldur_core.core.enums import CoreStates
+from waldur_core.core.enums import CoreStates, ReviewStates
 from waldur_core.core.models import User
 from waldur_core.permissions.enums import RoleEnum
 from waldur_core.permissions.utils import get_users
@@ -1603,6 +1603,50 @@ def create_award(
     mapping = update_award(board, mapping.project, details)
 
     return mapping
+
+
+@shared_task(name="waldur_openportal.reject_ended_waiting_awards")
+def reject_ended_waiting_awards():
+    """
+    Reject awards still waiting for approval, with no project, whose end date
+    has passed (e.g. embargoed awards nobody approved): their project could
+    no longer be created, so they would otherwise wait forever. Done as a
+    rejection from HomePort is, telling the awarding portal. Awards attached
+    to a project are left alone: their project's own lifecycle governs them.
+    """
+    today = datetime.date.today()
+    robot = None
+    waiting = models.ManagedProject.objects.filter(
+        state__in=(ReviewStates.DRAFT, ReviewStates.PENDING),
+        project__isnull=True,
+    )
+    for managed_project in waiting:
+        try:
+            end_date = managed_project.get_details().end_date
+        except Exception as e:
+            logger.warning(
+                f"OpenPortal - cannot read the details of award {managed_project.pk}: {e}"
+            )
+            continue
+        if end_date is None or end_date > today:
+            continue
+        if robot is None:
+            robot = utils.get_openportal_robot()
+        comment = (
+            f"Rejected: the award ended on {end_date} while waiting for approval, "
+            "so its project can no longer be created."
+        )
+        managed_project.reject(robot, comment)
+        models.ManagedProjectAuditEntry.record(
+            managed_project,
+            models.ManagedProjectAuditEventType.REJECTED,
+            performed_by=robot,
+            note=comment,
+        )
+        logger.info(
+            f"OpenPortal - rejected award {managed_project.identifier}: ended {end_date} while waiting"
+        )
+        managed_project.notify_rejected()
 
 
 @shared_task(name="waldur_openportal.managed_project_approved")
