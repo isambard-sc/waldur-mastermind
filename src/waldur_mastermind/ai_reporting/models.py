@@ -38,9 +38,16 @@ class ReportingMessage(UuidMixin, TimeStampedModel):
     status = models.CharField(
         max_length=10, choices=Status.choices, default=Status.PENDING
     )
-    # Short status lines relayed from the harness as it works (e.g. "Turn 3:
-    # calling run_code") - see PROJECT_LOG.md's progress-streaming design.
-    # Not a transcript - just enough to show the user it's actually working.
+    # Meant to hold a short status line relayed from the harness mid-answer
+    # (e.g. "Turn 3: calling run_code"), not a full transcript - just enough
+    # to show the user it's actually working while they wait. Nothing writes
+    # to this field today: a single ask_harness call blocks until the harness
+    # returns a finished answer, with no mid-flight updates coming back to
+    # record here, so in practice this is always blank, and the frontend
+    # shows rotating placeholder text instead (AIReportingPage.tsx's
+    # PENDING_PHASES) while it waits. Kept so a future version of the harness
+    # that does stream real progress has a field to write it into, without a
+    # schema change at that point.
     progress = models.TextField(blank=True, default="")
     # Filenames the harness reported for this answer. Kept even now that the
     # bytes are copied into ReportingFile below (see tasks.ask_harness) - a

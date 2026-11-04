@@ -9,8 +9,8 @@ race window of two concurrent requests both reading "under limit" before
 either is recorded is an acceptable trade-off against the real cost of
 replicating that machinery here. The actual purpose of these limits is a
 credible, visible safety net answering a wider-team perception that this
-feature is expensive, not hard real-time enforcement against genuine abuse -
-see PROJECT_LOG.md (harness repo) section 22. All limits default to -1
+feature is expensive, not hard real-time enforcement against genuine abuse.
+All limits default to -1
 (unlimited) except the global daily budget and the per-minute burst cap,
 which default to the AI Assistant's own already-chosen numbers.
 """

@@ -85,9 +85,10 @@ def _copy_files_from_harness(message: ReportingMessage, user, filenames: list[st
 def ask_harness(message_id: int):
     """Call the AI reporting harness for one ReportingMessage and record the result.
 
-    Runs in a Celery worker, not a web request - this is what lets run() take
-    minutes without tying up a Django web worker (see the design discussion in
-    PROJECT_LOG.md / this app's docstrings for why).
+    Runs in a Celery worker, not a web request - a single call to the harness
+    can take several minutes, and a Django web worker is meant to respond
+    quickly and move on to the next request, not sit blocked waiting on one
+    slow external call for that long.
     """
     try:
         message = ReportingMessage.objects.select_related("session__user").get(

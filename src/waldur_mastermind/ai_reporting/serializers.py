@@ -87,10 +87,9 @@ class UsageStatsByUserSerializer(serializers.Serializer):
 
 class UsageStatsResponseSerializer(serializers.Serializer):
     """See ReportingMessageViewSet.usage_stats - the one endpoint in this
-    viewset that is deliberately NOT scoped to the caller's own messages, for
-    staff/allocators to see actual site-wide AI reporting token consumption
-    rather than relying on perception (see PROJECT_LOG.md - harness repo -
-    section 22)."""
+    viewset that is deliberately NOT scoped to the caller's own messages, so
+    staff/allocators can see actual site-wide AI reporting token consumption
+    instead of just guessing at how expensive the feature is."""
 
     period_days = serializers.IntegerField()
     total_input_tokens = serializers.IntegerField()
