@@ -29,10 +29,14 @@ class ReportingFileSerializer(serializers.ModelSerializer):
 
 
 class ReportingFileListSerializer(ReportingFileSerializer):
-    """Used by ReportingFileViewSet's own list/retrieve - unlike
-    ReportingFileSerializer (nested read-only under a message, where the
-    question is already right there), this stands alone, so it carries the
-    originating question and session back with it for traceability."""
+    """Used by ReportingFileViewSet's own list/retrieve action, where a file
+    is returned on its own, not alongside the message that produced it.
+    ReportingFileSerializer above is enough when a file is nested under its
+    message (ReportingMessageSerializer.files) - there, the caller already
+    has the question and session from the surrounding message object. Here,
+    with no surrounding message to read that from, this serializer adds the
+    question (`prompt`) and `session` directly onto the file itself, so a
+    caller can still tell which conversation a file came from."""
 
     session = serializers.SlugRelatedField(
         source="message.session", slug_field="uuid", read_only=True
