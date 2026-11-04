@@ -1,0 +1,52 @@
+# Manual domain decisions for company_domain_report.py. These win over every
+# automatic rule (generic-provider list, .ac/.edu/.gov suffixes, eduGAIN).
+#
+# domain    - matches the domain and all of its subdomains
+# category  - company | academic | research | government | health | nonprofit | generic
+#             "company" keeps the domain in the company count; anything else excludes it.
+# same_as   - company rows: count this domain as part of another company domain.
+#             excluded rows: group this domain (and its subdomains) under another
+#             domain in the Excluded sheet's institution column, for aliases that
+#             automatic grouping can't see (e.g. gla.ac.uk -> glasgow.ac.uk)
+# note      - free text, shown in the report
+#
+# Rows below were pre-filled as best guesses from the domain name alone and have
+# NOT been checked; entries marked "guess" deserve a look before quoting numbers.
+# Lines starting with # are ignored.
+domain,category,same_as,note
+# --- Universities / research institutes not in eduGAIN and without an .ac/.edu suffix ---
+uni-due.de,academic,,University of Duisburg-Essen
+uni.lu,academic,,University of Luxembourg
+ens-paris-saclay.fr,academic,,ENS Paris-Saclay
+gssi.it,academic,,Gran Sasso Science Institute
+polyu.hk,academic,,Hong Kong Polytechnic University (student mail is connect.polyu.hk)
+cam.ca.uk,academic,,guess: looks like a typo for cam.ac.uk (University of Cambridge)
+mila.quebec,research,,Mila - Quebec AI Institute
+cscs.ch,research,,Swiss National Supercomputing Centre (ETH Zurich)
+nask.pl,research,,NASK - Polish state research institute
+fchampalimaud.org,research,,Champalimaud Foundation research centre
+aithyra.at,research,,AITHYRA (Austrian Academy of Sciences institute; also seen as aithyra.ac.at)
+cancerresearch.my,research,,guess: Cancer Research Malaysia (charity research institute)
+nccuk.com,research,,guess: National Composites Centre (HVM Catapult) - not NCC Group plc (nccgroup.com)
+# --- Government and public bodies without a .gov suffix ---
+ukaea.uk,government,,UK Atomic Energy Authority
+npl.co.uk,government,,guess: National Physical Laboratory - DSIT-owned national lab
+awe.co.uk,government,,guess: AWE - MoD-owned (arguably a company; flip to company if you count it)
+# --- Non-profits / charities (flip to company if they should count) ---
+eleuther.ai,nonprofit,,EleutherAI - non-profit AI research lab
+far.ai,nonprofit,,FAR.AI - non-profit AI safety research
+metr.org,nonprofit,,METR - non-profit AI evaluation
+transluce.org,nonprofit,,Transluce - non-profit AI research lab
+arcadiaimpact.org,nonprofit,,guess: Arcadia Impact - charity
+erafellowship.org,nonprofit,,guess: ERA Fellowship - AI safety research fellowship
+meridiancambridge.org,nonprofit,,guess: Meridian Cambridge - AI safety research hub
+openforcefield.org,nonprofit,,Open Force Field Initiative (part of OMSF)
+omsf.io,nonprofit,,Open Molecular Software Foundation
+openbiosim.org,nonprofit,,guess: OpenBioSim - community interest company / non-profit
+# --- Personal domains ---
+jamiejquinn.com,generic,,guess: personal domain
+# --- Same company under two domains ---
+odyssey.system,company,odyssey.systems,guess: probably a typo of odyssey.systems
+poindexterlabs.net,company,poindexterlabs.ai,
+# --- Aliases of excluded institutions (only feed the Excluded sheet's institution column) ---
+gla.ac.uk,academic,glasgow.ac.uk,University of Glasgow (gla.ac.uk is its short form)
