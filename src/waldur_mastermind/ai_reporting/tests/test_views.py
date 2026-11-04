@@ -215,6 +215,31 @@ class ReportingMessageViewSetTest(test.APITestCase):
         uuids = {item["uuid"] for item in response.data}
         self.assertEqual(uuids, {str(mine.uuid)})
 
+    def test_list_can_be_filtered_to_one_of_the_callers_own_sessions(self):
+        other_own_session = ReportingSession.objects.create(user=self.staff)
+        in_session = ReportingMessage.objects.create(
+            session=self.session, prompt="in this session"
+        )
+        ReportingMessage.objects.create(
+            session=other_own_session, prompt="a different one of my sessions"
+        )
+
+        response = self.client.get(self.list_url, {"session": str(self.session.uuid)})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        uuids = {item["uuid"] for item in response.data}
+        self.assertEqual(uuids, {str(in_session.uuid)})
+
+    def test_session_filter_cannot_reach_another_users_session(self):
+        ReportingMessage.objects.create(session=self.other_session, prompt="not mine")
+
+        response = self.client.get(
+            self.list_url, {"session": str(self.other_session.uuid)}
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, [])
+
     def test_create_update_destroy_are_disabled(self):
         message = ReportingMessage.objects.create(session=self.session, prompt="x")
         detail_url = reverse(

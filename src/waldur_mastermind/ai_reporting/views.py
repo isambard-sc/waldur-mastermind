@@ -1,9 +1,14 @@
+import uuid
 from datetime import timedelta
 
 from django.db.models import Count, Sum
 from django.db.models.functions import TruncDate
 from django.utils import timezone
-from drf_spectacular.utils import OpenApiParameter, extend_schema
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    extend_schema,
+    extend_schema_view,
+)
 from rest_framework import decorators, status
 from rest_framework.exceptions import NotFound
 from rest_framework.permissions import IsAuthenticated
@@ -19,6 +24,18 @@ _USAGE_STATS_MAX_DAYS = 365
 _USAGE_STATS_DEFAULT_DAYS = 30
 
 
+@extend_schema_view(
+    list=extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "session",
+                uuid.UUID,
+                OpenApiParameter.QUERY,
+                description="Filter to one of the caller's own AI reporting sessions.",
+            ),
+        ]
+    )
+)
 class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
     """Ask the AI reporting harness a question and poll for its answer.
 
@@ -55,7 +72,16 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
         # staff included - only ever sees their own AI reporting history here.
         # This view makes no claim about who may use the feature; that's
         # ask_permissions' job.
-        return super().get_queryset().filter(session__user=self.request.user)
+        queryset = super().get_queryset().filter(session__user=self.request.user)
+
+        # Lets the frontend restore one conversation's own messages (e.g. on
+        # mount, after the page was navigated away from and back) instead of
+        # always listing every session the caller has ever had.
+        session_uuid = self.request.query_params.get("session", "")
+        if session_uuid:
+            queryset = queryset.filter(session__uuid=session_uuid)
+
+        return queryset
 
     list_permissions = [permissions.check_enabled_roles]
     retrieve_permissions = [permissions.check_enabled_roles]
