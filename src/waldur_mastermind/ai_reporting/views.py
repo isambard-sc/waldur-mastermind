@@ -18,7 +18,11 @@ from waldur_core.core import permissions as core_permissions
 from waldur_core.core.views import ActionsViewSet, ConstanceCheckExtensionMixin
 from waldur_core.structure import permissions as structure_permissions
 from waldur_mastermind.ai_reporting import limits, permissions, serializers, tasks
-from waldur_mastermind.ai_reporting.models import ReportingMessage, ReportingSession
+from waldur_mastermind.ai_reporting.models import (
+    ReportingFile,
+    ReportingMessage,
+    ReportingSession,
+)
 
 _USAGE_STATS_MAX_DAYS = 365
 _USAGE_STATS_DEFAULT_DAYS = 30
@@ -251,3 +255,46 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
             "by_user": by_user,
         }
         return Response(serializers.UsageStatsResponseSerializer(response_data).data)
+
+
+class ReportingFileViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
+    """Browse and delete the caller's own AI reporting files - a flat,
+    standalone list across every one of their sessions (unlike
+    ReportingMessageSerializer.files, nested under the message that produced
+    each one), for a user who wants to find or clear up a file without
+    digging back through the chat.
+
+    Deleting here early is a convenience, not a requirement: files are also
+    deleted automatically after AI_REPORTING_FILE_RETENTION_DAYS (see
+    tasks.cleanup_old_reporting_files) regardless of whether anyone visits
+    this list at all.
+    """
+
+    extension_name = "AI_REPORTING"
+
+    queryset = ReportingFile.objects.all().select_related("message__session__user")
+    serializer_class = serializers.ReportingFileListSerializer
+    lookup_field = "uuid"
+    # http_method_names alone already forecloses create/update/partial_update
+    # at Django's own dispatch level (unlike ReportingMessageViewSet, nothing
+    # else here shares post/put/patch via a custom action), so disabling
+    # those same actions again via disabled_actions would just be the same
+    # guarantee stated twice.
+    http_method_names = ["get", "delete", "options"]
+    permission_classes = [IsAuthenticated, core_permissions.ActionsPermission]
+
+    def get_queryset(self):
+        return (
+            super()
+            .get_queryset()
+            .filter(message__session__user=self.request.user)
+            .order_by("-created")
+        )
+
+    # Same gate as the chat tool itself (not usage_stats' staff/support-only
+    # restriction) - these are the caller's own files, not site-wide data, so
+    # whoever AI_REPORTING_ENABLED_ROLES lets use the tool can also see and
+    # clear up what it made for them.
+    list_permissions = [permissions.check_enabled_roles]
+    retrieve_permissions = [permissions.check_enabled_roles]
+    destroy_permissions = [permissions.check_enabled_roles]

@@ -7,3 +7,8 @@ def register_in(router):
         views.ReportingMessageViewSet,
         basename="ai-reporting-message",
     )
+    router.register(
+        r"ai-reporting-files",
+        views.ReportingFileViewSet,
+        basename="ai-reporting-file",
+    )

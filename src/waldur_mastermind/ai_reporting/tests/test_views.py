@@ -1,11 +1,16 @@
 from unittest import mock
 
 from constance.test.unittest import override_config as override_constance_config
+from django.core.files.base import ContentFile
 from django.urls import reverse
 from rest_framework import status, test
 
 from waldur_core.structure.tests import factories as structure_factories
-from waldur_mastermind.ai_reporting.models import ReportingMessage, ReportingSession
+from waldur_mastermind.ai_reporting.models import (
+    ReportingFile,
+    ReportingMessage,
+    ReportingSession,
+)
 
 
 class FeatureEnabledSwitchTest(test.APITestCase):
@@ -400,3 +405,105 @@ class EnabledRolesIntegrationTest(test.APITestCase):
         self.client.force_authenticate(user=regular)
         response = self.client.get(self.usage_stats_url)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class ReportingFileViewSetTest(test.APITestCase):
+    def setUp(self):
+        self.staff = structure_factories.UserFactory(is_staff=True)
+        self.other_staff = structure_factories.UserFactory(is_staff=True)
+        self.client.force_authenticate(user=self.staff)
+
+        self.session = ReportingSession.objects.create(user=self.staff)
+        self.message = ReportingMessage.objects.create(
+            session=self.session, prompt="chart the projects", answer="Here it is."
+        )
+        self.file = ReportingFile.objects.create(
+            message=self.message, name="chart.png",
+            file=ContentFile(b"fake png bytes", name="chart.png"),
+        )
+
+        self.other_session = ReportingSession.objects.create(user=self.other_staff)
+        self.other_message = ReportingMessage.objects.create(
+            session=self.other_session, prompt="not mine"
+        )
+        self.other_file = ReportingFile.objects.create(
+            message=self.other_message, name="not-mine.png",
+            file=ContentFile(b"not mine either", name="not-mine.png"),
+        )
+
+        self.list_url = reverse("ai-reporting-file-list")
+
+    def _detail_url(self, reporting_file):
+        return reverse("ai-reporting-file-detail", kwargs={"uuid": reporting_file.uuid})
+
+    def test_list_returns_only_the_callers_own_files_with_their_question(self):
+        response = self.client.get(self.list_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        uuids = {item["uuid"] for item in response.data}
+        self.assertEqual(uuids, {str(self.file.uuid)})
+        self.assertEqual(response.data[0]["prompt"], "chart the projects")
+        self.assertEqual(str(response.data[0]["session"]), str(self.session.uuid))
+
+    def test_cannot_retrieve_another_users_file(self):
+        response = self.client.get(self._detail_url(self.other_file))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_can_delete_own_file_and_its_bytes_are_freed(self):
+        stored_file = self.file.file
+
+        response = self.client.delete(self._detail_url(self.file))
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(ReportingFile.objects.filter(pk=self.file.pk).exists())
+        self.assertFalse(stored_file.storage.exists(stored_file.name))
+
+    def test_cannot_delete_another_users_file(self):
+        response = self.client.delete(self._detail_url(self.other_file))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertTrue(ReportingFile.objects.filter(pk=self.other_file.pk).exists())
+
+    def test_create_and_update_are_disabled(self):
+        self.assertEqual(
+            self.client.post(self.list_url, {"name": "direct create"}).status_code,
+            status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+        self.assertEqual(
+            self.client.patch(
+                self._detail_url(self.file), {"name": "fabricated"}
+            ).status_code,
+            status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    @override_constance_config(AI_REPORTING_ENABLED=False)
+    def test_list_is_rejected_while_the_feature_is_disabled(self):
+        response = self.client.get(self.list_url)
+        self.assertEqual(response.status_code, status.HTTP_424_FAILED_DEPENDENCY)
+
+    @override_constance_config(AI_REPORTING_ENABLED_ROLES="disabled")
+    def test_list_is_rejected_for_a_role_the_setting_excludes(self):
+        response = self.client.get(self.list_url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @override_constance_config(AI_REPORTING_ENABLED_ROLES="all")
+    def test_a_regular_user_can_list_and_delete_their_own_files_once_allowed(self):
+        regular = structure_factories.UserFactory()
+        regular_session = ReportingSession.objects.create(user=regular)
+        regular_message = ReportingMessage.objects.create(
+            session=regular_session, prompt="mine"
+        )
+        regular_file = ReportingFile.objects.create(
+            message=regular_message, name="mine.png",
+            file=ContentFile(b"mine", name="mine.png"),
+        )
+        self.client.force_authenticate(user=regular)
+
+        list_response = self.client.get(self.list_url)
+        self.assertEqual(list_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            {item["uuid"] for item in list_response.data}, {str(regular_file.uuid)}
+        )
+
+        delete_response = self.client.delete(self._detail_url(regular_file))
+        self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)

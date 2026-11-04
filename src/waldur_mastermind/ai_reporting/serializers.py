@@ -28,6 +28,22 @@ class ReportingFileSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class ReportingFileListSerializer(ReportingFileSerializer):
+    """Used by ReportingFileViewSet's own list/retrieve - unlike
+    ReportingFileSerializer (nested read-only under a message, where the
+    question is already right there), this stands alone, so it carries the
+    originating question and session back with it for traceability."""
+
+    session = serializers.SlugRelatedField(
+        source="message.session", slug_field="uuid", read_only=True
+    )
+    prompt = serializers.CharField(source="message.prompt", read_only=True)
+
+    class Meta(ReportingFileSerializer.Meta):
+        fields = [*ReportingFileSerializer.Meta.fields, "created", "session", "prompt"]
+        read_only_fields = fields
+
+
 class ReportingMessageSerializer(serializers.ModelSerializer):
     session = serializers.SlugRelatedField(slug_field="uuid", read_only=True)
     files = ReportingFileSerializer(many=True, read_only=True)

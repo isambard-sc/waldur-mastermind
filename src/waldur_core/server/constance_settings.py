@@ -2599,6 +2599,9 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "AI_ASSISTANT_ENABLED_ROLES",
     "AI_ASSISTANT_NAME",
     "AI_REPORTING_ENABLED_ROLES",
+    # So the Files tab can show "deleted automatically after N days" without
+    # hardcoding it - see ai_reporting.tasks.cleanup_old_reporting_files.
+    "AI_REPORTING_FILE_RETENTION_DAYS",
     "MATRIX_ENABLED",
     "MATRIX_EXTERNAL_LOGIN_METHOD",
     "AFFILIATES_ENABLED",
