@@ -340,3 +340,38 @@ class UsageStatsTest(test.APITestCase):
         self.assertEqual(response.data["total_requests"], 0)
         self.assertEqual(response.data["daily"], [])
         self.assertEqual(response.data["by_user"], [])
+
+
+class EnabledRolesIntegrationTest(test.APITestCase):
+    """Confirms permissions.check_enabled_roles is actually wired into the
+    real endpoints (unit coverage of the check itself lives in
+    test_permissions.py), and specifically that usage_stats is NOT affected
+    by it - that endpoint stays staff/support-only regardless, since seeing
+    every other user's usage is a different boundary than being allowed to
+    use the tool at all."""
+
+    def setUp(self):
+        self.ask_url = reverse("ai-reporting-message-ask")
+        self.usage_stats_url = reverse("ai-reporting-message-usage-stats")
+
+    @override_constance_config(AI_REPORTING_ENABLED_ROLES="disabled")
+    def test_disabled_blocks_even_staff(self):
+        staff = structure_factories.UserFactory(is_staff=True)
+        self.client.force_authenticate(user=staff)
+        response = self.client.post(self.ask_url, {"prompt": "hi"})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    @override_constance_config(AI_REPORTING_ENABLED_ROLES="all")
+    def test_all_lets_a_regular_user_ask(self):
+        regular = structure_factories.UserFactory()
+        self.client.force_authenticate(user=regular)
+        with mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay"):
+            response = self.client.post(self.ask_url, {"prompt": "hi"})
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+
+    @override_constance_config(AI_REPORTING_ENABLED_ROLES="all")
+    def test_usage_stats_stays_staff_and_support_only_even_when_all_is_set(self):
+        regular = structure_factories.UserFactory()
+        self.client.force_authenticate(user=regular)
+        response = self.client.get(self.usage_stats_url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)

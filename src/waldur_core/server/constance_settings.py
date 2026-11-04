@@ -136,6 +136,15 @@ AI_ASSISTANT_ENABLED_ROLES_CHOICES = [
     ("anonymous", "All users including anonymous"),
 ]
 
+# No "anonymous" option - ai_reporting has no anonymous/unauthenticated mode
+# at all, unlike the AI assistant above.
+AI_REPORTING_ENABLED_ROLES_CHOICES = [
+    ("disabled", "Disabled"),
+    ("staff", "Staff users"),
+    ("staff_and_support", "Staff and support users"),
+    ("all", "All users"),
+]
+
 NOTIFY_SYSTEM_CHOICES = [
     ("AdminAnnouncement", "AdminAnnouncement"),
     ("BroadcastMessage", "BroadcastMessage"),
@@ -366,6 +375,7 @@ CONSTANCE_CONFIG_CHOICES = {
     "SSH_KEY_ALLOWED_TYPES": SSH_KEY_TYPE_CHOICES,
     "ENABLED_REPORTING_SCREENS": REPORTING_SCREEN_CHOICES,
     "AI_ASSISTANT_ENABLED_ROLES": AI_ASSISTANT_ENABLED_ROLES_CHOICES,
+    "AI_REPORTING_ENABLED_ROLES": AI_REPORTING_ENABLED_ROLES_CHOICES,
     "MATRIX_EXTERNAL_LOGIN_METHOD": MATRIX_EXTERNAL_LOGIN_METHOD_CHOICES,
 }
 
@@ -1553,6 +1563,15 @@ CONSTANCE_CONFIG = {
         True,
         "Enable the AI reporting feature and calls to the harness service.",
     ),
+    "AI_REPORTING_ENABLED_ROLES": (
+        "staff_and_support",
+        "Controls which user roles can access AI reporting. "
+        "'disabled': No role-based access. "
+        "'staff': Staff users only. "
+        "'staff_and_support': Staff and support users (today's fixed behavior). "
+        "'all': All authenticated users.",
+        "choice_field",
+    ),
     "AI_REPORTING_NAME": (
         "Isambard Reporting Assistant",
         "Display name for the AI reporting assistant persona.",
@@ -2402,6 +2421,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
     "AI reporting settings": (
         "AI_REPORTING_NAME",
         "AI_REPORTING_ENABLED",
+        "AI_REPORTING_ENABLED_ROLES",
         "AI_REPORTING_MODEL",
         "AI_REPORTING_CUSTOM_INSTRUCTIONS",
         "AI_REPORTING_HISTORY_LIMIT",
@@ -2578,6 +2598,7 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "AI_ASSISTANT_ENABLED",
     "AI_ASSISTANT_ENABLED_ROLES",
     "AI_ASSISTANT_NAME",
+    "AI_REPORTING_ENABLED_ROLES",
     "MATRIX_ENABLED",
     "MATRIX_EXTERNAL_LOGIN_METHOD",
     "AFFILIATES_ENABLED",

@@ -12,7 +12,7 @@ from rest_framework.response import Response
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core.views import ActionsViewSet, ConstanceCheckExtensionMixin
 from waldur_core.structure import permissions as structure_permissions
-from waldur_mastermind.ai_reporting import limits, serializers, tasks
+from waldur_mastermind.ai_reporting import limits, permissions, serializers, tasks
 from waldur_mastermind.ai_reporting.models import ReportingMessage, ReportingSession
 
 _USAGE_STATS_MAX_DAYS = 365
@@ -32,6 +32,13 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
     AI_REPORTING_ENABLED is off, matching that app's own convention of
     treating the whole feature as unavailable, not just the ability to ask
     something new.
+
+    permissions.check_enabled_roles (mirroring the same app's
+    AI_ASSISTANT_ENABLED_ROLES check) further restricts list/retrieve/ask to
+    whichever roles AI_REPORTING_ENABLED_ROLES currently names - read fresh
+    on every request, so an admin's change takes effect immediately, no
+    redeploy. usage_stats is the one action that does NOT use this check;
+    see its own permissions comment for why.
     """
 
     extension_name = "AI_REPORTING"
@@ -50,9 +57,9 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
         # ask_permissions' job.
         return super().get_queryset().filter(session__user=self.request.user)
 
-    list_permissions = [structure_permissions.is_staff_or_support]
-    retrieve_permissions = [structure_permissions.is_staff_or_support]
-    ask_permissions = [structure_permissions.is_staff_or_support]
+    list_permissions = [permissions.check_enabled_roles]
+    retrieve_permissions = [permissions.check_enabled_roles]
+    ask_permissions = [permissions.check_enabled_roles]
     ask_serializer_class = serializers.AskRequestSerializer
 
     @extend_schema(
@@ -130,6 +137,11 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
             status=status.HTTP_202_ACCEPTED,
         )
 
+    # Deliberately NOT permissions.check_enabled_roles - seeing every other
+    # user's token usage by name is a different, more sensitive boundary
+    # than being allowed to use the tool at all. Widening
+    # AI_REPORTING_ENABLED_ROLES to "all" must not also widen who can see
+    # site-wide usage data; this stays staff/support regardless.
     usage_stats_permissions = [structure_permissions.is_staff_or_support]
     usage_stats_serializer_class = serializers.UsageStatsResponseSerializer
 
