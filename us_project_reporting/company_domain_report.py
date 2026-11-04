@@ -4,143 +4,31 @@
 # dependencies = ["requests", "openpyxl"]
 # ///
 """
-Estimate how many different companies have used the system.
+Estimate how many companies use the Waldur instance, and how many node hours
+on one offering (default: Isambard-AI Phase 2) each has used.
 
-Background
-----------
-"How many companies use the system" has no single authoritative field.
-Project.is_industry looked like a candidate but isn't set in practice (a
-live check against this instance came back 0), so it's not used here.
-
-This script builds an independent, bottom-up estimate: pull every user known
-to the system via /api/users/ (which includes users whose project/customer
-role has since expired or been revoked — UserRole.is_active=False / a set
-expiration_time does not delete the User record, see
-waldur_core/permissions/models.py), group them by the domain of their email
-address (usernames here are professional email addresses), and treat each
-surviving domain as one company. Domains that are not companies are stripped
-out first, in this order (first match wins):
-
-  1. domain_overrides.csv (next to this script, or --overrides PATH): a
-     hand-maintained list of domain -> category decisions. This always wins,
-     so it is also where a wrongly excluded domain is forced back in
-     (category "company"), and where two domains of the same company are
-     merged (same_as column).
-  2. Generic consumer mail providers (gmail.com, etc.).
-  3. Suffix rules: academic (.ac.*, .edu, .edu.*), government (.gov, .gov.*,
-     .gov.uk, .int, .mil, ukri.org, ...) and health (nhs.uk, nhs.net).
-  4. eduGAIN: the domains ("scopes") declared by every university/research
-     identity provider in the eduGAIN federation metadata. The extracted
-     scope list is cached in edugain_scopes.json and refreshed when older
-     than 30 days (or with --refresh-edugain; disable with --no-edugain).
-
-All rules match a domain and any of its subdomains (mail.mcgill.ca is caught
-by mcgill.ca).
-
-This is still an estimate, not ground truth:
-  - it can undercount companies whose employee used a personal Gmail address
-    for the one project they set up;
-  - it can overcount when a single company uses two domains (rebrand,
-    subsidiary, acquisition), or when a listed domain actually belongs to a
-    contractor rather than "the company" itself.
-
-This script does NOT try to fully automate away that judgment call — it
-produces the domain list (with per-domain user counts, and optionally emails)
-in an Excel file so a human can eyeball the borderline entries before quoting a
-number to a funder.
-
-Node-hour usage
----------------
-Unless --no-usage is passed, node hours on one offering (default: Isambard-AI
-Phase 2) are added per company. Per-user usage lives in
-/api/marketplace-component-user-usages/ (one row per cluster username per
-allocation per billing month); each row links to its offering user, whose
-user_email ties it back to a company domain here. Usage is monthly — Waldur
-records it per billing period, not per job — and the current month is still
-accumulating, so it is flagged as partial. Companies with no usage stay in the
-list with 0 hours.
-
-Each company is also listed with the offering's projects (and their
-organisations) that its users recorded usage against or were members of. Past
-memberships come from revoked roles (/api/user-permissions/?show_inactive=true,
-staff only); a revoked role counts only if it was still active after the
-project's first resource on the offering was created. A project counts as an
-offering project if it has a resource (allocation) on the offering. Hard-deleted
-users and offering users leave no trace in any of these.
-
-Monthly review
---------------
-Each run's report is dated (company_domains_YYYY-MM-DD.xlsx by default) and is
-compared with the previous report: the most recent earlier dated report next to
-the output, or the one given with --previous. Both the Company domains and
-Excluded sheets then get a "new" column:
-  yes              the domain wasn't in the previous report
-  changed (was X)  it was, but under category X (company, or the Excluded
-                   sheet's category) — eduGAIN or the rules changed
-  (blank)          unchanged, or decided by domain_overrides.csv
-Flagged domains are also listed at the end of the run. Review them and add a
-row to domain_overrides.csv for any that are classified wrongly; nothing needs
-recording for the ones that are right, since the next run compares against
-this report. With no previous report (or --no-previous) the column is left out.
+Groups users by email domain, drops domains that are not companies (consumer
+mail, universities, government, ...) using domain_overrides.csv, suffix rules
+and the eduGAIN federation metadata, then adds per-user node-hour usage per
+company, organisation, project and month. Writes an .xlsx workbook; emails are
+only included with --include-emails.
 
 Usage:
     python company_domain_report.py [--token TOKEN] [--base-url URL] [--output FILE]
                                      [--include-emails] [--overrides FILE] [--previous FILE]
-                                     [--no-edugain] [--refresh-edugain]
+                                     [--no-previous] [--no-edugain] [--refresh-edugain]
                                      [--no-usage] [--offering-name NAME | --offering-uuid UUID]
 
-The Waldur API token can also be provided via the WALDUR_TOKEN environment
-variable, or entered interactively when prompted.
-
-Output:
-    An .xlsx workbook (default: company_domains_YYYY-MM-DD.xlsx, today's date):
-      Company domains  one row per surviving company (domains merged via
-                       same_as count as one): domain, new (with
-                       --previous, see Monthly review), user_count, usage
-                       columns (node hours, first_project_added = the
-                       date the earliest of those projects was created in
-                       Waldur, first/last month with usage,
-                       active months, users with access to the offering,
-                       users with usage, organisations, project_count and
-                       projects on the offering — the organisation and
-                       project lists show the LIST_LIMIT most-used, then
-                       "(+N more)"), merged_domains, note, plus emails if
-                       --include-emails is passed (omitted by default);
-                       sorted by user_count descending
-      Sovereign AI     same columns as Company domains, for companies whose
-                       users recorded usage in, or were members of, an
-                       offering project of the Sovereign AI organisation;
-                       usage, organisation and project columns count only
-                       those projects (user_count, users_with_access,
-                       merged_domains, note and emails stay company-wide)
-      Excluded         same layout for every excluded domain, with its
-                       category after domain and, in place of
-                       merged_domains/note, an institution key (see
-                       institution_of) to pivot on, the rule that matched it
-                       and the override note; sorted by category, then
-                       user_count. Kept for reference — none of it is in any
-                       company count or the company-only sheets; its
-                       node_hours add up to the summary's non-company total
-      Monthly usage    node hours and active users per company per month
-      Projects         one row per company per offering project: project
-                       start/end date, node hours (0 if none), users with
-                       usage, current members, former members, first/last
-                       month with usage
-      By month         per month across all companies: node hours,
-                       companies active, users active
-      Unmatched usage  usage rows whose user could not be resolved to an
-                       email (cluster usernames only with --include-emails)
-      Sector totals    node hours, domains and users with usage per sector
-                       (company and each excluded category, plus unmatched)
-                       and the per-user grand total (verify_usage_totals.py
-                       compares that with the allocation-level totals)
-    The Sovereign AI sheet, the last five sheets and the usage columns are
-    left out with --no-usage.
-    All progress/summary output goes to stderr.
+The Waldur API token (staff) can also be provided via the WALDUR_TOKEN
+environment variable, or entered interactively when prompted.
 
 Example (monthly run; writes company_domains_<today>.xlsx and compares it with
 the most recent earlier dated report in the same folder):
     WALDUR_TOKEN=abc123 uv run company_domain_report.py
+
+How domains are classified, what each sheet and column means, where the data
+comes from and the monthly review workflow are documented in
+README_company_domain_report.md.
 """
 
 import argparse

@@ -336,23 +336,87 @@ maintain it, and last month's report already records what is new.
 ## Backend load
 
 The script is meant to be run about once a month, so it is deliberately simple
-rather than fully optimised. A run makes a handful of bulk, paged, read-only
-requests (see [Where the data comes from](#where-the-data-comes-from)), not one
-request per user or project. Specifically:
+rather than fully optimised: the aim is to avoid anything wasteful, not to shave
+every request. The load was reviewed in detail while building it.
 
-- page size is the server maximum (300);
-- requests ask only for the fields needed, wherever the endpoint supports it
-  (the user-permissions endpoint does not, so that is the heaviest request);
-- usage is filtered to one offering and one component type;
-- rows are sorted on stable keys and de-duplicated by UUID, and the result count
-  is compared with the server's `X-Result-Count`, so a run that raced with new
-  data warns rather than silently losing rows;
-- transient 502/503/504 responses on `GET`s are retried with backoff (3 retries);
-- `--no-usage` skips all usage, project and membership requests;
-- the eduGAIN download happens at most once every 30 days.
+### What a run does
 
-If the instance has `USER_DATA_ACCESS_LOGGING_ENABLED` on, listing users writes
-GDPR access-log entries, so each run will appear there.
+A run makes a handful of **bulk, paged, read-only** requests (see
+[Where the data comes from](#where-the-data-comes-from)), never one request per
+user, project or usage row. Each endpoint is read once, in pages of 300, so the
+number of requests for an endpoint is roughly its row count divided by 300. The
+requests that grow with history are the per-user usage rows (one per cluster
+username, allocation and billing month) and the project memberships.
+
+| Endpoint | How it is requested | Notes |
+|----------|---------------------|-------|
+| `/api/users/` | `field=uuid,email` | Only the two fields needed. |
+| `/api/marketplace-offering-users/` | `offering_uuid`, `field=uuid,username,user_uuid` | One offering only. |
+| `/api/marketplace-component-user-usages/` | `offering_uuid`, `type=node`, field-restricted | The largest request. One extra one-row request reads the unit and `X-Result-Count`. |
+| `/api/marketplace-resources/` | `offering_uuid`, field-restricted | |
+| `/api/projects/` | `include_terminated=true`, `field=uuid,created,start_date,end_date` | Needed for ended projects too. |
+| `/api/user-permissions/` | `scope_type=project`, `show_inactive=true` | **The heaviest per row**: this serializer does not support `field=`, so every row comes back in full. It is one pass over all project roles. |
+
+Other measures:
+
+- **Server-side filtering and field restriction.** Waldur's list endpoints accept
+  `field=` (a restricted serializer), so each request names the fields it needs.
+  Usage is filtered to one offering and one component type rather than fetched in
+  full and filtered locally.
+- **Maximum page size.** The server's pagination caps `page_size` at 300, which
+  is what is requested, so the number of round trips is minimal.
+- **`--no-usage`** skips every usage, project and membership request and gives
+  only the domain list from `/api/users/`.
+- **eduGAIN** is downloaded at most once every 30 days (`edugain_scopes.json`),
+  and it is a public URL, not Waldur.
+- **Retries.** Transient 502/503/504 responses on `GET`s are retried with
+  backoff (3 retries), so a gateway blip part-way through does not force a full
+  re-fetch.
+- **Request timeout** of 120 seconds per page.
+
+### Pagination stability
+
+Paging through a large list while the system keeps writing can skip or repeat
+rows, which would silently change totals. Several of the default orderings are
+poor keys, so the script sets its own:
+
+- Offering users default to ordering by username, which is often null, so they
+  are fetched `o=created` (effectively unique).
+- Per-user usage defaults to ordering by component usage date, which has many
+  ties, and the current month's dates change as usage is reported. It is fetched
+  ordered by billing period and username, which does not change and puts newly
+  added rows at the end.
+- Waldur's pagination adds a primary-key tie-breaker to any ordering
+  (`ensure_total_ordering`), so ties are still stable.
+- Usage and allocation rows are **de-duplicated by UUID**, and the number of rows
+  received is compared with the server's `X-Result-Count`. A mismatch prints a
+  warning telling you to re-run if the totals matter.
+
+### Things checked about what the system does on read
+
+- Listing users with `USER_DATA_ACCESS_LOGGING_ENABLED` on writes GDPR
+  access-log entries, so each run would appear there. It is off by default.
+- `user_email` on an offering user is hidden unless the offering's
+  `OfferingUserAttributeConfig` exposes email. The script therefore does not rely
+  on it: it joins offering users to Waldur users by `user_uuid` and takes the
+  email from `/api/users/`.
+### Alternatives considered for usage
+
+Two sources of per-user usage exist: the marketplace's own records
+(`/api/marketplace-component-user-usages/`, written when the OpenPortal plugin
+syncs a project's usage) and OpenPortal's own allocation-user usage. The
+marketplace records were chosen because they keep history:
+
+- Marketplace usage rows survive allocation termination. Terminating an
+  allocation deletes the OpenPortal allocation, which cascades to its
+  allocation-user usage, but the marketplace rows remain. Earlier usage (for
+  example from last year) is therefore still available only from the marketplace
+  records.
+- Their one weak point is that per-user rows cascade when the offering user they
+  belong to is hard-deleted. Offering users are only hard-deleted by a staff
+  deletion through the API, by deleting the Waldur user, or by the remote sync.
+  Revoking a project role does not delete them. Users are deactivated, not
+  deleted, in normal operation, so this is rare.
 
 ## Privacy
 
@@ -366,38 +430,75 @@ GDPR access-log entries, so each run will appear there.
 
 ## Verifying the usage totals
 
+### Why a separate check exists
+
+The report attributes usage **per user**, because that is the only way to tie
+node hours to a company: a user has an email, an email has a domain. The system
+also records usage at **allocation level**, as the project's total for a month
+(one record per allocation per month). Both come from the same OpenPortal usage
+report for each project and **should agree**:
+
+- **allocation level** (`/api/marketplace-component-usages/`): the project's
+  total for the month;
+- **per user** (`/api/marketplace-component-user-usages/`): that total split by
+  user, written for the users linked to the allocation at the time of each sync.
+  This is what the report uses.
+
+The report does not use allocation-level usage for attribution. A project total
+cannot say which company's users earned the hours, and the report is built
+around users. But the allocation total is an independent measure of how much was
+used, so comparing the two answers "did the per-user numbers capture everything?"
+The check is a separate script rather than part of the report so that the
+report stays focused and does not fetch a second large set of rows on every run.
+Run it when the totals need defending, after a change to the usage logic, or
+occasionally as a sanity check.
+
+### Running it
+
 ```bash
 WALDUR_TOKEN=<staff token> uv run verify_usage_totals.py
 ```
 
-It compares, month by month, two views of the same OpenPortal usage reports for
-the offering:
+Options: `--base-url`, and `--offering-name` / `--offering-uuid` (same defaults
+as the report). It is read-only and prints aggregates only: no names or emails.
 
-- **allocation level** (`/api/marketplace-component-usages/`): the project's
-  total for the month, one record per allocation per month;
-- **per user** (`/api/marketplace-component-user-usages/`): that total split by
-  user. This is what the report uses.
+It compares the two views month by month and prints:
 
-They should agree. The script prints a table (allocation, per-user, difference,
-per-user percentage, allocation count, mismatched count), the grand TOTAL and
-the ten largest allocation-month differences, each labelled
-`organisation / project`, and marked `[no per-user rows]` where an allocation has
-a total but no per-user data. Differences under 0.05 hours are treated as rounding.
+- a table of allocation, per-user, difference, per-user percentage, number of
+  allocations and number of mismatched allocations per month, flagging the
+  current (partial) month;
+- the grand TOTAL;
+- the ten largest allocation-month differences, each labelled
+  `organisation / project`, and marked `[no per-user rows]` where an allocation
+  has a total but no per-user data.
 
-Usual reasons for a gap:
+Differences under 0.05 hours are treated as rounding. The comparison is done
+per (allocation, month), so a gap can be pinned to the project that caused it
+and positive and negative differences do not cancel out in the monthly total.
 
-- a user left mid-month: their per-user figure stops updating while the project
-  total keeps counting later hours (per-user is lower);
-- late usage for a closed month: syncs refresh last month's per-user figures but
-  only write the project total for the current month (per-user can end up
-  slightly higher);
-- usage by a cluster account not linked to any Waldur user (only in the total);
-- an allocation with a total but no per-user rows at all (for example one with
-  no active plan period): those hours are in the allocation total but cannot be
-  attributed to any company.
+### Reading a gap
 
-A current run covers about 99.8% of the allocation-level total; the largest known
-gap is a single allocation in January 2026 with no per-user rows.
+Usual reasons for a difference:
+
+- **A user left mid-month.** Their per-user figure stops updating while the
+  project total keeps counting later hours (per-user is lower).
+- **Late usage for a closed month.** Syncs refresh last month's per-user figures
+  but only write the project total for the current month (per-user can end up
+  slightly higher).
+- **Usage by a cluster account not linked to any Waldur user.** It is only in the
+  total.
+- **An allocation with a total but no per-user rows at all** (for example one
+  with no active plan period). Those hours are in the allocation total but cannot
+  be attributed to any company.
+
+When last run, per-user usage covered about 99.8% of the allocation-level total.
+The largest gap was one allocation in January 2026 (about 8,000 node hours) with
+no per-user rows. Per-user rows cannot be reconstructed for it, so the report was
+left unchanged rather than guessing; the gap is visible in this check instead.
+Re-run it to get current figures before quoting one.
+
+The report's own **Sector totals** sheet ends with the per-user grand total, which
+is the number to compare against this script's per-user TOTAL: they should match.
 
 ## Known limitations
 
