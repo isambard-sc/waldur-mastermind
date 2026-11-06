@@ -1,6 +1,7 @@
 import uuid
 from datetime import timedelta
 
+from django.db import transaction
 from django.db.models import Count, Sum
 from django.db.models.functions import TruncDate
 from django.utils import timezone
@@ -9,7 +10,7 @@ from drf_spectacular.utils import (
     extend_schema,
     extend_schema_view,
 )
-from rest_framework import decorators, status
+from rest_framework import decorators, status, views
 from rest_framework.exceptions import NotFound
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -19,6 +20,7 @@ from waldur_core.core.views import ActionsViewSet, ConstanceCheckExtensionMixin
 from waldur_core.structure import permissions as structure_permissions
 from waldur_mastermind.ai_reporting import limits, permissions, serializers, tasks
 from waldur_mastermind.ai_reporting.models import (
+    HarnessConnection,
     ReportingFile,
     ReportingMessage,
     ReportingSession,
@@ -298,3 +300,42 @@ class ReportingFileViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
     list_permissions = [permissions.check_enabled_roles]
     retrieve_permissions = [permissions.check_enabled_roles]
     destroy_permissions = [permissions.check_enabled_roles]
+
+
+class HarnessConnectionView(views.APIView):
+    """The site's AI reporting harness connection, set up through the API
+    like the Formbricks connection is, rather than baked into deployment
+    settings - see models.HarnessConnection. Staff may change it; support
+    may read it."""
+
+    permission_classes = (IsAuthenticated,)
+
+    def _check(self, request):
+        permissions.is_staff_or_support_for_reads(request, self)
+
+    @extend_schema(
+        operation_id="ai_reporting_harness_connection_retrieve",
+        responses=serializers.HarnessConnectionSerializer,
+    )
+    def get(self, request):
+        self._check(request)
+        serializer = serializers.HarnessConnectionSerializer(HarnessConnection.get())
+        return Response(serializer.data)
+
+    @extend_schema(
+        operation_id="ai_reporting_harness_connection_partial_update",
+        request=serializers.HarnessConnectionSerializer,
+        responses=serializers.HarnessConnectionSerializer,
+    )
+    def patch(self, request):
+        self._check(request)
+        with transaction.atomic():
+            connection = HarnessConnection.objects.select_for_update().get(
+                pk=HarnessConnection.get().pk
+            )
+            serializer = serializers.HarnessConnectionSerializer(
+                connection, data=request.data, partial=True,
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+        return Response(serializer.data)

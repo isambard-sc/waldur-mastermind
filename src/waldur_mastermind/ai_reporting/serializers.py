@@ -1,3 +1,5 @@
+import base64
+
 from rest_framework import serializers
 
 from waldur_mastermind.ai_reporting import models
@@ -97,3 +99,48 @@ class UsageStatsResponseSerializer(serializers.Serializer):
     total_requests = serializers.IntegerField()
     daily = UsageStatsDailySerializer(many=True)
     by_user = UsageStatsByUserSerializer(many=True)
+
+
+class HarnessConnectionSerializer(serializers.ModelSerializer):
+    """The site's AI reporting harness connection - same shape as
+    proposal_forms.serializers.FormbricksConnectionSerializer for the same
+    kind of value.
+
+    signing_private_key is write-only: leave it out of a PATCH to keep
+    whatever is currently stored, or send an empty string to clear it
+    (turning signing back off). signing_private_key_set says whether one is
+    stored right now, without ever returning the key itself."""
+
+    signing_private_key = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        help_text="Base64-encoded raw Ed25519 private key bytes (see models.HarnessConnection).",
+    )
+    signing_private_key_set = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.HarnessConnection
+        fields = (
+            "base_url",
+            "signing_private_key",
+            "signing_private_key_set",
+            "modified",
+        )
+        read_only_fields = ("modified",)
+
+    def get_signing_private_key_set(self, connection) -> bool:
+        return bool(connection.signing_private_key)
+
+    def validate_signing_private_key(self, value):
+        if not value:
+            return value
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except Exception:
+            raise serializers.ValidationError("Not valid base64.")
+        if len(raw) != 32:
+            raise serializers.ValidationError(
+                "Not a raw Ed25519 private key: expected 32 bytes once base64-decoded."
+            )
+        return value

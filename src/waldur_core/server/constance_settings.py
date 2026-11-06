@@ -1558,7 +1558,8 @@ CONSTANCE_CONFIG = {
     # AI reporting settings (waldur_mastermind.ai_reporting - a separate feature from
     # the AI Assistant above: a staff/support tool that asks a question and gets a
     # report, not a conversational assistant. Harness lives in a separate repo,
-    # waldur-ai-harness; see AI_REPORTING_HARNESS_URL for where it's reached.)
+    # waldur-ai-harness; where it's reached is set through the API, not here -
+    # see models.HarnessConnection.)
     "AI_REPORTING_ENABLED": (
         True,
         "Enable the AI reporting feature and calls to the harness service.",
@@ -2418,7 +2419,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ANONYMOUS_CHAT_REVIEW_DAILY_TOKEN_BUDGET",
         "ANONYMOUS_CHAT_ARTIFACT_RETENTION_DAYS",
     ),
-    "AI reporting settings": (
+    "AI reporting general": (
         "AI_REPORTING_NAME",
         "AI_REPORTING_ENABLED",
         "AI_REPORTING_ENABLED_ROLES",
@@ -2427,11 +2428,15 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "AI_REPORTING_HISTORY_LIMIT",
         "AI_REPORTING_MAX_TURNS",
         "AI_REPORTING_REQUEST_TIMEOUT_SECONDS",
+    ),
+    "AI reporting limits": (
         "AI_REPORTING_TOKEN_LIMIT_DAILY",
         "AI_REPORTING_TOKEN_LIMIT_WEEKLY",
         "AI_REPORTING_TOKEN_LIMIT_MONTHLY",
         "AI_REPORTING_GLOBAL_DAILY_TOKEN_BUDGET",
         "AI_REPORTING_GLOBAL_REQUESTS_PER_MINUTE",
+    ),
+    "AI reporting retention": (
         "AI_REPORTING_MESSAGE_RETENTION_DAYS",
         "AI_REPORTING_FILE_RETENTION_DAYS",
     ),

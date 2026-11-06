@@ -1,8 +1,25 @@
+from urllib.parse import urlsplit
+
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 from model_utils.models import TimeStampedModel
 
+from waldur_core.core import fields as core_fields
 from waldur_core.core.models import User, UuidMixin
+
+
+def _validate_http_url(value):
+    """An http(s) URL with a host. Not Django's URLValidator: that insists on
+    a dotted domain, and the harness is reached by a bare in-cluster service
+    name ("http://waldur-harness.waldur-harness.svc.cluster.local:8000"),
+    which it would reject. Same validator proposal_forms.models uses for
+    FormbricksConnection's URLs, for the same reason."""
+    if not value:
+        return
+    parts = urlsplit(value)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ValidationError(_("Enter an http or https URL, including its host."))
 
 
 class ReportingSession(UuidMixin, TimeStampedModel):
@@ -88,3 +105,52 @@ class ReportingFile(UuidMixin, TimeStampedModel):
 
     def __str__(self):
         return self.name
+
+
+class HarnessConnection(TimeStampedModel):
+    """The one AI reporting harness this site talks to. A single row (see
+    get()) - configured through the API
+    (/api/ai-reporting-harness-connection/) rather than baked into deployment
+    settings, the same way proposal_forms.models.FormbricksConnection is.
+
+    signing_private_key is encrypted at rest and never returned by the API.
+    Blank (the default) means every call to the harness goes out unsigned:
+    the harness only starts requiring a signature once its own
+    WALDUR_SIGNING_PUBLIC_KEY is configured, so an unsigned request is
+    accepted exactly as it always has been until both sides are set up.
+    """
+
+    base_url = models.CharField(
+        max_length=500,
+        default="http://waldur-harness.waldur-harness.svc.cluster.local:8000",
+        validators=[_validate_http_url],
+        help_text=_(
+            "In-cluster address of the AI reporting harness's HTTP wrapper "
+            "(http_service.py in the waldur-ai-harness repo)."
+        ),
+    )
+    signing_private_key = core_fields.EncryptedTextField(
+        blank=True,
+        default="",
+        help_text=_(
+            "Base64-encoded raw Ed25519 private key bytes, used to sign every "
+            "request to the harness so it can verify the request genuinely "
+            "came from Waldur. See signing.py's own module docstring for a "
+            "ready-to-run snippet that generates a real keypair."
+        ),
+    )
+
+    class Meta:
+        verbose_name = _("AI reporting harness connection")
+
+    def __str__(self):
+        return self.base_url
+
+    @classmethod
+    def get(cls) -> "HarnessConnection":
+        connection, _created = cls.objects.get_or_create(pk=1)
+        return connection
+
+    @property
+    def is_signing_configured(self) -> bool:
+        return bool(self.signing_private_key)

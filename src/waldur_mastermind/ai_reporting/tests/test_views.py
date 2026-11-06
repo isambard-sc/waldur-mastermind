@@ -1,3 +1,4 @@
+import base64
 from unittest import mock
 
 from constance.test.unittest import override_config as override_constance_config
@@ -7,6 +8,7 @@ from rest_framework import status, test
 
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.ai_reporting.models import (
+    HarnessConnection,
     ReportingFile,
     ReportingMessage,
     ReportingSession,
@@ -507,3 +509,98 @@ class ReportingFileViewSetTest(test.APITestCase):
 
         delete_response = self.client.delete(self._detail_url(regular_file))
         self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
+
+
+_FAKE_KEY = base64.b64encode(b"0" * 32).decode()
+
+
+class HarnessConnectionApiTest(test.APITestCase):
+    """Same read/write split, and the same write-only-secret shape, as
+    proposal_forms.tests.test_api.ConnectionApiTest for FormbricksConnection
+    - this is the same kind of value, configured the same way."""
+
+    url = "/api/ai-reporting-harness-connection/"
+
+    def setUp(self):
+        self.staff = structure_factories.UserFactory(is_staff=True)
+        self.support = structure_factories.UserFactory(is_support=True)
+        self.regular = structure_factories.UserFactory()
+
+    def test_staff_and_support_can_read_without_the_key(self):
+        connection = HarnessConnection.get()
+        connection.base_url = "http://waldur-harness.waldur-harness.svc.cluster.local:8000"
+        connection.signing_private_key = _FAKE_KEY
+        connection.save()
+
+        for user in (self.staff, self.support):
+            self.client.force_authenticate(user)
+            response = self.client.get(self.url)
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertNotIn("signing_private_key", response.data)
+            self.assertTrue(response.data["signing_private_key_set"])
+            self.assertNotIn(_FAKE_KEY, response.content.decode())
+
+    def test_a_regular_user_cannot_read_or_change_it(self):
+        self.client.force_authenticate(self.regular)
+        self.assertEqual(
+            self.client.get(self.url).status_code, status.HTTP_403_FORBIDDEN
+        )
+        self.assertEqual(
+            self.client.patch(self.url, {"base_url": "http://x:8000"}).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    def test_support_can_read_but_not_change_it(self):
+        self.client.force_authenticate(self.support)
+        response = self.client.patch(self.url, {"base_url": "http://x:8000"})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_staff_can_change_the_url_and_leaving_out_the_key_keeps_it(self):
+        HarnessConnection.get()  # creates the row with its default key: ""
+        connection = HarnessConnection.get()
+        connection.signing_private_key = _FAKE_KEY
+        connection.save()
+
+        self.client.force_authenticate(self.staff)
+        response = self.client.patch(self.url, {"base_url": "http://x:8000"})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        connection.refresh_from_db()
+        self.assertEqual(connection.base_url, "http://x:8000")
+        self.assertEqual(connection.signing_private_key, _FAKE_KEY)  # left out: kept
+
+    def test_sending_an_empty_key_clears_it(self):
+        connection = HarnessConnection.get()
+        connection.signing_private_key = _FAKE_KEY
+        connection.save()
+
+        self.client.force_authenticate(self.staff)
+        response = self.client.patch(self.url, {"signing_private_key": ""})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data["signing_private_key_set"])
+
+        connection.refresh_from_db()
+        self.assertEqual(connection.signing_private_key, "")
+
+    def test_key_must_be_a_32_byte_ed25519_key_once_decoded(self):
+        self.client.force_authenticate(self.staff)
+        response = self.client.patch(
+            self.url, {"signing_private_key": "not base64!"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        too_short = base64.b64encode(b"short").decode()
+        response = self.client.patch(self.url, {"signing_private_key": too_short})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_bad_url_refused(self):
+        self.client.force_authenticate(self.staff)
+        response = self.client.patch(self.url, {"base_url": "not-a-url"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_bare_in_cluster_hostname_accepted(self):
+        self.client.force_authenticate(self.staff)
+        response = self.client.patch(
+            self.url, {"base_url": "http://waldur-harness:8000"}
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)

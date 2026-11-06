@@ -6,13 +6,22 @@ import requests
 from constance.test.unittest import override_config as override_constance_config
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from django.test import override_settings
 from rest_framework import test
 
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.ai_reporting import signing
-from waldur_mastermind.ai_reporting.models import ReportingMessage, ReportingSession
+from waldur_mastermind.ai_reporting.models import (
+    HarnessConnection,
+    ReportingMessage,
+    ReportingSession,
+)
 from waldur_mastermind.ai_reporting.tasks import _harness_overrides, ask_harness
+
+
+def _set_signing_private_key(value: str) -> None:
+    connection = HarnessConnection.get()
+    connection.signing_private_key = value
+    connection.save()
 
 
 class AskHarnessTaskTest(test.APITestCase):
@@ -82,8 +91,8 @@ class AskHarnessTaskTest(test.APITestCase):
         )
 
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
-    @override_settings(AI_REPORTING_SIGNING_PRIVATE_KEY="")
     def test_request_is_unsigned_when_no_signing_key_configured(self, mock_post):
+        _set_signing_private_key("")
         mock_post.return_value = mock.Mock(
             status_code=200, json=lambda: {"answer": "ok", "new_files": []}
         )
@@ -110,8 +119,8 @@ class AskHarnessTaskTest(test.APITestCase):
         )
         mock_post.return_value.raise_for_status = mock.Mock()
 
-        with override_settings(AI_REPORTING_SIGNING_PRIVATE_KEY=private_b64):
-            ask_harness(self.message.pk)
+        _set_signing_private_key(private_b64)
+        ask_harness(self.message.pk)
 
         _, kwargs = mock_post.call_args
         self.assertIn("X-Waldur-Signature", kwargs["headers"])

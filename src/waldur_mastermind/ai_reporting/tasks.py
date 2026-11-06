@@ -5,12 +5,15 @@ from datetime import timedelta
 import requests
 from celery import shared_task
 from constance import config
-from django.conf import settings
 from django.core.files.base import ContentFile
 from django.utils import timezone
 
 from waldur_mastermind.ai_reporting import signing
-from waldur_mastermind.ai_reporting.models import ReportingFile, ReportingMessage
+from waldur_mastermind.ai_reporting.models import (
+    HarnessConnection,
+    ReportingFile,
+    ReportingMessage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +58,12 @@ def _copy_files_from_harness(message: ReportingMessage, user, filenames: list[st
     than failing the whole message - the text answer is still good even if a
     chart didn't copy across.
     """
+    harness_url = HarnessConnection.get().base_url
     for filename in filenames:
         path = f"/files/{filename}"
         try:
             response = requests.get(
-                f"{settings.AI_REPORTING_HARNESS_URL}{path}",
+                f"{harness_url}{path}",
                 # Same headers as the /query call above - the harness keys
                 # its conversation store on the user id alone today, but
                 # sending both keeps this call consistent with that one.
@@ -107,7 +111,7 @@ def ask_harness(message_id: int):
         # produce internally.
         body = json.dumps({"prompt": message.prompt, **_harness_overrides()}).encode("utf-8")
         response = requests.post(
-            f"{settings.AI_REPORTING_HARNESS_URL}/query",
+            f"{HarnessConnection.get().base_url}/query",
             headers={
                 # Keys the harness's own conversation store - a user may have
                 # several sessions (one per browser tab) running concurrently,

@@ -30,3 +30,17 @@ def check_enabled_roles(request, view, obj=None):
             )
     elif enabled_roles != "all":
         raise exceptions.PermissionDenied("AI reporting access is not configured correctly.")
+
+
+def is_staff_or_support_for_reads(request, view, obj=None):
+    """Staff may change the harness connection; support may only read it.
+
+    Same split as proposal_forms.permissions.is_staff_or_support_for_reads
+    for the Formbricks connection - not reused directly, since that function
+    belongs to a different, unrelated app."""
+    user = request.user
+    if user.is_staff:
+        return
+    if user.is_support and request.method in ("GET", "HEAD", "OPTIONS"):
+        return
+    raise exceptions.PermissionDenied()

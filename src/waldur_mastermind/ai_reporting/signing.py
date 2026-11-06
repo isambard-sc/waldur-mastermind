@@ -6,14 +6,29 @@ the verifying half and the fuller design rationale.
 
 Asymmetric by design, not a shared secret: only this (private) key is ever
 a secret Waldur has to protect; the harness only ever holds the
-corresponding public key (see AI_REPORTING_SIGNING_PRIVATE_KEY in
-base_settings.py), which isn't sensitive at all - a leak of the harness's
-copy is a non-event, unlike a shared secret that would need rotating on
-both sides.
+corresponding public key (see models.HarnessConnection.signing_private_key),
+which isn't sensitive at all - a leak of the harness's copy is a non-event,
+unlike a shared secret that would need rotating on both sides.
 
-Inert when AI_REPORTING_SIGNING_PRIVATE_KEY isn't configured (empty, the
+Inert when the connection's signing_private_key isn't set (blank, the
 default) - sign_request() just returns no extra headers, and every request
 goes out exactly as it did before this existed.
+
+Generate a real keypair with:
+    python -c "
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    import base64
+    k = Ed25519PrivateKey.generate()
+    priv = k.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+    pub = k.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    print('private (Waldur, keep secret):', base64.b64encode(priv).decode())
+    print('public (harness, not secret): ', base64.b64encode(pub).decode())
+    "
+The private half goes into HarnessConnection.signing_private_key (via the
+API, encrypted at rest - see models.py); the public half goes to the
+harness's WALDUR_SIGNING_PUBLIC_KEY - see request_signing.py in the
+waldur-ai-harness repo.
 """
 
 import base64
@@ -21,7 +36,8 @@ import hashlib
 import time
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from django.conf import settings
+
+from waldur_mastermind.ai_reporting.models import HarnessConnection
 
 SIGNATURE_HEADER = "X-Waldur-Signature"
 TIMESTAMP_HEADER = "X-Waldur-Signature-Timestamp"
@@ -39,11 +55,10 @@ def _canonical_message(timestamp: str, identity: str, path: str, body: bytes) ->
 def sign_request(identity: str, path: str, body: bytes) -> dict[str, str]:
     """Headers to add to a call to the harness - an empty dict if no signing
     key is configured, so the request goes out unsigned exactly as before."""
-    if not settings.AI_REPORTING_SIGNING_PRIVATE_KEY:
+    private_key_b64 = HarnessConnection.get().signing_private_key
+    if not private_key_b64:
         return {}
-    private_key = Ed25519PrivateKey.from_private_bytes(
-        base64.b64decode(settings.AI_REPORTING_SIGNING_PRIVATE_KEY)
-    )
+    private_key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(private_key_b64))
     timestamp = str(int(time.time()))
     signature = private_key.sign(_canonical_message(timestamp, identity, path, body))
     return {
