@@ -232,6 +232,22 @@ class ApplyResponseTest(FormsResponseBase):
         stored = self.proposal.form_step_responses.get()
         self.assertEqual(stored.question_labels, {"q1": "Why?"})
 
+    def test_malformed_survey_keeps_the_saved_labels_and_the_answers(self):
+        # A 200 whose survey is not the shape survey_labels expects raises
+        # KeyError or TypeError, not FormbricksError; the answers still count.
+        for number, error in enumerate((KeyError("data"), TypeError("not iterable"))):
+            with self.subTest(error=type(error).__name__):
+                models.FormStepResponse.objects.all().delete()
+                link = self.issue(su=f"su-malformed-{number}")
+                with mock.patch.object(client, "get_survey", side_effect=error):
+                    self.assertEqual(
+                        responses.apply_response(record(link, {"q1": "Yes"})),
+                        "applied",
+                    )
+                stored = self.proposal.form_step_responses.get()
+                self.assertEqual(stored.raw_response, {"q1": "Yes"})
+                self.assertEqual(stored.question_labels, {"q1": "Why?"})
+
     def test_unknown_link_and_unfinished_ignored(self):
         link = self.issue()
         self.assertEqual(

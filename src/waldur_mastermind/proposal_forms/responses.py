@@ -215,18 +215,31 @@ def _labels_for(flow, survey_id):
     the survey asks them.
 
     Read from Formbricks as the survey is now, so that an answer is labelled
-    as the question was worded when it was answered, whatever has been edited
-    since: a question added to the survey, or reworded, needs no Sync. The
+    as the question is worded when the response is applied, whatever has been
+    edited before then: a question added to the survey, or reworded, needs no
+    Sync. For a webhook that is the moment it was answered; a later catch-up
+    (fetch_for_subject) after an edit in between gives the newer wording. The
     flow's saved copy (survey_schemas, written by Sync) is only the fallback
-    when Formbricks cannot be reached, and supplies labels the live survey no
+    when Formbricks cannot be read, and supplies labels the live survey no
     longer has, which are kept after it.
+
+    Trade-off: this is a network call, up to client.REQUEST_TIMEOUT_SECONDS
+    long, and apply_response makes it inside its transaction, with the
+    FormLink and FormStepResponse rows locked. A slow Formbricks holds those
+    locks for that long, once per response applied, and fetch_for_subject
+    applies its records one after another. That is accepted while responses
+    are few; if it stops being so, fetch the labels once per survey per
+    fetch_for_subject call and pass them down, rather than shortening the
+    timeout.
     """
     schema = (flow.survey_schemas or {}).get(survey_id) or {}
     saved = {q["id"]: q["label"] for q in schema.get("questions") or []}
     try:
         current = client.get_survey(survey_id)
-    except client.FormbricksError as e:
-        # The answers matter more than their labels.
+    except (client.FormbricksError, KeyError, TypeError) as e:
+        # The answers matter more than their labels. KeyError and TypeError
+        # are Formbricks answering 200 with a survey of an unexpected shape,
+        # which client.get_survey does not turn into a FormbricksError.
         logger.warning("Formbricks question labels not fetched: %s", e)
         return saved
     return {
