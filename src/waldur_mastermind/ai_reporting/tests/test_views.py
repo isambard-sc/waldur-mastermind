@@ -59,11 +59,16 @@ class AskUsageLimitTest(test.APITestCase):
     def test_ask_is_rejected_once_the_daily_limit_is_reached(self):
         session = ReportingSession.objects.create(user=self.staff)
         ReportingMessage.objects.create(
-            session=session, prompt="earlier", status=ReportingMessage.Status.DONE,
-            input_tokens=6, output_tokens=5,  # 11 >= 10
+            session=session,
+            prompt="earlier",
+            status=ReportingMessage.Status.DONE,
+            input_tokens=6,
+            output_tokens=5,  # 11 >= 10
         )
 
-        with mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay") as mock_delay:
+        with mock.patch(
+            "waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay"
+        ) as mock_delay:
             response = self.client.post(self.ask_url, {"prompt": "How many projects?"})
 
         self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
@@ -111,7 +116,8 @@ class AskPermissionTest(test.APITestCase):
     def test_unauthenticated_is_rejected(self):
         response = self.client.post(self.ask_url, {"prompt": "How many projects?"})
         self.assertIn(
-            response.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN)
+            response.status_code,
+            (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN),
         )
 
 
@@ -149,7 +155,9 @@ class AskActionTest(test.APITestCase):
         self, mock_delay
     ):
         first = self.client.post(self.ask_url, {"prompt": "first"})
-        second = self.client.post(self.ask_url, {"prompt": "second, while first is pending"})
+        second = self.client.post(
+            self.ask_url, {"prompt": "second, while first is pending"}
+        )
 
         self.assertEqual(mock_delay.call_count, 1)
         self.assertEqual(first.data["uuid"], second.data["uuid"])
@@ -285,8 +293,11 @@ class UsageStatsTest(test.APITestCase):
     def _message(self, user, input_tokens, output_tokens):
         session = ReportingSession.objects.create(user=user)
         return ReportingMessage.objects.create(
-            session=session, prompt="x", status=ReportingMessage.Status.DONE,
-            input_tokens=input_tokens, output_tokens=output_tokens,
+            session=session,
+            prompt="x",
+            status=ReportingMessage.Status.DONE,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
 
     def test_regular_user_is_denied(self):
@@ -420,7 +431,8 @@ class ReportingFileViewSetTest(test.APITestCase):
             session=self.session, prompt="chart the projects", answer="Here it is."
         )
         self.file = ReportingFile.objects.create(
-            message=self.message, name="chart.png",
+            message=self.message,
+            name="chart.png",
             file=ContentFile(b"fake png bytes", name="chart.png"),
         )
 
@@ -429,7 +441,8 @@ class ReportingFileViewSetTest(test.APITestCase):
             session=self.other_session, prompt="not mine"
         )
         self.other_file = ReportingFile.objects.create(
-            message=self.other_message, name="not-mine.png",
+            message=self.other_message,
+            name="not-mine.png",
             file=ContentFile(b"not mine either", name="not-mine.png"),
         )
 
@@ -496,7 +509,8 @@ class ReportingFileViewSetTest(test.APITestCase):
             session=regular_session, prompt="mine"
         )
         regular_file = ReportingFile.objects.create(
-            message=regular_message, name="mine.png",
+            message=regular_message,
+            name="mine.png",
             file=ContentFile(b"mine", name="mine.png"),
         )
         self.client.force_authenticate(user=regular)
@@ -509,6 +523,84 @@ class ReportingFileViewSetTest(test.APITestCase):
 
         delete_response = self.client.delete(self._detail_url(regular_file))
         self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
+
+
+class ReportingSessionViewSetTest(test.APITestCase):
+    def setUp(self):
+        self.staff = structure_factories.UserFactory(is_staff=True)
+        self.other_staff = structure_factories.UserFactory(is_staff=True)
+        self.client.force_authenticate(user=self.staff)
+
+        self.session = ReportingSession.objects.create(user=self.staff)
+        self.first_message = ReportingMessage.objects.create(
+            session=self.session, prompt="first question", answer="first answer"
+        )
+        self.second_message = ReportingMessage.objects.create(
+            session=self.session, prompt="second question", answer="second answer"
+        )
+
+        # Every message aged out via AI_REPORTING_MESSAGE_RETENTION_DAYS leaves exactly
+        # this behind: a session row with no messages left to preview.
+        self.empty_session = ReportingSession.objects.create(user=self.staff)
+
+        self.other_session = ReportingSession.objects.create(user=self.other_staff)
+        ReportingMessage.objects.create(session=self.other_session, prompt="not mine")
+
+        self.list_url = reverse("ai-reporting-session-list")
+
+    def _detail_url(self, session):
+        return reverse("ai-reporting-session-detail", kwargs={"uuid": session.uuid})
+
+    def test_list_returns_only_the_callers_own_non_empty_sessions(self):
+        response = self.client.get(self.list_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        uuids = {item["uuid"] for item in response.data}
+        self.assertEqual(uuids, {str(self.session.uuid)})
+
+    def test_first_prompt_and_message_count_are_reported(self):
+        response = self.client.get(self.list_url)
+
+        row = response.data[0]
+        self.assertEqual(row["first_prompt"], "first question")
+        self.assertEqual(row["message_count"], 2)
+
+    def test_ordered_most_recently_active_session_first(self):
+        later_session = ReportingSession.objects.create(user=self.staff)
+        ReportingMessage.objects.create(session=later_session, prompt="newer")
+
+        response = self.client.get(self.list_url)
+
+        uuids = [item["uuid"] for item in response.data]
+        self.assertEqual(uuids[0], str(later_session.uuid))
+
+    def test_cannot_retrieve_another_users_session(self):
+        response = self.client.get(self._detail_url(self.other_session))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_create_update_destroy_are_disabled(self):
+        self.assertEqual(
+            self.client.post(self.list_url, {}).status_code,
+            status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+        self.assertEqual(
+            self.client.patch(self._detail_url(self.session), {}).status_code,
+            status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+        self.assertEqual(
+            self.client.delete(self._detail_url(self.session)).status_code,
+            status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    @override_constance_config(AI_REPORTING_ENABLED=False)
+    def test_list_is_rejected_while_the_feature_is_disabled(self):
+        response = self.client.get(self.list_url)
+        self.assertEqual(response.status_code, status.HTTP_424_FAILED_DEPENDENCY)
+
+    @override_constance_config(AI_REPORTING_ENABLED_ROLES="disabled")
+    def test_list_is_rejected_for_a_role_the_setting_excludes(self):
+        response = self.client.get(self.list_url)
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
 _FAKE_KEY = base64.b64encode(b"0" * 32).decode()
@@ -528,7 +620,9 @@ class HarnessConnectionApiTest(test.APITestCase):
 
     def test_staff_and_support_can_read_without_the_key(self):
         connection = HarnessConnection.get()
-        connection.base_url = "http://waldur-harness.waldur-harness.svc.cluster.local:8000"
+        connection.base_url = (
+            "http://waldur-harness.waldur-harness.svc.cluster.local:8000"
+        )
         connection.signing_private_key = _FAKE_KEY
         connection.save()
 
@@ -584,9 +678,7 @@ class HarnessConnectionApiTest(test.APITestCase):
 
     def test_key_must_be_a_32_byte_ed25519_key_once_decoded(self):
         self.client.force_authenticate(self.staff)
-        response = self.client.patch(
-            self.url, {"signing_private_key": "not base64!"}
-        )
+        response = self.client.patch(self.url, {"signing_private_key": "not base64!"})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
         too_short = base64.b64encode(b"short").decode()

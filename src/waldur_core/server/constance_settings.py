@@ -2607,6 +2607,9 @@ PUBLIC_CONSTANCE_SETTINGS = (
     # So the Files tab can show "deleted automatically after N days" without
     # hardcoding it - see ai_reporting.tasks.cleanup_old_reporting_files.
     "AI_REPORTING_FILE_RETENTION_DAYS",
+    # Same reason, for the History tab - see
+    # ai_reporting.tasks.cleanup_old_reporting_messages.
+    "AI_REPORTING_MESSAGE_RETENTION_DAYS",
     "MATRIX_ENABLED",
     "MATRIX_EXTERNAL_LOGIN_METHOD",
     "AFFILIATES_ENABLED",

@@ -2,7 +2,7 @@ import uuid
 from datetime import timedelta
 
 from django.db import transaction
-from django.db.models import Count, Sum
+from django.db.models import Count, Max, Prefetch, Sum
 from django.db.models.functions import TruncDate
 from django.utils import timezone
 from drf_spectacular.utils import (
@@ -132,12 +132,9 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
                 raise NotFound()
             session = requested_session
         else:
-            session = (
-                ReportingSession.objects.filter(user=request.user)
-                .order_by("-created")
-                .first()
-                or ReportingSession.objects.create(user=request.user)
-            )
+            session = ReportingSession.objects.filter(user=request.user).order_by(
+                "-created"
+            ).first() or ReportingSession.objects.create(user=request.user)
 
         # Avoid piling up a second Celery task for the same conversation if the
         # caller submits again before the first answer lands - the harness's own
@@ -157,7 +154,9 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
 
         if existing_pending is not None:
             return Response(
-                serializers.ReportingMessageSerializer(existing_pending, context=context).data,
+                serializers.ReportingMessageSerializer(
+                    existing_pending, context=context
+                ).data,
                 status=status.HTTP_202_ACCEPTED,
             )
 
@@ -188,7 +187,9 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
         ),
         parameters=[
             OpenApiParameter(
-                "days", int, location=OpenApiParameter.QUERY,
+                "days",
+                int,
+                location=OpenApiParameter.QUERY,
                 description=f"Trailing window in days (1-{_USAGE_STATS_MAX_DAYS}, default {_USAGE_STATS_DEFAULT_DAYS}).",
             ),
         ],
@@ -215,8 +216,7 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
         )
 
         daily = list(
-            queryset
-            .annotate(date=TruncDate("created"))
+            queryset.annotate(date=TruncDate("created"))
             .values("date")
             .annotate(
                 input_tokens=Sum("input_tokens"),
@@ -235,10 +235,11 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
                 "output_tokens": row["output_tokens"],
                 "requests": row["requests"],
             }
-            for row in queryset
-            .values(
-                "session__user__uuid", "session__user__username",
-                "session__user__first_name", "session__user__last_name",
+            for row in queryset.values(
+                "session__user__uuid",
+                "session__user__username",
+                "session__user__first_name",
+                "session__user__last_name",
             )
             .annotate(
                 input_tokens=Sum("input_tokens"),
@@ -257,6 +258,49 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
             "by_user": by_user,
         }
         return Response(serializers.UsageStatsResponseSerializer(response_data).data)
+
+
+class ReportingSessionViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
+    """Lists the caller's own AI reporting conversations (ReportingSession rows) for a
+    "previous conversations" history view, most recently active first - same per-user
+    scoping and AI_REPORTING_ENABLED_ROLES gate as ReportingMessageViewSet. Read-only: a
+    session is only ever created implicitly by ReportingMessageViewSet.ask, never
+    directly here.
+
+    Sessions with zero remaining messages - every message aged out via
+    AI_REPORTING_MESSAGE_RETENTION_DAYS (tasks.cleanup_old_reporting_messages deletes
+    the messages but not the now-empty session) - are excluded, so the history list
+    never shows an entry with nothing to preview.
+    """
+
+    extension_name = "AI_REPORTING"
+
+    queryset = ReportingSession.objects.all()
+    serializer_class = serializers.ReportingSessionSerializer
+    lookup_field = "uuid"
+    http_method_names = ["get", "options"]
+    permission_classes = [IsAuthenticated, core_permissions.ActionsPermission]
+
+    def get_queryset(self):
+        return (
+            ReportingSession.objects.filter(user=self.request.user)
+            .annotate(
+                last_activity=Max("messages__created"),
+                message_count=Count("messages"),
+            )
+            .filter(message_count__gt=0)
+            .prefetch_related(
+                Prefetch(
+                    "messages",
+                    queryset=ReportingMessage.objects.order_by("created"),
+                    to_attr="ordered_messages",
+                )
+            )
+            .order_by("-last_activity")
+        )
+
+    list_permissions = [permissions.check_enabled_roles]
+    retrieve_permissions = [permissions.check_enabled_roles]
 
 
 class ReportingFileViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
@@ -334,7 +378,9 @@ class HarnessConnectionView(views.APIView):
                 pk=HarnessConnection.get().pk
             )
             serializer = serializers.HarnessConnectionSerializer(
-                connection, data=request.data, partial=True,
+                connection,
+                data=request.data,
+                partial=True,
             )
             serializer.is_valid(raise_exception=True)
             serializer.save()

@@ -14,6 +14,11 @@ def register_in(router):
         views.ReportingFileViewSet,
         basename="ai-reporting-file",
     )
+    router.register(
+        r"ai-reporting-sessions",
+        views.ReportingSessionViewSet,
+        basename="ai-reporting-session",
+    )
 
 
 urlpatterns = [

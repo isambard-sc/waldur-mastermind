@@ -71,6 +71,30 @@ class ReportingMessageSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class ReportingSessionSerializer(serializers.ModelSerializer):
+    # Both annotated onto the queryset by ReportingSessionViewSet.get_queryset - not
+    # real model fields, so plain read-only declarations here just describe their type
+    # for the OpenAPI schema and serialize whatever the queryset already computed.
+    last_activity = serializers.DateTimeField(read_only=True)
+    message_count = serializers.IntegerField(read_only=True)
+    first_prompt = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.ReportingSession
+        fields = ["uuid", "created", "last_activity", "message_count", "first_prompt"]
+        read_only_fields = fields
+
+    def get_first_prompt(self, obj) -> str:
+        """The conversation's own opening question, as a stable label for it in a
+        history list - unlike the latest message, this doesn't change as the
+        conversation grows. Reads the view's Prefetch(..., to_attr="ordered_messages")
+        when present to avoid a query per row; falls back to a direct query otherwise
+        (e.g. when this serializer is used outside that queryset, such as in a test)."""
+        messages = getattr(obj, "ordered_messages", None)
+        first = messages[0] if messages else obj.messages.order_by("created").first()
+        return first.prompt if first else ""
+
+
 class UsageStatsDailySerializer(serializers.Serializer):
     date = serializers.DateField()
     input_tokens = serializers.IntegerField()
