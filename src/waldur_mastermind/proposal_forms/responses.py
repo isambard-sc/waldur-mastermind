@@ -210,16 +210,31 @@ def issue_link(subject, step, user) -> models.FormLink:
 # --- taking in responses ------------------------------------------------------
 
 
-def _labels_for(flow, survey_id):
+def _labels_for(flow, survey_id, answered_ids=()):
+    """The labels of a survey's questions, {question_id: label}, in the order
+    the survey asks them.
+
+    The flow's saved copy of the survey's questions (survey_schemas, written
+    by Sync) is used when it covers every question answered. A survey edited
+    in Formbricks since the last Sync does not: its new questions are in
+    the answers but not in the copy, and would otherwise be shown by their
+    ids. Then the survey is read from Formbricks as it is now, and what the
+    saved copy knows beyond it is kept after, so no label is lost.
+    """
     schema = (flow.survey_schemas or {}).get(survey_id) or {}
-    if schema.get("questions"):
-        return {q["id"]: q["label"] for q in schema["questions"]}
+    saved = {q["id"]: q["label"] for q in schema.get("questions") or []}
+    if saved and all(question_id in saved for question_id in answered_ids):
+        return saved
     try:
-        return client.get_survey(survey_id)
+        current = client.get_survey(survey_id)
     except client.FormbricksError as e:
         # The answers matter more than their labels.
         logger.warning("Formbricks question labels not fetched: %s", e)
-        return {}
+        return saved
+    return {
+        **current,
+        **{k: v for k, v in saved.items() if k not in current},
+    }
 
 
 def _answers(data) -> dict:
@@ -304,7 +319,7 @@ def apply_response(record: dict) -> str:
         if is_current and current.raw_response == answers:
             return "unchanged"
 
-        labels = _labels_for(flow, link.survey_id)
+        labels = _labels_for(flow, link.survey_id, answers)
         previous_response_id = current.response_id if current else ""
         models.FormStepResponse.objects.update_or_create(
             **_subject_filter(subject),

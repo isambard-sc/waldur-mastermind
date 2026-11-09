@@ -195,6 +195,39 @@ class ApplyResponseTest(FormsResponseBase):
         link.refresh_from_db()
         self.assertEqual(link.state, models.FormLink.States.ANSWERED)
 
+    def test_question_added_since_last_sync_is_labelled_from_the_live_survey(self):
+        # The survey was edited in Formbricks (q1 replaced by q2) and Sync
+        # was not run, so the flow's saved copy still knows only q1.
+        link = self.issue()
+        live = {"q2": "Is the lead employed?"}
+        with mock.patch.object(client, "get_survey", return_value=live) as get_survey:
+            self.assertEqual(
+                responses.apply_response(record(link, {"q2": "Yes"})), "applied"
+            )
+        get_survey.assert_called_once_with("survey1")
+        stored = self.proposal.form_step_responses.get()
+        self.assertEqual(stored.question_labels["q2"], "Is the lead employed?")
+        # What the saved copy knew beyond the live survey is kept, after it.
+        self.assertEqual(list(stored.question_order), ["q2", "q1"])
+
+    def test_saved_questions_cover_the_answers_without_asking_formbricks(self):
+        link = self.issue()
+        with mock.patch.object(client, "get_survey") as get_survey:
+            responses.apply_response(record(link))
+        get_survey.assert_not_called()
+
+    def test_unreachable_formbricks_keeps_the_saved_labels(self):
+        link = self.issue()
+        with mock.patch.object(
+            client, "get_survey", side_effect=client.FormbricksError("down")
+        ):
+            self.assertEqual(
+                responses.apply_response(record(link, {"q1": "Yes", "q2": "Yes"})),
+                "applied",
+            )
+        stored = self.proposal.form_step_responses.get()
+        self.assertEqual(stored.question_labels, {"q1": "Why?"})
+
     def test_unknown_link_and_unfinished_ignored(self):
         link = self.issue()
         self.assertEqual(
