@@ -210,11 +210,15 @@ class ApplyResponseTest(FormsResponseBase):
         # What the saved copy knew beyond the live survey is kept, after it.
         self.assertEqual(list(stored.question_order), ["q2", "q1"])
 
-    def test_saved_questions_cover_the_answers_without_asking_formbricks(self):
+    def test_reworded_question_is_labelled_with_its_current_wording(self):
+        # q1 keeps its id when it is reworded, so the flow's saved copy still
+        # covers the answer: only reading the survey shows the new wording.
         link = self.issue()
-        with mock.patch.object(client, "get_survey") as get_survey:
+        live = {"q1": "Why do you need it?"}
+        with mock.patch.object(client, "get_survey", return_value=live):
             responses.apply_response(record(link))
-        get_survey.assert_not_called()
+        stored = self.proposal.form_step_responses.get()
+        self.assertEqual(stored.question_labels, {"q1": "Why do you need it?"})
 
     def test_unreachable_formbricks_keeps_the_saved_labels(self):
         link = self.issue()
