@@ -214,31 +214,16 @@ def _labels_for(flow, survey_id):
     """The labels of a survey's questions, {question_id: label}, in the order
     the survey asks them.
 
-    Read from Formbricks as the survey is now, so that an answer is labelled
-    as the question is worded when the response is applied, whatever has been
-    edited before then: a question added to the survey, or reworded, needs no
-    Sync. For a webhook that is the moment it was answered; a later catch-up
-    (fetch_for_subject) after an edit in between gives the newer wording. The
-    flow's saved copy (survey_schemas, written by Sync) is only the fallback
-    when Formbricks cannot be read, and supplies labels the live survey no
-    longer has, which are kept after it.
+    Read from Formbricks as the survey is now, so a question added or reworded
+    since the last Sync is labelled correctly. The flow's saved copy
+    (survey_schemas) is only the fallback when Formbricks cannot be read, and
+    supplies labels the live survey no longer has, which are kept after it.
 
-    Trade-off: this is a network call, up to client.REQUEST_TIMEOUT_SECONDS
-    long, and apply_response makes it inside its transaction, with the
-    FormLink and FormStepResponse rows locked. A slow Formbricks holds those
-    locks for that long, once per response applied, and fetch_for_subject
-    applies its records one after another. What the locks hold up is another
-    apply_response for the same link or step, and the cascade delete of a
-    draft proposal. That is accepted while responses are few; if it stops
-    being so, fetch the labels once per survey per fetch_for_subject call and
-    pass them down.
-
-    The timeout is deliberately not shortened below Formbricks' 5 seconds for
-    a webhook delivery. A call that gave up would fall back to the saved
-    labels, and the retry of the delivery would then find the answers already
-    stored and return "unchanged", so a question added or reworded since the
-    last Sync would stay mislabelled. Waiting costs a retry that changes
-    nothing; giving up costs a wrong label that is not corrected.
+    This is a network call made inside apply_response's transaction, with the
+    FormLink and FormStepResponse rows locked, so the timeout is not shortened:
+    giving up would store the saved labels, and a retry would not correct them.
+    If lock time becomes a problem, fetch the labels once per survey per
+    fetch_for_subject call and pass them down.
     """
     schema = (flow.survey_schemas or {}).get(survey_id) or {}
     saved = {q["id"]: q["label"] for q in schema.get("questions") or []}
