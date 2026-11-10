@@ -211,15 +211,34 @@ def issue_link(subject, step, user) -> models.FormLink:
 
 
 def _labels_for(flow, survey_id):
+    """The labels of a survey's questions, {question_id: label}, in the order
+    the survey asks them.
+
+    Read from Formbricks as the survey is now, so a question added or reworded
+    since the last Sync is labelled correctly. The flow's saved copy
+    (survey_schemas) is only the fallback when Formbricks cannot be read, and
+    supplies labels the live survey no longer has, which are kept after it.
+
+    This is a network call made inside apply_response's transaction, with the
+    FormLink and FormStepResponse rows locked, so the timeout is not shortened:
+    giving up would store the saved labels, and a retry would not correct them.
+    If lock time becomes a problem, fetch the labels once per survey per
+    fetch_for_subject call and pass them down.
+    """
     schema = (flow.survey_schemas or {}).get(survey_id) or {}
-    if schema.get("questions"):
-        return {q["id"]: q["label"] for q in schema["questions"]}
+    saved = {q["id"]: q["label"] for q in schema.get("questions") or []}
     try:
-        return client.get_survey(survey_id)
-    except client.FormbricksError as e:
-        # The answers matter more than their labels.
+        current = client.get_survey(survey_id)
+    except (client.FormbricksError, KeyError, TypeError) as e:
+        # The answers matter more than their labels. KeyError and TypeError
+        # are Formbricks answering 200 with a survey of an unexpected shape,
+        # which client.get_survey does not turn into a FormbricksError.
         logger.warning("Formbricks question labels not fetched: %s", e)
-        return {}
+        return saved
+    return {
+        **current,
+        **{k: v for k, v in saved.items() if k not in current},
+    }
 
 
 def _answers(data) -> dict:
