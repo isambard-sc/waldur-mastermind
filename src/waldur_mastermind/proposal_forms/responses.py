@@ -227,10 +227,18 @@ def _labels_for(flow, survey_id):
     long, and apply_response makes it inside its transaction, with the
     FormLink and FormStepResponse rows locked. A slow Formbricks holds those
     locks for that long, once per response applied, and fetch_for_subject
-    applies its records one after another. That is accepted while responses
-    are few; if it stops being so, fetch the labels once per survey per
-    fetch_for_subject call and pass them down, rather than shortening the
-    timeout.
+    applies its records one after another. What the locks hold up is another
+    apply_response for the same link or step, and the cascade delete of a
+    draft proposal. That is accepted while responses are few; if it stops
+    being so, fetch the labels once per survey per fetch_for_subject call and
+    pass them down.
+
+    The timeout is deliberately not shortened below Formbricks' 5 seconds for
+    a webhook delivery. A call that gave up would fall back to the saved
+    labels, and the retry of the delivery would then find the answers already
+    stored and return "unchanged", so a question added or reworded since the
+    last Sync would stay mislabelled. Waiting costs a retry that changes
+    nothing; giving up costs a wrong label that is not corrected.
     """
     schema = (flow.survey_schemas or {}).get(survey_id) or {}
     saved = {q["id"]: q["label"] for q in schema.get("questions") or []}

@@ -317,8 +317,10 @@ class FormStepResponse(core_models.UuidMixin, TimeStampedModel):
 
     Written from the webhook or a fetch, and updated when Formbricks changes
     (it is the source of truth). The question labels are captured at the same
-    moment, so the answers always read as the questions were worded when the
-    applicant saw them, whatever happens to the survey afterwards.
+    moment, from the survey as it is then, so the answers read as the questions
+    were worded when the response was applied, whatever happens to the survey
+    afterwards. For a webhook that is when the applicant answered; a catch-up
+    fetch after the survey was edited records the newer wording.
     """
 
     class Permissions:
