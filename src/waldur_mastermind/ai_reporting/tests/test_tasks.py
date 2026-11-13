@@ -14,6 +14,7 @@ from waldur_mastermind.ai_reporting.models import (
     HarnessConnection,
     ReportingMessage,
     ReportingSession,
+    ReportingUsageRecord,
 )
 from waldur_mastermind.ai_reporting.tasks import _harness_overrides, ask_harness
 
@@ -37,7 +38,8 @@ class AskHarnessTaskTest(test.APITestCase):
         mock_post.return_value = mock.Mock(
             status_code=200,
             json=lambda: {
-                "answer": "There are 26 projects.", "new_files": ["a.png"],
+                "answer": "There are 26 projects.",
+                "new_files": ["a.png"],
                 "usage": {"input_tokens": 120, "output_tokens": 45},
             },
         )
@@ -54,12 +56,11 @@ class AskHarnessTaskTest(test.APITestCase):
 
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
     def test_missing_usage_defaults_to_zero(self, mock_post):
-        """A harness response with no "usage" key at all (shouldn't happen
-        post-upgrade, but a stale harness pod or a transient bug shouldn't
-        crash the task) must not raise - zero is the honest answer when the
-        cost of this call isn't known."""
+        """A response without "usage" (e.g. from an older harness) records 0,
+        not an error."""
         mock_post.return_value = mock.Mock(
-            status_code=200, json=lambda: {"answer": "ok", "new_files": []},
+            status_code=200,
+            json=lambda: {"answer": "ok", "new_files": []},
         )
         mock_post.return_value.raise_for_status = mock.Mock()
 
@@ -73,10 +74,8 @@ class AskHarnessTaskTest(test.APITestCase):
     def test_identity_headers_use_the_authenticated_users_and_sessions_real_uuids(
         self, mock_post
     ):
-        """Never derive these headers from anything but the message's own
-        session/user - this is the whole IDOR protection for the harness
-        call. The session uuid is what the harness actually keys its
-        conversation store on - see http_service.py."""
+        """Headers come from the message's own session and user, never from
+        the request."""
         mock_post.return_value = mock.Mock(
             status_code=200, json=lambda: {"answer": "ok", "new_files": []}
         )
@@ -109,7 +108,8 @@ class AskHarnessTaskTest(test.APITestCase):
         private_key = Ed25519PrivateKey.generate()
         private_b64 = base64.b64encode(
             private_key.private_bytes(
-                serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                serialization.Encoding.Raw,
+                serialization.PrivateFormat.Raw,
                 serialization.NoEncryption(),
             )
         ).decode()
@@ -125,13 +125,13 @@ class AskHarnessTaskTest(test.APITestCase):
         _, kwargs = mock_post.call_args
         self.assertIn("X-Waldur-Signature", kwargs["headers"])
         self.assertIn("X-Waldur-Signature-Timestamp", kwargs["headers"])
-        # The signed body must be exactly the bytes actually sent (data=),
-        # not some other representation - otherwise the harness's
-        # independently-recomputed signature would never match.
+        # The signature must cover exactly the bytes sent.
         public_key = private_key.public_key()
         message = signing._canonical_message(
             kwargs["headers"]["X-Waldur-Signature-Timestamp"],
-            str(self.user.uuid), "/query", kwargs["data"],
+            str(self.user.uuid),
+            "/query",
+            kwargs["data"],
         )
         public_key.verify(
             base64.b64decode(kwargs["headers"]["X-Waldur-Signature"]), message
@@ -176,9 +176,11 @@ class AskHarnessTaskTest(test.APITestCase):
 
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
     @override_constance_config(
-        AI_REPORTING_MODEL="custom-model", AI_REPORTING_NAME="Bristol Bot",
+        AI_REPORTING_MODEL="custom-model",
+        AI_REPORTING_NAME="Bristol Bot",
         AI_REPORTING_CUSTOM_INSTRUCTIONS="Be terse.",
-        AI_REPORTING_MAX_TURNS=5, AI_REPORTING_HISTORY_LIMIT=10,
+        AI_REPORTING_MAX_TURNS=5,
+        AI_REPORTING_HISTORY_LIMIT=10,
     )
     def test_configured_overrides_are_sent_in_the_request_body(self, mock_post):
         mock_post.return_value = mock.Mock(
@@ -198,13 +200,8 @@ class AskHarnessTaskTest(test.APITestCase):
 
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
     def test_default_config_sends_only_the_name_override(self, mock_post):
-        """Model/custom_instructions/max_turns/history_limit all default to
-        "no override" (empty string / -1) and must be omitted. Name is the
-        one exception: its Constance default is a real, non-empty value
-        (deliberately kept identical to run_agent.DEFAULT_ASSISTANT_NAME, so
-        sending it is always a harmless no-op) - it's only actually omitted
-        once an admin clears it to "" to explicitly defer to the harness's
-        own default instead."""
+        """Unset overrides are omitted. Name is sent by default because its
+        setting has a real default value."""
         mock_post.return_value = mock.Mock(
             status_code=200, json=lambda: {"answer": "ok", "new_files": []}
         )
@@ -219,21 +216,116 @@ class AskHarnessTaskTest(test.APITestCase):
         )
 
 
+class RecordUsageTest(test.APITestCase):
+    """ask_harness leaves a usage record for every outcome, and it survives
+    the message being deleted."""
+
+    def setUp(self):
+        self.user = structure_factories.UserFactory()
+        self.session = ReportingSession.objects.create(user=self.user)
+        self.message = ReportingMessage.objects.create(
+            session=self.session, prompt="How many projects are there?"
+        )
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_success_creates_a_done_usage_record_with_real_tokens(self, mock_post):
+        mock_post.return_value = mock.Mock(
+            status_code=200,
+            json=lambda: {
+                "answer": "26 projects.",
+                "new_files": [],
+                "usage": {"input_tokens": 120, "output_tokens": 45},
+            },
+        )
+        mock_post.return_value.raise_for_status = mock.Mock()
+
+        ask_harness(self.message.pk)
+
+        record = ReportingUsageRecord.objects.get(user=self.user)
+        self.assertEqual(record.status, ReportingUsageRecord.Status.DONE)
+        self.assertEqual(record.input_tokens, 120)
+        self.assertEqual(record.output_tokens, 45)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_network_failure_still_creates_a_failed_usage_record(self, mock_post):
+        mock_post.side_effect = requests.ConnectionError("connection refused")
+
+        ask_harness(self.message.pk)
+
+        record = ReportingUsageRecord.objects.get(user=self.user)
+        self.assertEqual(record.status, ReportingUsageRecord.Status.FAILED)
+        self.assertEqual(record.input_tokens, 0)
+        self.assertEqual(record.output_tokens, 0)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_bad_response_status_still_creates_a_failed_usage_record(self, mock_post):
+        response = requests.Response()
+        response.status_code = 500
+        mock_post.return_value = response
+
+        ask_harness(self.message.pk)
+
+        record = ReportingUsageRecord.objects.get(user=self.user)
+        self.assertEqual(record.status, ReportingUsageRecord.Status.FAILED)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_usage_record_survives_the_message_being_deleted(self, mock_post):
+        mock_post.return_value = mock.Mock(
+            status_code=200,
+            json=lambda: {
+                "answer": "ok",
+                "new_files": [],
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+        )
+        mock_post.return_value.raise_for_status = mock.Mock()
+
+        ask_harness(self.message.pk)
+        self.message.delete()
+
+        record = ReportingUsageRecord.objects.get(user=self.user)
+        self.assertEqual(record.input_tokens, 10)
+        self.assertEqual(record.output_tokens, 5)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_usage_record_survives_the_user_being_deleted(self, mock_post):
+        mock_post.return_value = mock.Mock(
+            status_code=200,
+            json=lambda: {
+                "answer": "ok",
+                "new_files": [],
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+        )
+        mock_post.return_value.raise_for_status = mock.Mock()
+        ask_harness(self.message.pk)
+        record_id = ReportingUsageRecord.objects.get(user=self.user).pk
+
+        self.user.delete()
+
+        record = ReportingUsageRecord.objects.get(pk=record_id)
+        self.assertIsNone(record.user)
+        self.assertEqual(record.input_tokens, 10)
+
+
 class HarnessOverridesTest(test.APITestCase):
     @override_constance_config(
-        AI_REPORTING_MODEL="", AI_REPORTING_NAME="",
+        AI_REPORTING_MODEL="",
+        AI_REPORTING_NAME="",
         AI_REPORTING_CUSTOM_INSTRUCTIONS="",
-        AI_REPORTING_MAX_TURNS=-1, AI_REPORTING_HISTORY_LIMIT=-1,
+        AI_REPORTING_MAX_TURNS=-1,
+        AI_REPORTING_HISTORY_LIMIT=-1,
     )
     def test_empty_defaults_produce_no_overrides(self):
         self.assertEqual(_harness_overrides(), {})
 
-    @override_constance_config(AI_REPORTING_MODEL="anthropic.claude-opus-5-5", AI_REPORTING_NAME="")
+    @override_constance_config(
+        AI_REPORTING_MODEL="anthropic.claude-opus-5-5", AI_REPORTING_NAME=""
+    )
     def test_model_override_included_when_set(self):
         self.assertEqual(_harness_overrides(), {"model": "anthropic.claude-opus-5-5"})
 
     @override_constance_config(AI_REPORTING_MAX_TURNS=0, AI_REPORTING_NAME="")
     def test_max_turns_zero_is_a_real_override_not_treated_as_unset(self):
-        """0 is a valid (if extreme) turn limit - only -1 means 'no
-        override', so this must not be confused with the unset sentinel."""
+        """0 is a real limit; only -1 means no override."""
         self.assertEqual(_harness_overrides(), {"max_turns": 0})

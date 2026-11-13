@@ -3,16 +3,9 @@ from rest_framework import exceptions
 
 
 def check_enabled_roles(request, view, obj=None):
-    """Mirrors waldur_mastermind.chat.views.LLMConfigurationMixin's own
-    AI_ASSISTANT_ENABLED_ROLES check - reads AI_REPORTING_ENABLED_ROLES fresh
-    on every request (not cached at import time), so changing the Constance
-    value takes effect immediately, with no redeploy and no restart.
-
-    No "anonymous" branch, unlike the chat app's equivalent: ai_reporting has
-    no anonymous/unauthenticated mode at all - IsAuthenticated is already a
-    base permission_class on the viewset, so request.user is always a real
-    user here.
-    """
+    """Checks AI_REPORTING_ENABLED_ROLES, read on every request so a change
+    takes effect immediately. Same idea as the chat app's
+    AI_ASSISTANT_ENABLED_ROLES, minus the anonymous mode."""
     enabled_roles = config.AI_REPORTING_ENABLED_ROLES
     user = request.user
 
@@ -29,15 +22,13 @@ def check_enabled_roles(request, view, obj=None):
                 "AI reporting is currently available to staff and support users only."
             )
     elif enabled_roles != "all":
-        raise exceptions.PermissionDenied("AI reporting access is not configured correctly.")
+        raise exceptions.PermissionDenied(
+            "AI reporting access is not configured correctly."
+        )
 
 
 def is_staff_or_support_for_reads(request, view, obj=None):
-    """Staff may change the harness connection; support may only read it.
-
-    Same split as proposal_forms.permissions.is_staff_or_support_for_reads
-    for the Formbricks connection - not reused directly, since that function
-    belongs to a different, unrelated app."""
+    """Staff may change the harness connection; support may only read it."""
     user = request.user
     if user.is_staff:
         return

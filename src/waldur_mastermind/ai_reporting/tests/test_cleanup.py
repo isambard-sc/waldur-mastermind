@@ -20,12 +20,16 @@ class MessageCleanupTest(test.APITestCase):
         session = ReportingSession.objects.create(user=user)
         now = timezone.now()
 
-        self.recent_message = ReportingMessage.objects.create(session=session, prompt="recent")
+        self.recent_message = ReportingMessage.objects.create(
+            session=session, prompt="recent"
+        )
         ReportingMessage.objects.filter(pk=self.recent_message.pk).update(
             created=now - timedelta(days=10)
         )
 
-        self.old_message = ReportingMessage.objects.create(session=session, prompt="old")
+        self.old_message = ReportingMessage.objects.create(
+            session=session, prompt="old"
+        )
         ReportingMessage.objects.filter(pk=self.old_message.pk).update(
             created=now - timedelta(days=100)
         )
@@ -35,8 +39,12 @@ class MessageCleanupTest(test.APITestCase):
         result = tasks.cleanup_old_reporting_messages()
 
         self.assertEqual(result, {"status": "ok", "deleted_count": 1})
-        self.assertTrue(ReportingMessage.objects.filter(pk=self.recent_message.pk).exists())
-        self.assertFalse(ReportingMessage.objects.filter(pk=self.old_message.pk).exists())
+        self.assertTrue(
+            ReportingMessage.objects.filter(pk=self.recent_message.pk).exists()
+        )
+        self.assertFalse(
+            ReportingMessage.objects.filter(pk=self.old_message.pk).exists()
+        )
 
     @override_constance_config(AI_REPORTING_MESSAGE_RETENTION_DAYS=-1)
     def test_cleanup_disabled(self):
@@ -48,7 +56,8 @@ class MessageCleanupTest(test.APITestCase):
     @override_constance_config(AI_REPORTING_MESSAGE_RETENTION_DAYS=90)
     def test_cleanup_cascades_to_attached_files_and_frees_their_bytes(self):
         reporting_file = ReportingFile.objects.create(
-            message=self.old_message, name="chart.png",
+            message=self.old_message,
+            name="chart.png",
             file=ContentFile(b"fake png bytes", name="chart.png"),
         )
         stored_file = reporting_file.file
@@ -73,16 +82,22 @@ class FileCleanupTest(test.APITestCase):
         now = timezone.now()
 
         self.recent_file = ReportingFile.objects.create(
-            message=self.message, name="recent.png",
+            message=self.message,
+            name="recent.png",
             file=ContentFile(b"recent bytes", name="recent.png"),
         )
-        ReportingFile.objects.filter(pk=self.recent_file.pk).update(created=now - timedelta(days=5))
+        ReportingFile.objects.filter(pk=self.recent_file.pk).update(
+            created=now - timedelta(days=5)
+        )
 
         self.old_file = ReportingFile.objects.create(
-            message=self.message, name="old.png",
+            message=self.message,
+            name="old.png",
             file=ContentFile(b"old bytes", name="old.png"),
         )
-        ReportingFile.objects.filter(pk=self.old_file.pk).update(created=now - timedelta(days=30))
+        ReportingFile.objects.filter(pk=self.old_file.pk).update(
+            created=now - timedelta(days=30)
+        )
 
     @override_constance_config(AI_REPORTING_FILE_RETENTION_DAYS=21)
     def test_cleanup_deletes_only_old_files_and_keeps_the_message(self):
@@ -94,9 +109,7 @@ class FileCleanupTest(test.APITestCase):
         self.assertTrue(ReportingFile.objects.filter(pk=self.recent_file.pk).exists())
         self.assertFalse(ReportingFile.objects.filter(pk=self.old_file.pk).exists())
         self.assertFalse(old_stored_file.storage.exists(old_stored_file.name))
-        # The file is gone, but the message it was attached to is not -
-        # file retention is deliberately shorter/separate from message
-        # retention, see the Constance settings' own descriptions.
+        # The message stays - file retention is separate from message retention.
         self.assertTrue(ReportingMessage.objects.filter(pk=self.message.pk).exists())
 
     @override_constance_config(AI_REPORTING_FILE_RETENTION_DAYS=-1)
@@ -108,17 +121,21 @@ class FileCleanupTest(test.APITestCase):
 
     @override_constance_config(AI_REPORTING_FILE_RETENTION_DAYS=21)
     def test_cleanup_processes_more_than_one_chunk(self):
-        """Chunked deletion (_FILE_CLEANUP_CHUNK_SIZE) must still get
-        everything, not just the first chunk."""
+        """Deletes everything, not just the first chunk."""
         now = timezone.now()
         for i in range(tasks._FILE_CLEANUP_CHUNK_SIZE + 5):
             extra = ReportingFile.objects.create(
-                message=self.message, name=f"extra-{i}.png",
+                message=self.message,
+                name=f"extra-{i}.png",
                 file=ContentFile(b"x", name=f"extra-{i}.png"),
             )
-            ReportingFile.objects.filter(pk=extra.pk).update(created=now - timedelta(days=30))
+            ReportingFile.objects.filter(pk=extra.pk).update(
+                created=now - timedelta(days=30)
+            )
 
         result = tasks.cleanup_old_reporting_files()
 
-        self.assertEqual(result["deleted_count"], tasks._FILE_CLEANUP_CHUNK_SIZE + 5 + 1)  # +1 is self.old_file
+        self.assertEqual(
+            result["deleted_count"], tasks._FILE_CLEANUP_CHUNK_SIZE + 5 + 1
+        )  # +1 is self.old_file
         self.assertTrue(ReportingFile.objects.filter(pk=self.recent_file.pk).exists())

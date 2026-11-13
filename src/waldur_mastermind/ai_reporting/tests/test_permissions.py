@@ -45,8 +45,6 @@ class CheckEnabledRolesTest(test.APITestCase):
 
     @override_constance_config(AI_REPORTING_ENABLED_ROLES="something-unexpected")
     def test_unrecognised_value_fails_closed(self):
-        """An unrecognised value must deny access, not silently behave like
-        "all" - failing open on a typo/misconfiguration would be the worse
-        failure mode for an access-control setting."""
+        """A typo in the setting must deny access, not allow everyone."""
         with self.assertRaises(PermissionDenied):
             check_enabled_roles(_Request(self.staff), view=None)

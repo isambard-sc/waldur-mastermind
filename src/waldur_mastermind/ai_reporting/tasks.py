@@ -13,30 +13,23 @@ from waldur_mastermind.ai_reporting.models import (
     HarnessConnection,
     ReportingFile,
     ReportingMessage,
+    ReportingUsageRecord,
 )
 
 logger = logging.getLogger(__name__)
 
-# Files are deleted one chunk at a time, unlike the message cleanup below -
-# each one also does real storage I/O (ReportingFile.file.delete(), via the
-# post_delete signal in handlers.py), not just a DB row, so a single huge
-# .delete() call would hold a long transaction open on top of lots of I/O.
+# Files are deleted in chunks: each delete also removes the stored file, so
+# one big delete would hold a long transaction open.
 _FILE_CLEANUP_CHUNK_SIZE = 100
 
-# A single file fetch is just a read of bytes the harness already produced -
-# nowhere near as slow as a /query turn, but still bounded so one bad
-# download can't hold up the task indefinitely. Not Constance-driven like the
-# /query timeout below - it's a much smaller, less variable operation with no
-# admin-facing reason to tune it separately.
+# Fetching a finished file is quick; this just stops one bad download from
+# hanging the task.
 _HARNESS_FILE_TIMEOUT_SECONDS = 60
 
 
 def _harness_overrides() -> dict:
-    """The admin-configurable AI_REPORTING_* Constance overrides, as the
-    optional fields http_service.py's /query accepts - only included when
-    set away from their "no override" default (empty string / -1), so an
-    admin who hasn't touched a setting gets exactly today's harness
-    behavior, not a value that happens to match its own hardcoded default."""
+    """Admin overrides for the harness, sent only when set, so untouched
+    settings keep the harness's own defaults."""
     overrides = {}
     if config.AI_REPORTING_MODEL:
         overrides["model"] = config.AI_REPORTING_MODEL
@@ -51,22 +44,18 @@ def _harness_overrides() -> dict:
     return overrides
 
 
-def _copy_files_from_harness(message: ReportingMessage, user, filenames: list[str]) -> None:
-    """Copy each file the harness reported into its own ReportingFile row.
-
-    Best-effort per file: one failing download is logged and skipped rather
-    than failing the whole message - the text answer is still good even if a
-    chart didn't copy across.
-    """
+def _copy_files_from_harness(
+    message: ReportingMessage, user, filenames: list[str]
+) -> None:
+    """Copy each reported file into a ReportingFile. A failed download is
+    logged and skipped - the text answer is still useful without it."""
     harness_url = HarnessConnection.get().base_url
     for filename in filenames:
         path = f"/files/{filename}"
         try:
             response = requests.get(
                 f"{harness_url}{path}",
-                # Same headers as the /query call above - the harness keys
-                # its conversation store on the user id alone today, but
-                # sending both keeps this call consistent with that one.
+                # Same headers as the /query call in ask_harness.
                 headers={
                     "X-Waldur-User-Id": str(user.uuid),
                     "X-Waldur-Session-Id": str(message.session.uuid),
@@ -77,23 +66,33 @@ def _copy_files_from_harness(message: ReportingMessage, user, filenames: list[st
             response.raise_for_status()
         except requests.RequestException:
             logger.exception(
-                "ask_harness: could not fetch file %r for message %s", filename, message.pk
+                "ask_harness: could not fetch file %r for message %s",
+                filename,
+                message.pk,
             )
             continue
         ReportingFile.objects.create(
-            message=message, name=filename, file=ContentFile(response.content, name=filename)
+            message=message,
+            name=filename,
+            file=ContentFile(response.content, name=filename),
         )
+
+
+def _record_usage(message: ReportingMessage, user) -> None:
+    """Write the permanent usage record for a finished message, whether it
+    succeeded or failed."""
+    ReportingUsageRecord.objects.create(
+        user=user,
+        status=message.status,
+        input_tokens=message.input_tokens,
+        output_tokens=message.output_tokens,
+    )
 
 
 @shared_task(name="waldur_mastermind.ai_reporting.ask_harness")
 def ask_harness(message_id: int):
-    """Call the AI reporting harness for one ReportingMessage and record the result.
-
-    Runs in a Celery worker, not a web request - a single call to the harness
-    can take several minutes, and a Django web worker is meant to respond
-    quickly and move on to the next request, not sit blocked waiting on one
-    slow external call for that long.
-    """
+    """Ask the harness one question and save the result. Runs in Celery
+    because a single question can take several minutes."""
     try:
         message = ReportingMessage.objects.select_related("session__user").get(
             pk=message_id
@@ -105,20 +104,15 @@ def ask_harness(message_id: int):
     user = message.session.user
 
     try:
-        # Built and encoded by hand (not requests' own json= convenience) so
-        # the exact bytes being sent are known up front - signing has to sign
-        # precisely what goes over the wire, not whatever requests happens to
-        # produce internally.
-        body = json.dumps({"prompt": message.prompt, **_harness_overrides()}).encode("utf-8")
+        # Encoded by hand so we sign exactly the bytes that are sent.
+        body = json.dumps({"prompt": message.prompt, **_harness_overrides()}).encode(
+            "utf-8"
+        )
         response = requests.post(
             f"{HarnessConnection.get().base_url}/query",
             headers={
-                # Keys the harness's own conversation store - a user may have
-                # several sessions (one per browser tab) running concurrently,
-                # each with its own harness-side conversation. The user id is
-                # sent too, even though the harness doesn't act on it yet,
-                # since it's real identity (unlike the session uuid) and is
-                # useful in the harness's own logs.
+                # The harness keys conversations on the user id; it doesn't
+                # read the session id yet.
                 "X-Waldur-User-Id": str(user.uuid),
                 "X-Waldur-Session-Id": str(message.session.uuid),
                 "Content-Type": "application/json",
@@ -136,6 +130,7 @@ def ask_harness(message_id: int):
         message.status = ReportingMessage.Status.FAILED
         message.error_message = str(exc)
         message.save(update_fields=["status", "error_message", "modified"])
+        _record_usage(message, user)
         return
     except ValueError:
         logger.exception(
@@ -145,6 +140,7 @@ def ask_harness(message_id: int):
         message.status = ReportingMessage.Status.FAILED
         message.error_message = "The harness returned an unexpected response."
         message.save(update_fields=["status", "error_message", "modified"])
+        _record_usage(message, user)
         return
 
     usage = payload.get("usage") or {}
@@ -155,10 +151,15 @@ def ask_harness(message_id: int):
     message.output_tokens = usage.get("output_tokens", 0)
     message.save(
         update_fields=[
-            "status", "answer", "new_files",
-            "input_tokens", "output_tokens", "modified",
+            "status",
+            "answer",
+            "new_files",
+            "input_tokens",
+            "output_tokens",
+            "modified",
         ]
     )
+    _record_usage(message, user)
 
     if message.new_files:
         _copy_files_from_harness(message, user, message.new_files)
@@ -166,12 +167,9 @@ def ask_harness(message_id: int):
 
 @shared_task(name="waldur_mastermind.ai_reporting.cleanup_old_reporting_messages")
 def cleanup_old_reporting_messages():
-    """Delete AI reporting questions/answers older than
-    AI_REPORTING_MESSAGE_RETENTION_DAYS. Cascades to any attached
-    ReportingFile rows; handlers.on_reporting_file_deleted frees their bytes
-    from storage too, so this doesn't orphan anything even for a message
-    whose files weren't already cleaned up by cleanup_old_reporting_files
-    below."""
+    """Delete messages older than AI_REPORTING_MESSAGE_RETENTION_DAYS. Their
+    files are deleted too, including the stored bytes. Usage records are
+    kept."""
     retention_days = config.AI_REPORTING_MESSAGE_RETENTION_DAYS
     if retention_days < 0:
         logger.info("Reporting message cleanup skipped: retention is disabled")
@@ -185,17 +183,17 @@ def cleanup_old_reporting_messages():
 
     logger.info(
         "Deleted %d AI reporting message(s) older than %d days (cutoff %s)",
-        count, retention_days, cutoff.date(),
+        count,
+        retention_days,
+        cutoff.date(),
     )
     return {"status": "ok", "deleted_count": count}
 
 
 @shared_task(name="waldur_mastermind.ai_reporting.cleanup_old_reporting_files")
 def cleanup_old_reporting_files():
-    """Delete just the generated files (charts, PDFs, CSVs) older than
-    AI_REPORTING_FILE_RETENTION_DAYS - normally shorter than the message
-    retention above, so a question's text/answer is kept around longer than
-    its (bigger, more expensive) attachments."""
+    """Delete generated files older than AI_REPORTING_FILE_RETENTION_DAYS.
+    Usually shorter than message retention, since files are bigger."""
     retention_days = config.AI_REPORTING_FILE_RETENTION_DAYS
     if retention_days < 0:
         logger.info("Reporting file cleanup skipped: retention is disabled")
@@ -216,6 +214,8 @@ def cleanup_old_reporting_files():
 
     logger.info(
         "Deleted %d AI reporting file(s) older than %d days (cutoff %s)",
-        total_deleted, retention_days, cutoff.date(),
+        total_deleted,
+        retention_days,
+        cutoff.date(),
     )
     return {"status": "ok", "deleted_count": total_deleted}

@@ -11,9 +11,7 @@ from waldur_mastermind.ai_reporting.models import (
 
 class ReportingSessionModelTest(test.APITestCase):
     def test_a_user_can_have_several_sessions(self):
-        """Unlike chat's ChatSession, this isn't a per-user singleton - a user
-        may have several independent AI-reporting conversations at once (e.g.
-        one per open browser tab)."""
+        """Unlike chat's ChatSession, a user can have several sessions at once."""
         user = structure_factories.UserFactory()
         ReportingSession.objects.create(user=user)
         ReportingSession.objects.create(user=user)
@@ -48,9 +46,7 @@ class ReportingMessageModelTest(test.APITestCase):
     def test_deleting_session_deletes_messages(self):
         message = ReportingMessage.objects.create(session=self.session, prompt="x")
         self.session.delete()
-        self.assertFalse(
-            ReportingMessage.objects.filter(pk=message.pk).exists()
-        )
+        self.assertFalse(ReportingMessage.objects.filter(pk=message.pk).exists())
 
 
 class HarnessConnectionModelTest(test.APITestCase):
@@ -61,18 +57,15 @@ class HarnessConnectionModelTest(test.APITestCase):
         self.assertEqual(connection.pk, 1)
 
     def test_get_always_returns_the_same_row(self):
-        """A second get() must not create a second row - there is only ever
-        one AI reporting harness this site talks to."""
+        """get() never creates a second row."""
         first = HarnessConnection.get()
         second = HarnessConnection.get()
         self.assertEqual(first.pk, second.pk)
         self.assertEqual(HarnessConnection.objects.count(), 1)
 
     def test_default_base_url_points_at_the_in_cluster_service(self):
-        """A freshly-created row must already be usable without an admin
-        having to configure anything first - the harness is always deployed
-        at this same address by convention (see manifests/service.yaml in
-        the waldur-ai-harness repo)."""
+        """A new row works without configuration - the harness is always
+        deployed at this address."""
         connection = HarnessConnection.get()
         self.assertEqual(
             connection.base_url,
@@ -97,8 +90,7 @@ class HarnessConnectionModelTest(test.APITestCase):
             connection.full_clean()
 
     def test_accepts_a_bare_in_cluster_hostname(self):
-        """Not Django's own URLValidator: that insists on a dotted domain,
-        which an in-cluster Service name like this one never has."""
+        """Django's URLValidator would reject this, since it has no dot."""
         connection = HarnessConnection.get()
         connection.base_url = "http://waldur-harness:8000"
         connection.full_clean()  # must not raise

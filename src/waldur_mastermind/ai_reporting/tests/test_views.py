@@ -12,14 +12,12 @@ from waldur_mastermind.ai_reporting.models import (
     ReportingFile,
     ReportingMessage,
     ReportingSession,
+    ReportingUsageRecord,
 )
 
 
 class FeatureEnabledSwitchTest(test.APITestCase):
-    """AI_REPORTING_ENABLED (ConstanceCheckExtensionMixin, same mechanism the
-    chat app's AI_ASSISTANT_ENABLED uses) must gate the whole viewset, not
-    just ask - list/retrieve included, matching chat's own MessageViewSet
-    convention of treating the feature as entirely unavailable when off."""
+    """AI_REPORTING_ENABLED gates every action, not just ask."""
 
     def setUp(self):
         self.staff = structure_factories.UserFactory(is_staff=True)
@@ -38,17 +36,15 @@ class FeatureEnabledSwitchTest(test.APITestCase):
         self.assertEqual(response.status_code, status.HTTP_424_FAILED_DEPENDENCY)
 
     def test_ask_works_normally_once_enabled_again(self):
-        # Default is True - no override needed, just confirming the baseline
-        # the two tests above are deviating from.
+        # Enabled by default.
         with mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay"):
             response = self.client.post(self.ask_url, {"prompt": "How many projects?"})
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
 
 
 class AskUsageLimitTest(test.APITestCase):
-    """Confirms limits.enforce_usage_limits is actually wired into the ask
-    action (see ai_reporting.tests.test_limits for the limit logic itself) -
-    rejected before anything is created, not just logged after the fact."""
+    """ask rejects over-limit requests before creating anything. The limit
+    logic itself is tested in test_limits."""
 
     def setUp(self):
         self.staff = structure_factories.UserFactory(is_staff=True)
@@ -57,11 +53,10 @@ class AskUsageLimitTest(test.APITestCase):
 
     @override_constance_config(AI_REPORTING_TOKEN_LIMIT_DAILY=10)
     def test_ask_is_rejected_once_the_daily_limit_is_reached(self):
-        session = ReportingSession.objects.create(user=self.staff)
-        ReportingMessage.objects.create(
-            session=session,
-            prompt="earlier",
-            status=ReportingMessage.Status.DONE,
+        # The limit reads usage records, not messages.
+        ReportingUsageRecord.objects.create(
+            user=self.staff,
+            status=ReportingUsageRecord.Status.DONE,
             input_tokens=6,
             output_tokens=5,  # 11 >= 10
         )
@@ -174,10 +169,8 @@ class AskActionTest(test.APITestCase):
 
     @mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay")
     def test_new_session_actually_creates_a_second_session_row(self, mock_delay):
-        """The whole point of many-per-user: new_session must mint a distinct
-        ReportingSession, not just reset something inside the existing one -
-        otherwise two browser tabs could never get independent, concurrently
-        runnable conversations."""
+        """new_session creates a separate session, so two tabs can run
+        independently."""
         self.client.post(self.ask_url, {"prompt": "first"})
         self.client.post(self.ask_url, {"prompt": "second", "new_session": True})
 
@@ -276,9 +269,8 @@ class ReportingMessageViewSetTest(test.APITestCase):
 
 
 class UsageStatsTest(test.APITestCase):
-    """usage_stats is deliberately the one action in this viewset that is
-    NOT scoped to the caller's own messages - these tests specifically
-    confirm it sees every user's usage, unlike list/retrieve."""
+    """usage_stats covers every user, not just the caller. It reads usage
+    records, so these tests create those directly."""
 
     def setUp(self):
         self.staff = structure_factories.UserFactory(
@@ -291,11 +283,9 @@ class UsageStatsTest(test.APITestCase):
         self.url = reverse("ai-reporting-message-usage-stats")
 
     def _message(self, user, input_tokens, output_tokens):
-        session = ReportingSession.objects.create(user=user)
-        return ReportingMessage.objects.create(
-            session=session,
-            prompt="x",
-            status=ReportingMessage.Status.DONE,
+        return ReportingUsageRecord.objects.create(
+            user=user,
+            status=ReportingUsageRecord.Status.DONE,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         )
@@ -335,7 +325,7 @@ class UsageStatsTest(test.APITestCase):
 
         today_message = self._message(self.staff, input_tokens=10, output_tokens=5)
         yesterday_message = self._message(self.staff, input_tokens=20, output_tokens=10)
-        ReportingMessage.objects.filter(pk=yesterday_message.pk).update(
+        ReportingUsageRecord.objects.filter(pk=yesterday_message.pk).update(
             created=timezone.now() - datetime.timedelta(days=1)
         )
 
@@ -343,10 +333,7 @@ class UsageStatsTest(test.APITestCase):
 
         self.assertEqual(len(response.data["daily"]), 2)
         self.assertEqual(response.data["period_days"], 7)
-        # response.data holds raw Python objects (DATE_FORMAT is None
-        # project-wide - see base_settings.py - so DateField passes the
-        # native date through unconverted here; actual JSON responses handle
-        # serialization separately), so compare against a date object too.
+        # response.data holds a date object, not a string, since DATE_FORMAT is None.
         today_date = today_message.created.date()
         by_date = {row["date"]: row for row in response.data["daily"]}
         self.assertEqual(by_date[today_date]["input_tokens"], 10)
@@ -357,7 +344,7 @@ class UsageStatsTest(test.APITestCase):
         from django.utils import timezone
 
         old_message = self._message(self.staff, input_tokens=999, output_tokens=999)
-        ReportingMessage.objects.filter(pk=old_message.pk).update(
+        ReportingUsageRecord.objects.filter(pk=old_message.pk).update(
             created=timezone.now() - datetime.timedelta(days=40)
         )
 
@@ -384,14 +371,34 @@ class UsageStatsTest(test.APITestCase):
         self.assertEqual(response.data["daily"], [])
         self.assertEqual(response.data["by_user"], [])
 
+    def test_usage_survives_the_message_that_produced_it_being_deleted(self):
+        # Usage must survive the message being deleted.
+        session = ReportingSession.objects.create(user=self.staff)
+        message = ReportingMessage.objects.create(
+            session=session,
+            prompt="x",
+            status=ReportingMessage.Status.DONE,
+            input_tokens=10,
+            output_tokens=5,
+        )
+        ReportingUsageRecord.objects.create(
+            user=self.staff,
+            status=ReportingUsageRecord.Status.DONE,
+            input_tokens=10,
+            output_tokens=5,
+        )
+
+        message.delete()
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.data["total_input_tokens"], 10)
+        self.assertEqual(response.data["total_output_tokens"], 5)
+        self.assertEqual(response.data["total_requests"], 1)
+
 
 class EnabledRolesIntegrationTest(test.APITestCase):
-    """Confirms permissions.check_enabled_roles is actually wired into the
-    real endpoints (unit coverage of the check itself lives in
-    test_permissions.py), and specifically that usage_stats is NOT affected
-    by it - that endpoint stays staff/support-only regardless, since seeing
-    every other user's usage is a different boundary than being allowed to
-    use the tool at all."""
+    """check_enabled_roles is applied to the real endpoints, except
+    usage_stats, which stays staff/support only."""
 
     def setUp(self):
         self.ask_url = reverse("ai-reporting-message-ask")
@@ -539,8 +546,7 @@ class ReportingSessionViewSetTest(test.APITestCase):
             session=self.session, prompt="second question", answer="second answer"
         )
 
-        # Every message aged out via AI_REPORTING_MESSAGE_RETENTION_DAYS leaves exactly
-        # this behind: a session row with no messages left to preview.
+        # What's left once retention cleanup removes every message.
         self.empty_session = ReportingSession.objects.create(user=self.staff)
 
         self.other_session = ReportingSession.objects.create(user=self.other_staff)
@@ -607,9 +613,7 @@ _FAKE_KEY = base64.b64encode(b"0" * 32).decode()
 
 
 class HarnessConnectionApiTest(test.APITestCase):
-    """Same read/write split, and the same write-only-secret shape, as
-    proposal_forms.tests.test_api.ConnectionApiTest for FormbricksConnection
-    - this is the same kind of value, configured the same way."""
+    """Same read/write split as the Formbricks connection API."""
 
     url = "/api/ai-reporting-harness-connection/"
 

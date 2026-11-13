@@ -22,7 +22,9 @@ def _keypair():
     public_bytes = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
     )
-    return base64.b64encode(private_bytes).decode(), base64.b64encode(public_bytes).decode()
+    return base64.b64encode(private_bytes).decode(), base64.b64encode(
+        public_bytes
+    ).decode()
 
 
 def _set_private_key(value: str) -> None:
@@ -44,9 +46,7 @@ class SignRequestTest(test.APITestCase):
         self.assertIn(signing.SIGNATURE_HEADER, headers)
 
     def test_signature_actually_verifies_against_the_public_key(self):
-        """Round-trips the real cryptography, not just checking headers
-        exist - proves the signing and verifying halves actually agree on
-        the same canonical message format."""
+        """Checks the signature really verifies, not just that headers exist."""
         private_b64, public_b64 = _keypair()
         _set_private_key(private_b64)
         headers = signing.sign_request("user-1", "/query", b'{"prompt": "hi"}')
@@ -65,7 +65,12 @@ class SignRequestTest(test.APITestCase):
 
         public_key = Ed25519PublicKey.from_public_bytes(base64.b64decode(public_b64))
         tampered_message = signing._canonical_message(
-            headers[signing.TIMESTAMP_HEADER], "user-1", "/query", b'{"prompt": "tampered"}'
+            headers[signing.TIMESTAMP_HEADER],
+            "user-1",
+            "/query",
+            b'{"prompt": "tampered"}',
         )
         with self.assertRaises(InvalidSignature):
-            public_key.verify(base64.b64decode(headers[signing.SIGNATURE_HEADER]), tampered_message)
+            public_key.verify(
+                base64.b64decode(headers[signing.SIGNATURE_HEADER]), tampered_message
+            )

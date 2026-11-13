@@ -1,18 +1,9 @@
-"""Token/request limits for the AI reporting feature.
+"""Token and request limits for AI reporting (the AI_REPORTING_TOKEN_LIMIT_*
+and AI_REPORTING_GLOBAL_* settings).
 
-See the AI_REPORTING_TOKEN_LIMIT_*/AI_REPORTING_GLOBAL_* Constance settings.
-
-Deliberately a simple query-based check against ReportingMessage rows, not
-chat's budget_gate.py's locked singleton-counter model: ai_reporting is a
-low-volume, staff/support-only internal tool, not public-facing, so the tiny
-race window of two concurrent requests both reading "under limit" before
-either is recorded is an acceptable trade-off against the real cost of
-replicating that machinery here. The actual purpose of these limits is a
-credible, visible safety net answering a wider-team perception that this
-feature is expensive, not hard real-time enforcement against genuine abuse.
-All limits default to -1
-(unlimited) except the global daily budget and the per-minute burst cap,
-which default to the AI Assistant's own already-chosen numbers.
+A simple query-based check rather than chat's locked counter: this is a
+low-volume internal tool, so two requests racing past a limit together is
+acceptable. -1 means unlimited.
 """
 
 from datetime import timedelta
@@ -22,7 +13,7 @@ from django.db.models import F, Sum
 from django.utils import timezone
 from rest_framework.exceptions import Throttled
 
-from waldur_mastermind.ai_reporting.models import ReportingMessage
+from waldur_mastermind.ai_reporting.models import ReportingMessage, ReportingUsageRecord
 
 UNLIMITED = -1
 
@@ -35,8 +26,10 @@ _PER_USER_TOKEN_LIMITS = (
 
 
 def _tokens_used_since(since, **filters) -> int:
+    # Reads usage records, not messages: messages can be cleaned up before
+    # the weekly/monthly window ends, which would reset the limit early.
     total = (
-        ReportingMessage.objects.filter(created__gte=since, **filters)
+        ReportingUsageRecord.objects.filter(created__gte=since, **filters)
         .aggregate(total=Sum(F("input_tokens") + F("output_tokens")))
         .get("total")
     )
@@ -44,16 +37,14 @@ def _tokens_used_since(since, **filters) -> int:
 
 
 def enforce_usage_limits(user) -> None:
-    """Raise rest_framework.exceptions.Throttled (429) if `user` asking a
-    question right now would exceed any configured limit. Call before
-    creating a ReportingMessage/dispatching ask_harness - rejecting up front
-    is better UX than creating a message a Celery task later fails, and
-    avoids paying for a Bedrock call that was always going to be over
-    budget."""
+    """Raise Throttled (429) if a new question from `user` would exceed a
+    limit. Called before the message is created, so nothing is spent."""
     now = timezone.now()
 
     burst_limit = config.AI_REPORTING_GLOBAL_REQUESTS_PER_MINUTE
     if burst_limit != UNLIMITED:
+        # Reads messages, not usage records: messages are created when the
+        # question arrives, usage records only once it's answered.
         recent_requests = ReportingMessage.objects.filter(
             created__gte=now - timedelta(minutes=1)
         ).count()
@@ -67,7 +58,7 @@ def enforce_usage_limits(user) -> None:
         limit = getattr(config, setting_name)
         if limit == UNLIMITED:
             continue
-        used = _tokens_used_since(now - window, session__user=user)
+        used = _tokens_used_since(now - window, user=user)
         if used >= limit:
             raise Throttled(
                 detail=f"You've reached your {label} AI reporting token limit. Please try again later.",

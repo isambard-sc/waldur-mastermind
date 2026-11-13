@@ -1,20 +1,9 @@
-"""Signs each call to the AI reporting harness with Waldur's own Ed25519
-private key, so the harness can verify a request genuinely came from
-Waldur - not just from something that can reach its NetworkPolicy-
-restricted port. See request_signing.py in the waldur-ai-harness repo for
-the verifying half and the fuller design rationale.
+"""Signs each call to the AI reporting harness with an Ed25519 private key,
+so the harness can check it really came from Waldur. The harness only holds
+the public key (see request_signing.py in waldur-ai-harness). Does nothing
+while no private key is set.
 
-Asymmetric by design, not a shared secret: only this (private) key is ever
-a secret Waldur has to protect; the harness only ever holds the
-corresponding public key (see models.HarnessConnection.signing_private_key),
-which isn't sensitive at all - a leak of the harness's copy is a non-event,
-unlike a shared secret that would need rotating on both sides.
-
-Inert when the connection's signing_private_key isn't set (blank, the
-default) - sign_request() just returns no extra headers, and every request
-goes out exactly as it did before this existed.
-
-Generate a real keypair with:
+Generate a keypair with:
     python -c "
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives import serialization
@@ -25,10 +14,8 @@ Generate a real keypair with:
     print('private (Waldur, keep secret):', base64.b64encode(priv).decode())
     print('public (harness, not secret): ', base64.b64encode(pub).decode())
     "
-The private half goes into HarnessConnection.signing_private_key (via the
-API, encrypted at rest - see models.py); the public half goes to the
-harness's WALDUR_SIGNING_PUBLIC_KEY - see request_signing.py in the
-waldur-ai-harness repo.
+The private key goes into HarnessConnection.signing_private_key; the public
+key goes into the harness's WALDUR_SIGNING_PUBLIC_KEY.
 """
 
 import base64
@@ -44,21 +31,21 @@ TIMESTAMP_HEADER = "X-Waldur-Signature-Timestamp"
 
 
 def _canonical_message(timestamp: str, identity: str, path: str, body: bytes) -> bytes:
-    """Must match request_signing._canonical_message byte for byte on the
-    harness side - timestamp, the claimed identity, the request path, and a
-    hash of the body, so a valid signature is bound to exactly this request
-    and cannot be replayed for a different identity, path, or payload."""
+    """Must match the harness's request_signing._canonical_message exactly.
+    Covers identity, path and body, so a signature can't be reused for a
+    different request."""
     body_hash = hashlib.sha256(body).hexdigest()
     return f"{timestamp}.{identity}.{path}.{body_hash}".encode()
 
 
 def sign_request(identity: str, path: str, body: bytes) -> dict[str, str]:
-    """Headers to add to a call to the harness - an empty dict if no signing
-    key is configured, so the request goes out unsigned exactly as before."""
+    """Signature headers for a harness call, or {} if no key is set."""
     private_key_b64 = HarnessConnection.get().signing_private_key
     if not private_key_b64:
         return {}
-    private_key = Ed25519PrivateKey.from_private_bytes(base64.b64decode(private_key_b64))
+    private_key = Ed25519PrivateKey.from_private_bytes(
+        base64.b64decode(private_key_b64)
+    )
     timestamp = str(int(time.time()))
     signature = private_key.sign(_canonical_message(timestamp, identity, path, body))
     return {

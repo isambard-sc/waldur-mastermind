@@ -24,6 +24,7 @@ from waldur_mastermind.ai_reporting.models import (
     ReportingFile,
     ReportingMessage,
     ReportingSession,
+    ReportingUsageRecord,
 )
 
 _USAGE_STATS_MAX_DAYS = 365
@@ -45,23 +46,9 @@ _USAGE_STATS_DEFAULT_DAYS = 30
 class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
     """Ask the AI reporting harness a question and poll for its answer.
 
-    Messages are created only via `ask` - direct create/update/destroy are
-    disabled so a client can never fabricate a message's status/answer or
-    bypass the harness call entirely.
-
-    ConstanceCheckExtensionMixin (same mechanism the chat app's
-    LLMConfigurationMixin uses for AI_ASSISTANT_ENABLED) raises a 424 for
-    every action - list and retrieve included, not just ask - while
-    AI_REPORTING_ENABLED is off, matching that app's own convention of
-    treating the whole feature as unavailable, not just the ability to ask
-    something new.
-
-    permissions.check_enabled_roles (mirroring the same app's
-    AI_ASSISTANT_ENABLED_ROLES check) further restricts list/retrieve/ask to
-    whichever roles AI_REPORTING_ENABLED_ROLES currently names - read fresh
-    on every request, so an admin's change takes effect immediately, no
-    redeploy. usage_stats is the one action that does NOT use this check;
-    see its own permissions comment for why.
+    Messages are only created via `ask`, so a client can't fabricate a
+    status or answer. Every action returns 424 while AI_REPORTING_ENABLED is
+    off, and all but usage_stats are limited to AI_REPORTING_ENABLED_ROLES.
     """
 
     extension_name = "AI_REPORTING"
@@ -74,15 +61,10 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
     disabled_actions = ["create", "update", "partial_update", "destroy"]
 
     def get_queryset(self):
-        # Staff/support-scoped feature (see ask_permissions), but each user -
-        # staff included - only ever sees their own AI reporting history here.
-        # This view makes no claim about who may use the feature; that's
-        # ask_permissions' job.
+        # Everyone, staff included, only sees their own messages.
         queryset = super().get_queryset().filter(session__user=self.request.user)
 
-        # Lets the frontend restore one conversation's own messages (e.g. on
-        # mount, after the page was navigated away from and back) instead of
-        # always listing every session the caller has ever had.
+        # Lets the frontend restore a single conversation.
         session_uuid = self.request.query_params.get("session", "")
         if session_uuid:
             queryset = queryset.filter(session__uuid=session_uuid)
@@ -97,13 +79,9 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
     @extend_schema(
         summary="Ask the AI reporting harness a question",
         description=(
-            "Enqueues the question for the harness against one of the caller's AI "
-            "reporting sessions (a user may have several, e.g. one per open browser "
-            "tab) and returns immediately - poll the returned message's detail "
-            "endpoint for the answer, since a single question can take several "
-            "minutes. Pass 'session' to continue a specific one, or 'new_session' "
-            "to start a fresh one; with neither, the most recently used session is "
-            "reused (or created, for a first-time caller)."
+            "Queues the question and returns immediately - poll the returned "
+            "message for the answer. Pass 'session' to continue a conversation or "
+            "'new_session' to start one; with neither, the latest session is reused."
         ),
         responses={202: serializers.ReportingMessageSerializer},
     )
@@ -112,11 +90,7 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
         request_serializer = self.get_serializer(data=request.data)
         request_serializer.is_valid(raise_exception=True)
 
-        # Reject before creating anything if this would exceed a configured
-        # AI_REPORTING_TOKEN_LIMIT_*/GLOBAL_* Constance limit - see
-        # ai_reporting.limits. Raises rest_framework.exceptions.Throttled
-        # (429) directly; DRF's own exception handling turns that into the
-        # response.
+        # 429 before anything is created if a usage limit is reached.
         limits.enforce_usage_limits(request.user)
 
         prompt = request_serializer.validated_data["prompt"]
@@ -126,8 +100,7 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
         if new_session:
             session = ReportingSession.objects.create(user=request.user)
         elif requested_session is not None:
-            # Don't reveal whether a foreign uuid exists at all - just 404 it,
-            # the same way an owned-but-unknown uuid would 404.
+            # 404, not 403, so we don't reveal that someone else's session exists.
             if requested_session.user_id != request.user.id:
                 raise NotFound()
             session = requested_session
@@ -136,20 +109,11 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
                 "-created"
             ).first() or ReportingSession.objects.create(user=request.user)
 
-        # Avoid piling up a second Celery task for the same conversation if the
-        # caller submits again before the first answer lands - the harness's own
-        # per-identity lock would serialize them anyway, but there's no reason to
-        # queue redundant work (or redundant Bedrock cost) for it. A brand-new
-        # session (new_session=True) never has a pending message of its own, so
-        # this never fires for one.
+        # Don't queue a second task while this conversation has one pending.
         existing_pending = session.messages.filter(
             status=ReportingMessage.Status.PENDING
         ).first()
-        # context carries the request, so ReportingFileSerializer.file (once
-        # any exist) serializes to an absolute download URL - ask_serializer_class
-        # overrides what self.get_serializer() builds for *input*, so the
-        # response here is built explicitly instead, same as the response
-        # schema in @extend_schema above.
+        # Passes the request so file URLs come out absolute.
         context = self.get_serializer_context()
 
         if existing_pending is not None:
@@ -168,22 +132,15 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
             status=status.HTTP_202_ACCEPTED,
         )
 
-    # Deliberately NOT permissions.check_enabled_roles - seeing every other
-    # user's token usage by name is a different, more sensitive boundary
-    # than being allowed to use the tool at all. Widening
-    # AI_REPORTING_ENABLED_ROLES to "all" must not also widen who can see
-    # site-wide usage data; this stays staff/support regardless.
+    # Staff/support only, whatever AI_REPORTING_ENABLED_ROLES says - other
+    # users' usage is more sensitive than being able to use the tool.
     usage_stats_permissions = [structure_permissions.is_staff_or_support]
     usage_stats_serializer_class = serializers.UsageStatsResponseSerializer
 
     @extend_schema(
         summary="Site-wide AI reporting token usage",
         description=(
-            "Token usage totals and a daily trend across every user's AI reporting "
-            "questions - not scoped to the caller's own messages, unlike every other "
-            "action on this viewset. For staff/allocators to see actual usage, since "
-            "that's a more direct answer to 'does this cost a lot' than a policy limit "
-            "alone."
+            "Token usage totals and a daily trend across all users, not just the caller."
         ),
         parameters=[
             OpenApiParameter(
@@ -204,10 +161,9 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
         days = max(1, min(days, _USAGE_STATS_MAX_DAYS))
         since = timezone.now() - timedelta(days=days)
 
-        # Deliberately not self.get_queryset() - that's filtered to the
-        # caller's own messages (see get_queryset's own docstring); this is
-        # the one action in this viewset that is site-wide by design.
-        queryset = ReportingMessage.objects.filter(created__gte=since)
+        # Site-wide, so not self.get_queryset(). Reads ReportingUsageRecord,
+        # which outlives message retention cleanup.
+        queryset = ReportingUsageRecord.objects.filter(created__gte=since)
 
         totals = queryset.aggregate(
             total_input_tokens=Sum("input_tokens"),
@@ -228,18 +184,18 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
 
         by_user = [
             {
-                "user": row["session__user__uuid"],
-                "full_name": f"{row['session__user__first_name']} {row['session__user__last_name']}".strip(),
-                "username": row["session__user__username"],
+                "user": row["user__uuid"],
+                "full_name": f"{row['user__first_name']} {row['user__last_name']}".strip(),
+                "username": row["user__username"],
                 "input_tokens": row["input_tokens"],
                 "output_tokens": row["output_tokens"],
                 "requests": row["requests"],
             }
             for row in queryset.values(
-                "session__user__uuid",
-                "session__user__username",
-                "session__user__first_name",
-                "session__user__last_name",
+                "user__uuid",
+                "user__username",
+                "user__first_name",
+                "user__last_name",
             )
             .annotate(
                 input_tokens=Sum("input_tokens"),
@@ -261,17 +217,9 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
 
 
 class ReportingSessionViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
-    """Lists the caller's own AI reporting conversations (ReportingSession rows) for a
-    "previous conversations" history view, most recently active first - same per-user
-    scoping and AI_REPORTING_ENABLED_ROLES gate as ReportingMessageViewSet. Read-only: a
-    session is only ever created implicitly by ReportingMessageViewSet.ask, never
-    directly here.
-
-    Sessions with zero remaining messages - every message aged out via
-    AI_REPORTING_MESSAGE_RETENTION_DAYS (tasks.cleanup_old_reporting_messages deletes
-    the messages but not the now-empty session) - are excluded, so the history list
-    never shows an entry with nothing to preview.
-    """
+    """The caller's own conversations, most recently active first. Read-only -
+    sessions are created by ReportingMessageViewSet.ask. Sessions whose
+    messages have all been cleaned up are hidden."""
 
     extension_name = "AI_REPORTING"
 
@@ -304,28 +252,15 @@ class ReportingSessionViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
 
 
 class ReportingFileViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
-    """Browse and delete the caller's own AI reporting files - a flat,
-    standalone list across every one of their sessions (unlike
-    ReportingMessageSerializer.files, nested under the message that produced
-    each one), for a user who wants to find or clear up a file without
-    digging back through the chat.
-
-    Deleting here early is a convenience, not a requirement: files are also
-    deleted automatically after AI_REPORTING_FILE_RETENTION_DAYS (see
-    tasks.cleanup_old_reporting_files) regardless of whether anyone visits
-    this list at all.
-    """
+    """The caller's own files across all sessions, so one can be found or
+    deleted without digging through the chat. Files are also deleted
+    automatically after AI_REPORTING_FILE_RETENTION_DAYS."""
 
     extension_name = "AI_REPORTING"
 
     queryset = ReportingFile.objects.all().select_related("message__session__user")
     serializer_class = serializers.ReportingFileListSerializer
     lookup_field = "uuid"
-    # http_method_names alone already forecloses create/update/partial_update
-    # at Django's own dispatch level (unlike ReportingMessageViewSet, nothing
-    # else here shares post/put/patch via a custom action), so disabling
-    # those same actions again via disabled_actions would just be the same
-    # guarantee stated twice.
     http_method_names = ["get", "delete", "options"]
     permission_classes = [IsAuthenticated, core_permissions.ActionsPermission]
 
@@ -337,20 +272,14 @@ class ReportingFileViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
             .order_by("-created")
         )
 
-    # Same gate as the chat tool itself (not usage_stats' staff/support-only
-    # restriction) - these are the caller's own files, not site-wide data, so
-    # whoever AI_REPORTING_ENABLED_ROLES lets use the tool can also see and
-    # clear up what it made for them.
     list_permissions = [permissions.check_enabled_roles]
     retrieve_permissions = [permissions.check_enabled_roles]
     destroy_permissions = [permissions.check_enabled_roles]
 
 
 class HarnessConnectionView(views.APIView):
-    """The site's AI reporting harness connection, set up through the API
-    like the Formbricks connection is, rather than baked into deployment
-    settings - see models.HarnessConnection. Staff may change it; support
-    may read it."""
+    """The site's AI reporting harness connection. Staff may change it;
+    support may read it."""
 
     permission_classes = (IsAuthenticated,)
 
