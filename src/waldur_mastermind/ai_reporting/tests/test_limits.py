@@ -1,4 +1,8 @@
+import datetime
+
 from constance.test.unittest import override_config as override_constance_config
+from django.utils import timezone
+from freezegun import freeze_time
 from rest_framework import test
 from rest_framework.exceptions import Throttled
 
@@ -102,10 +106,6 @@ class EnforceUsageLimitsTest(test.APITestCase):
 
     @override_constance_config(**{**ALL_UNLIMITED, "AI_REPORTING_TOKEN_LIMIT_DAILY": 1})
     def test_only_recent_messages_count_toward_the_daily_window(self):
-        import datetime
-
-        from django.utils import timezone
-
         _message(self.user, input_tokens=1000, output_tokens=1000)
         # The token check reads usage records, so age that row.
         ReportingUsageRecord.objects.filter(user=self.user).update(
@@ -122,3 +122,25 @@ class EnforceUsageLimitsTest(test.APITestCase):
         message.delete()
         with self.assertRaises(Throttled):
             enforce_usage_limits(self.user)
+
+    @freeze_time("2026-11-13 12:00:00")
+    @override_constance_config(
+        **{**ALL_UNLIMITED, "AI_REPORTING_GLOBAL_DAILY_TOKEN_BUDGET": 100}
+    )
+    def test_global_budget_resets_at_midnight(self):
+        # 13 hours ago is within a rolling 24h, but it was yesterday.
+        _message(self.user, input_tokens=60, output_tokens=50)
+        ReportingUsageRecord.objects.update(
+            created=datetime.datetime(2026, 11, 12, 23, 0, tzinfo=datetime.UTC)
+        )
+        enforce_usage_limits(self.user)  # must not raise
+
+    @freeze_time("2026-11-13 22:00:00")
+    @override_constance_config(
+        **{**ALL_UNLIMITED, "AI_REPORTING_GLOBAL_DAILY_TOKEN_BUDGET": 100}
+    )
+    def test_global_budget_retry_time_is_next_midnight(self):
+        _message(self.user, input_tokens=60, output_tokens=50)
+        with self.assertRaises(Throttled) as raised:
+            enforce_usage_limits(self.user)
+        self.assertEqual(raised.exception.wait, 2 * 60 * 60)

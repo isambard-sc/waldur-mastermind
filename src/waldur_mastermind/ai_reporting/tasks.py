@@ -49,13 +49,13 @@ def _copy_files_from_harness(
 ) -> None:
     """Copy each reported file into a ReportingFile. A failed download is
     logged and skipped - the text answer is still useful without it."""
-    harness_url = HarnessConnection.get().base_url
+    connection = HarnessConnection.get()
     for filename in filenames:
         path = f"/files/{filename}"
         try:
             response = requests.get(
-                f"{harness_url}{path}",
-                # Same headers as the /query call in ask_harness.
+                connection.endpoint(path),
+                # Same headers as the /query call.
                 headers={
                     "X-Waldur-User-Id": str(user.uuid),
                     "X-Waldur-Session-Id": str(message.session.uuid),
@@ -78,15 +78,78 @@ def _copy_files_from_harness(
         )
 
 
-def _record_usage(message: ReportingMessage, user) -> None:
-    """Write the permanent usage record for a finished message, whether it
-    succeeded or failed."""
+_FAILED_MESSAGE = (
+    "The AI reporting service couldn't answer this question. Please try again later."
+)
+_TIMEOUT_MESSAGE = "This question took too long to answer. Try a narrower question."
+_INTERRUPTED_MESSAGE = "This question was interrupted. Please ask it again."
+
+# How long past the request timeout a message may stay pending before
+# fail_stale_reporting_messages gives up on it.
+_STALE_PENDING_MARGIN = timedelta(minutes=5)
+
+
+def _count(usage: dict, key: str) -> int:
+    value = usage.get(key)
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _finish(message: ReportingMessage, user, usage: dict, **fields) -> bool:
+    """Save the outcome and its usage record, but only if the message is
+    still pending - the stale check may already have failed it."""
+    fields["modified"] = timezone.now()
+    updated = ReportingMessage.objects.filter(
+        pk=message.pk, status=ReportingMessage.Status.PENDING
+    ).update(**fields)
+    if not updated:
+        return False
+    for name, value in fields.items():
+        setattr(message, name, value)
     ReportingUsageRecord.objects.create(
         user=user,
         status=message.status,
         input_tokens=message.input_tokens,
         output_tokens=message.output_tokens,
+        cache_read_tokens=_count(usage, "cache_read_tokens"),
+        cache_write_tokens=_count(usage, "cache_write_tokens"),
     )
+    return True
+
+
+def _fail(message: ReportingMessage, user, error: str) -> None:
+    _finish(
+        message, user, {}, status=ReportingMessage.Status.FAILED, error_message=error
+    )
+
+
+def _query_harness(message: ReportingMessage, user) -> dict:
+    body = {"prompt": message.prompt, **_harness_overrides()}
+    # The harness keeps one conversation per user, so a session's first
+    # question restarts it.
+    if not message.session.messages.filter(
+        pk__lt=message.pk, status=ReportingMessage.Status.DONE
+    ).exists():
+        body["new_session"] = True
+    # Encoded by hand so we sign exactly the bytes that are sent.
+    data = json.dumps(body).encode("utf-8")
+    response = requests.post(
+        HarnessConnection.get().endpoint("/query"),
+        headers={
+            # The harness keys conversations on the user id; it doesn't
+            # read the session id yet.
+            "X-Waldur-User-Id": str(user.uuid),
+            "X-Waldur-Session-Id": str(message.session.uuid),
+            "Content-Type": "application/json",
+            **signing.sign_request(str(user.uuid), "/query", data),
+        },
+        data=data,
+        timeout=config.AI_REPORTING_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("The harness response is not a JSON object.")
+    return payload
 
 
 @shared_task(name="waldur_mastermind.ai_reporting.ask_harness")
@@ -100,69 +163,62 @@ def ask_harness(message_id: int):
     except ReportingMessage.DoesNotExist:
         logger.error("ask_harness: ReportingMessage %s does not exist", message_id)
         return
+    if message.status != ReportingMessage.Status.PENDING:
+        return
 
     user = message.session.user
-
     try:
-        # Encoded by hand so we sign exactly the bytes that are sent.
-        body = json.dumps({"prompt": message.prompt, **_harness_overrides()}).encode(
-            "utf-8"
-        )
-        response = requests.post(
-            f"{HarnessConnection.get().base_url}/query",
-            headers={
-                # The harness keys conversations on the user id; it doesn't
-                # read the session id yet.
-                "X-Waldur-User-Id": str(user.uuid),
-                "X-Waldur-Session-Id": str(message.session.uuid),
-                "Content-Type": "application/json",
-                **signing.sign_request(str(user.uuid), "/query", body),
-            },
-            data=body,
-            timeout=config.AI_REPORTING_REQUEST_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except requests.RequestException as exc:
-        logger.exception(
-            "ask_harness: request to the harness failed for message %s", message_id
-        )
-        message.status = ReportingMessage.Status.FAILED
-        message.error_message = str(exc)
-        message.save(update_fields=["status", "error_message", "modified"])
-        _record_usage(message, user)
+        payload = _query_harness(message, user)
+    except requests.Timeout:
+        logger.exception("ask_harness: harness timed out for message %s", message_id)
+        _fail(message, user, _TIMEOUT_MESSAGE)
         return
-    except ValueError:
-        logger.exception(
-            "ask_harness: harness returned a non-JSON response for message %s",
-            message_id,
-        )
-        message.status = ReportingMessage.Status.FAILED
-        message.error_message = "The harness returned an unexpected response."
-        message.save(update_fields=["status", "error_message", "modified"])
-        _record_usage(message, user)
+    # Anything else, including Celery's soft time limit, must still end the
+    # message, or it would stay pending and block the user's next question.
+    except Exception:
+        logger.exception("ask_harness: harness call failed for message %s", message_id)
+        _fail(message, user, _FAILED_MESSAGE)
         return
 
-    usage = payload.get("usage") or {}
-    message.status = ReportingMessage.Status.DONE
-    message.answer = payload.get("answer", "")
-    message.new_files = payload.get("new_files", [])
-    message.input_tokens = usage.get("input_tokens", 0)
-    message.output_tokens = usage.get("output_tokens", 0)
-    message.save(
-        update_fields=[
-            "status",
-            "answer",
-            "new_files",
-            "input_tokens",
-            "output_tokens",
-            "modified",
-        ]
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+    new_files = [
+        name for name in payload.get("new_files") or [] if isinstance(name, str)
+    ]
+    finished = _finish(
+        message,
+        user,
+        usage,
+        status=ReportingMessage.Status.DONE,
+        answer=payload.get("answer") or "",
+        new_files=new_files,
+        input_tokens=_count(usage, "input_tokens"),
+        output_tokens=_count(usage, "output_tokens"),
     )
-    _record_usage(message, user)
+    if finished and new_files:
+        _copy_files_from_harness(message, user, new_files)
 
-    if message.new_files:
-        _copy_files_from_harness(message, user, message.new_files)
+
+@shared_task(name="waldur_mastermind.ai_reporting.fail_stale_reporting_messages")
+def fail_stale_reporting_messages():
+    """Fail messages still pending well past the request timeout. Their task
+    was lost, for example to a worker restart."""
+    cutoff = (
+        timezone.now()
+        - timedelta(seconds=config.AI_REPORTING_REQUEST_TIMEOUT_SECONDS)
+        - _STALE_PENDING_MARGIN
+    )
+    stale = ReportingMessage.objects.filter(
+        status=ReportingMessage.Status.PENDING, created__lt=cutoff
+    ).select_related("session__user")
+    count = 0
+    for message in stale:
+        _fail(message, message.session.user, _INTERRUPTED_MESSAGE)
+        count += 1
+    if count:
+        logger.info("Failed %d AI reporting message(s) left pending", count)
+    return {"failed_count": count}
 
 
 @shared_task(name="waldur_mastermind.ai_reporting.cleanup_old_reporting_messages")

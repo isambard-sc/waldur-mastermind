@@ -4,20 +4,19 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('ai_reporting', '0001_initial'),
+        ("ai_reporting", "0001_initial"),
     ]
 
     operations = [
         migrations.AddField(
-            model_name='reportingmessage',
-            name='input_tokens',
+            model_name="reportingmessage",
+            name="input_tokens",
             field=models.PositiveIntegerField(default=0),
         ),
         migrations.AddField(
-            model_name='reportingmessage',
-            name='output_tokens',
+            model_name="reportingmessage",
+            name="output_tokens",
             field=models.PositiveIntegerField(default=0),
         ),
     ]

@@ -817,18 +817,13 @@ def validate_waldur_operation_ids(result, generator, **kwargs):
     """
     errors = []
     # These fields are exempt because they usually refer to the object itself
-    # or are part of a Generic Foreign Key (GFK) structure. "session" is
-    # exempt for a different reason: ai_reporting.ReportingSession has no
-    # list endpoint of its own to point autocomplete at - it's an implicit
-    # per-conversation grouping (see ai_reporting.models.ReportingSession),
-    # not a resource a user browses independently of its messages.
+    # or are part of a Generic Foreign Key (GFK) structure.
     whitelist = [
         "uuid",
         "scope_uuid",
         "scope",
         "parent_uuid",
         "available_for_customer",
-        "session",
     ]
 
     paths = result.get("paths", {})

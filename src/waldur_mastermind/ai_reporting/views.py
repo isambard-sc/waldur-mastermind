@@ -11,11 +11,11 @@ from drf_spectacular.utils import (
     extend_schema_view,
 )
 from rest_framework import decorators, status, views
-from rest_framework.exceptions import NotFound
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from waldur_core.core import permissions as core_permissions
+from waldur_core.core.exceptions import IncorrectStateException
 from waldur_core.core.views import ActionsViewSet, ConstanceCheckExtensionMixin
 from waldur_core.structure import permissions as structure_permissions
 from waldur_mastermind.ai_reporting import limits, permissions, serializers, tasks
@@ -28,6 +28,7 @@ from waldur_mastermind.ai_reporting.models import (
 )
 
 _USAGE_STATS_MAX_DAYS = 365
+_BUSY_MESSAGE = "Wait for your current question to finish before asking another."
 _USAGE_STATS_DEFAULT_DAYS = 30
 
 
@@ -39,6 +40,7 @@ _USAGE_STATS_DEFAULT_DAYS = 30
                 uuid.UUID,
                 OpenApiParameter.QUERY,
                 description="Filter to one of the caller's own AI reporting sessions.",
+                extensions={"x-waldur-operation-id": "ai_reporting_sessions_retrieve"},
             ),
         ]
     )
@@ -53,7 +55,11 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
 
     extension_name = "AI_REPORTING"
 
-    queryset = ReportingMessage.objects.all().select_related("session__user")
+    queryset = (
+        ReportingMessage.objects.all()
+        .select_related("session__user")
+        .prefetch_related("files")
+    )
     serializer_class = serializers.ReportingMessageSerializer
     lookup_field = "uuid"
     http_method_names = ["get", "post", "options"]
@@ -97,30 +103,31 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
         new_session = request_serializer.validated_data["new_session"]
         requested_session = request_serializer.validated_data["session"]
 
+        # The harness answers one question per user at a time.
+        pending = ReportingMessage.objects.filter(
+            session__user=request.user, status=ReportingMessage.Status.PENDING
+        ).first()
+
         if new_session:
+            if pending is not None:
+                raise IncorrectStateException(_BUSY_MESSAGE)
             session = ReportingSession.objects.create(user=request.user)
         elif requested_session is not None:
-            # 404, not 403, so we don't reveal that someone else's session exists.
-            if requested_session.user_id != request.user.id:
-                raise NotFound()
             session = requested_session
         else:
             session = ReportingSession.objects.filter(user=request.user).order_by(
                 "-created"
             ).first() or ReportingSession.objects.create(user=request.user)
 
-        # Don't queue a second task while this conversation has one pending.
-        existing_pending = session.messages.filter(
-            status=ReportingMessage.Status.PENDING
-        ).first()
         # Passes the request so file URLs come out absolute.
         context = self.get_serializer_context()
 
-        if existing_pending is not None:
+        if pending is not None:
+            if pending.session_id != session.id:
+                raise IncorrectStateException(_BUSY_MESSAGE)
+            # Asked again in the same conversation: return the one in progress.
             return Response(
-                serializers.ReportingMessageSerializer(
-                    existing_pending, context=context
-                ).data,
+                serializers.ReportingMessageSerializer(pending, context=context).data,
                 status=status.HTTP_202_ACCEPTED,
             )
 
@@ -169,6 +176,8 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
             total_input_tokens=Sum("input_tokens"),
             total_output_tokens=Sum("output_tokens"),
             total_requests=Count("id"),
+            total_cache_read_tokens=Sum("cache_read_tokens"),
+            total_cache_write_tokens=Sum("cache_write_tokens"),
         )
 
         daily = list(
@@ -185,7 +194,10 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
         by_user = [
             {
                 "user": row["user__uuid"],
-                "full_name": f"{row['user__first_name']} {row['user__last_name']}".strip(),
+                # Blank for a deleted user, whose records are kept.
+                "full_name": " ".join(
+                    filter(None, [row["user__first_name"], row["user__last_name"]])
+                ),
                 "username": row["user__username"],
                 "input_tokens": row["input_tokens"],
                 "output_tokens": row["output_tokens"],
@@ -210,6 +222,8 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
             "total_input_tokens": totals["total_input_tokens"] or 0,
             "total_output_tokens": totals["total_output_tokens"] or 0,
             "total_requests": totals["total_requests"] or 0,
+            "total_cache_read_tokens": totals["total_cache_read_tokens"] or 0,
+            "total_cache_write_tokens": totals["total_cache_write_tokens"] or 0,
             "daily": daily,
             "by_user": by_user,
         }

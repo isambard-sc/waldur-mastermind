@@ -23,6 +23,11 @@ class AIReportingExtension(WaldurExtension):
         from celery.schedules import crontab
 
         return {
+            "waldur-ai-reporting-fail-stale-messages": {
+                "task": "waldur_mastermind.ai_reporting.fail_stale_reporting_messages",
+                "schedule": crontab(minute="*/10"),
+                "args": (),
+            },
             "waldur-ai-reporting-cleanup-old-messages": {
                 "task": "waldur_mastermind.ai_reporting.cleanup_old_reporting_messages",
                 "schedule": crontab(minute=0, hour=3),  # 3 AM daily

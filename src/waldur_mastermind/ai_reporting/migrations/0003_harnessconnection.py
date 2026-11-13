@@ -9,23 +9,61 @@ import waldur_mastermind.ai_reporting.models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
-        ('ai_reporting', '0002_reportingmessage_token_usage'),
+        ("ai_reporting", "0002_reportingmessage_token_usage"),
     ]
 
     operations = [
         migrations.CreateModel(
-            name='HarnessConnection',
+            name="HarnessConnection",
             fields=[
-                ('id', models.AutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
-                ('created', model_utils.fields.AutoCreatedField(default=django.utils.timezone.now, editable=False, verbose_name='created')),
-                ('modified', model_utils.fields.AutoLastModifiedField(default=django.utils.timezone.now, editable=False, verbose_name='modified')),
-                ('base_url', models.CharField(default='http://waldur-harness.waldur-harness.svc.cluster.local:8000', help_text="In-cluster address of the AI reporting harness's HTTP wrapper (http_service.py in the waldur-ai-harness repo).", max_length=500, validators=[waldur_mastermind.ai_reporting.models._validate_http_url])),
-                ('signing_private_key', waldur_core.core.fields.EncryptedTextField(blank=True, default='', help_text="Base64-encoded raw Ed25519 private key bytes, used to sign every request to the harness so it can verify the request genuinely came from Waldur. See signing.py's own module docstring for a ready-to-run snippet that generates a real keypair.")),
+                (
+                    "id",
+                    models.AutoField(
+                        auto_created=True,
+                        primary_key=True,
+                        serialize=False,
+                        verbose_name="ID",
+                    ),
+                ),
+                (
+                    "created",
+                    model_utils.fields.AutoCreatedField(
+                        default=django.utils.timezone.now,
+                        editable=False,
+                        verbose_name="created",
+                    ),
+                ),
+                (
+                    "modified",
+                    model_utils.fields.AutoLastModifiedField(
+                        default=django.utils.timezone.now,
+                        editable=False,
+                        verbose_name="modified",
+                    ),
+                ),
+                (
+                    "base_url",
+                    models.CharField(
+                        default="http://waldur-harness.waldur-harness.svc.cluster.local:8000",
+                        help_text="In-cluster address of the AI reporting harness's HTTP wrapper (http_service.py in the waldur-ai-harness repo).",
+                        max_length=500,
+                        validators=[
+                            waldur_mastermind.ai_reporting.models.validate_http_url
+                        ],
+                    ),
+                ),
+                (
+                    "signing_private_key",
+                    waldur_core.core.fields.EncryptedTextField(
+                        blank=True,
+                        default="",
+                        help_text="Base64-encoded raw Ed25519 private key bytes, used to sign every request to the harness so it can verify the request genuinely came from Waldur. See signing.py's own module docstring for a ready-to-run snippet that generates a real keypair.",
+                    ),
+                ),
             ],
             options={
-                'verbose_name': 'AI reporting harness connection',
+                "verbose_name": "AI reporting harness connection",
             },
         ),
     ]

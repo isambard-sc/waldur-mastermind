@@ -1561,16 +1561,17 @@ CONSTANCE_CONFIG = {
     # waldur-ai-harness; where it's reached is set through the API, not here -
     # see models.HarnessConnection.)
     "AI_REPORTING_ENABLED": (
-        True,
-        "Enable the AI reporting feature and calls to the harness service.",
+        False,
+        "Turn AI reporting on. While off, the tab is hidden and every request "
+        "is refused.",
     ),
     "AI_REPORTING_ENABLED_ROLES": (
         "staff_and_support",
-        "Controls which user roles can access AI reporting. "
-        "'disabled': No role-based access. "
-        "'staff': Staff users only. "
-        "'staff_and_support': Staff and support users (today's fixed behavior). "
-        "'all': All authenticated users.",
+        "Who can use AI reporting. "
+        "'disabled': nobody. "
+        "'staff': staff users only. "
+        "'staff_and_support': staff and support users. "
+        "'all': all authenticated users.",
         "choice_field",
     ),
     "AI_REPORTING_NAME": (
@@ -1602,7 +1603,8 @@ CONSTANCE_CONFIG = {
     ),
     "AI_REPORTING_REQUEST_TIMEOUT_SECONDS": (
         600,
-        "Timeout in seconds for a single call from Waldur to the AI reporting harness.",
+        "Timeout in seconds for a single question to the AI reporting harness. "
+        "Keep it under 1200 (20 minutes), the Celery task limit.",
     ),
     "AI_REPORTING_TOKEN_LIMIT_DAILY": (
         -1,
@@ -1618,23 +1620,24 @@ CONSTANCE_CONFIG = {
     ),
     "AI_REPORTING_GLOBAL_DAILY_TOKEN_BUDGET": (
         5000000,
-        "Site-wide daily token cap across all AI reporting traffic. -1 means unlimited.",
+        "Site-wide token cap per calendar day (UTC) across all AI reporting "
+        "traffic. -1 means unlimited.",
     ),
     "AI_REPORTING_GLOBAL_REQUESTS_PER_MINUTE": (
         60,
-        "Site-wide burst cap across all AI reporting traffic.",
+        "Site-wide cap on AI reporting questions per minute. -1 means unlimited.",
     ),
     "AI_REPORTING_MESSAGE_RETENTION_DAYS": (
         90,
-        "Number of days to retain AI reporting questions/answers before "
-        "automatic deletion. Set to -1 to disable automatic cleanup.",
+        "Days to keep AI reporting questions and answers. Deleting a message "
+        "also deletes its files; usage records are always kept. Set to -1 to "
+        "disable automatic cleanup.",
     ),
     "AI_REPORTING_FILE_RETENTION_DAYS": (
         21,
-        "Number of days to retain AI reporting generated files (charts, PDFs, "
-        "CSVs) before automatic deletion - shorter than the message retention "
-        "above since file bytes are the more expensive part to keep. Set to "
-        "-1 to disable automatic cleanup.",
+        "Days to keep AI reporting generated files (charts, PDFs, CSVs). "
+        "Usually shorter than message retention, since files are larger. Set "
+        "to -1 to disable automatic cleanup.",
     ),
     # Anonymous AI assistant settings
     "ANONYMOUS_CHAT_USER_SLUG_SALT": (
@@ -2603,6 +2606,7 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "AI_ASSISTANT_ENABLED",
     "AI_ASSISTANT_ENABLED_ROLES",
     "AI_ASSISTANT_NAME",
+    "AI_REPORTING_ENABLED",
     "AI_REPORTING_ENABLED_ROLES",
     # So the Files tab can show "deleted automatically after N days" without
     # hardcoding it - see ai_reporting.tasks.cleanup_old_reporting_files.

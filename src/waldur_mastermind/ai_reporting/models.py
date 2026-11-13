@@ -9,7 +9,7 @@ from waldur_core.core import fields as core_fields
 from waldur_core.core.models import User, UuidMixin
 
 
-def _validate_http_url(value):
+def validate_http_url(value):
     """An http(s) URL with a host - not Django's URLValidator, which rejects
     the harness's bare in-cluster hostname."""
     if not value:
@@ -20,9 +20,9 @@ def _validate_http_url(value):
 
 
 class ReportingSession(UuidMixin, TimeStampedModel):
-    """One AI reporting conversation. A user may have several - e.g. one per
-    open browser tab - each with its own harness-side conversation, keyed
-    by this model's uuid."""
+    """One AI reporting conversation. A user may have several. The harness
+    itself keeps one conversation per user, restarted when a session's
+    first question is asked."""
 
     user = models.ForeignKey(
         User, on_delete=models.CASCADE, related_name="ai_reporting_sessions"
@@ -94,6 +94,8 @@ class ReportingUsageRecord(TimeStampedModel):
     status = models.CharField(max_length=10, choices=Status.choices)
     input_tokens = models.PositiveIntegerField(default=0)
     output_tokens = models.PositiveIntegerField(default=0)
+    cache_read_tokens = models.PositiveIntegerField(default=0)
+    cache_write_tokens = models.PositiveIntegerField(default=0)
 
     class Meta:
         verbose_name = _("AI reporting usage record")
@@ -125,14 +127,13 @@ class HarnessConnection(TimeStampedModel):
     get()), configured through the API like FormbricksConnection.
 
     signing_private_key is encrypted at rest and never returned by the API.
-    Blank means requests go out unsigned, until the harness's own public
-    key is configured too.
+    The harness rejects unsigned requests, so it must be set.
     """
 
     base_url = models.CharField(
         max_length=500,
         default="http://waldur-harness.waldur-harness.svc.cluster.local:8000",
-        validators=[_validate_http_url],
+        validators=[validate_http_url],
         help_text=_(
             "In-cluster address of the AI reporting harness's HTTP wrapper "
             "(http_service.py in the waldur-ai-harness repo)."
@@ -159,6 +160,9 @@ class HarnessConnection(TimeStampedModel):
     def get(cls) -> "HarnessConnection":
         connection, _created = cls.objects.get_or_create(pk=1)
         return connection
+
+    def endpoint(self, path: str) -> str:
+        return self.base_url.rstrip("/") + path
 
     @property
     def is_signing_configured(self) -> bool:

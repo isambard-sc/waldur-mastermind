@@ -7,16 +7,27 @@ from waldur_mastermind.ai_reporting import models
 
 class AskRequestSerializer(serializers.Serializer):
     prompt = serializers.CharField(allow_blank=False, trim_whitespace=True)
-    # Ownership is checked in the view, not here. Omit to reuse the latest
-    # session, or set new_session to start a fresh one.
+    # Omit to reuse the latest session, or set new_session to start a
+    # fresh one.
     session = serializers.SlugRelatedField(
         slug_field="uuid",
-        queryset=models.ReportingSession.objects.all(),
+        queryset=models.ReportingSession.objects.none(),
         required=False,
         allow_null=True,
         default=None,
     )
     new_session = serializers.BooleanField(default=False)
+
+    def get_fields(self):
+        fields = super().get_fields()
+        # Only the caller's own sessions, so someone else's uuid gets the same
+        # "does not exist" error as one that was never created.
+        request = self.context.get("request")
+        if request is not None and request.user.is_authenticated:
+            fields["session"].queryset = models.ReportingSession.objects.filter(
+                user=request.user
+            )
+        return fields
 
 
 class ReportingFileSerializer(serializers.ModelSerializer):
@@ -88,9 +99,10 @@ class UsageStatsDailySerializer(serializers.Serializer):
 
 
 class UsageStatsByUserSerializer(serializers.Serializer):
-    user = serializers.UUIDField()
-    full_name = serializers.CharField()
-    username = serializers.CharField()
+    # Null once the user has been deleted; their usage is kept.
+    user = serializers.UUIDField(allow_null=True)
+    full_name = serializers.CharField(allow_blank=True)
+    username = serializers.CharField(allow_null=True)
     input_tokens = serializers.IntegerField()
     output_tokens = serializers.IntegerField()
     requests = serializers.IntegerField()
@@ -103,6 +115,8 @@ class UsageStatsResponseSerializer(serializers.Serializer):
     total_input_tokens = serializers.IntegerField()
     total_output_tokens = serializers.IntegerField()
     total_requests = serializers.IntegerField()
+    total_cache_read_tokens = serializers.IntegerField()
+    total_cache_write_tokens = serializers.IntegerField()
     daily = UsageStatsDailySerializer(many=True)
     by_user = UsageStatsByUserSerializer(many=True)
 

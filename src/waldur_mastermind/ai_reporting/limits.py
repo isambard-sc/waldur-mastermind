@@ -66,11 +66,11 @@ def enforce_usage_limits(user) -> None:
 
     global_budget = config.AI_REPORTING_GLOBAL_DAILY_TOKEN_BUDGET
     if global_budget != UNLIMITED:
-        used = _tokens_used_since(now - timedelta(days=1))
+        # Per calendar day (UTC), so "try again tomorrow" is actually true.
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        used = _tokens_used_since(today)
         if used >= global_budget:
-            next_midnight = (now + timedelta(days=1)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
+            next_midnight = today + timedelta(days=1)
             raise Throttled(
                 wait=int((next_midnight - now).total_seconds()),
                 detail="AI reporting has reached its site-wide daily token budget. Please try again tomorrow.",

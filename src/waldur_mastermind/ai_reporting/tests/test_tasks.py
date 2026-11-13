@@ -1,11 +1,13 @@
 import base64
 import json
+from datetime import timedelta
 from unittest import mock
 
 import requests
 from constance.test.unittest import override_config as override_constance_config
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from django.utils import timezone
 from rest_framework import test
 
 from waldur_core.structure.tests import factories as structure_factories
@@ -16,7 +18,22 @@ from waldur_mastermind.ai_reporting.models import (
     ReportingSession,
     ReportingUsageRecord,
 )
-from waldur_mastermind.ai_reporting.tasks import _harness_overrides, ask_harness
+from waldur_mastermind.ai_reporting.tasks import (
+    _harness_overrides,
+    ask_harness,
+    fail_stale_reporting_messages,
+)
+
+
+def _respond(mock_post, payload):
+    """Make the mocked harness return `payload` as its JSON body."""
+    mock_post.return_value = mock.Mock(status_code=200, json=lambda: payload)
+    mock_post.return_value.raise_for_status = mock.Mock()
+
+
+def _sent_body(mock_post) -> dict:
+    _, kwargs = mock_post.call_args
+    return json.loads(kwargs["data"])
 
 
 def _set_signing_private_key(value: str) -> None:
@@ -145,7 +162,9 @@ class AskHarnessTaskTest(test.APITestCase):
 
         self.message.refresh_from_db()
         self.assertEqual(self.message.status, ReportingMessage.Status.FAILED)
-        self.assertIn("connection refused", self.message.error_message)
+        # Users get a generic message; the details only go to the log.
+        self.assertNotIn("connection refused", self.message.error_message)
+        self.assertNotIn("http", self.message.error_message)
 
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
     def test_harness_error_status_marks_failed(self, mock_post):
@@ -212,7 +231,11 @@ class AskHarnessTaskTest(test.APITestCase):
         _, kwargs = mock_post.call_args
         self.assertEqual(
             json.loads(kwargs["data"]),
-            {"prompt": self.message.prompt, "name": "Isambard Reporting Assistant"},
+            {
+                "prompt": self.message.prompt,
+                "name": "Isambard Reporting Assistant",
+                "new_session": True,
+            },
         )
 
 
@@ -306,6 +329,189 @@ class RecordUsageTest(test.APITestCase):
         record = ReportingUsageRecord.objects.get(pk=record_id)
         self.assertIsNone(record.user)
         self.assertEqual(record.input_tokens, 10)
+
+
+class AskHarnessRobustnessTest(test.APITestCase):
+    """Whatever the harness does, the message must end up done or failed,
+    never stuck on pending."""
+
+    def setUp(self):
+        self.user = structure_factories.UserFactory()
+        self.session = ReportingSession.objects.create(user=self.user)
+        self.message = ReportingMessage.objects.create(
+            session=self.session, prompt="How many projects are there?"
+        )
+
+    def _status(self):
+        self.message.refresh_from_db()
+        return self.message.status
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_non_object_json_marks_failed(self, mock_post):
+        _respond(mock_post, ["not", "an", "object"])
+
+        ask_harness(self.message.pk)
+
+        self.assertEqual(self._status(), ReportingMessage.Status.FAILED)
+        self.assertEqual(ReportingUsageRecord.objects.count(), 1)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_null_fields_are_treated_as_empty(self, mock_post):
+        _respond(
+            mock_post,
+            {"answer": None, "new_files": None, "usage": {"input_tokens": None}},
+        )
+
+        ask_harness(self.message.pk)
+
+        self.message.refresh_from_db()
+        self.assertEqual(self.message.status, ReportingMessage.Status.DONE)
+        self.assertEqual(self.message.answer, "")
+        self.assertEqual(self.message.new_files, [])
+        self.assertEqual(self.message.input_tokens, 0)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_unexpected_error_marks_failed(self, mock_post):
+        mock_post.side_effect = RuntimeError("something nobody planned for")
+
+        ask_harness(self.message.pk)
+
+        self.assertEqual(self._status(), ReportingMessage.Status.FAILED)
+        self.assertEqual(ReportingUsageRecord.objects.count(), 1)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_timeout_gets_its_own_message(self, mock_post):
+        mock_post.side_effect = requests.Timeout()
+
+        ask_harness(self.message.pk)
+
+        self.message.refresh_from_db()
+        self.assertEqual(self.message.status, ReportingMessage.Status.FAILED)
+        self.assertIn("too long", self.message.error_message)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_already_finished_message_is_skipped(self, mock_post):
+        self.message.status = ReportingMessage.Status.FAILED
+        self.message.save()
+
+        ask_harness(self.message.pk)
+
+        mock_post.assert_not_called()
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_answer_arriving_after_the_message_was_failed_is_dropped(self, mock_post):
+        def fail_it_meanwhile(*args, **kwargs):
+            ReportingMessage.objects.filter(pk=self.message.pk).update(
+                status=ReportingMessage.Status.FAILED
+            )
+            return mock.DEFAULT
+
+        _respond(mock_post, {"answer": "late", "usage": {"input_tokens": 5}})
+        mock_post.side_effect = fail_it_meanwhile
+
+        ask_harness(self.message.pk)
+
+        self.message.refresh_from_db()
+        self.assertEqual(self.message.status, ReportingMessage.Status.FAILED)
+        self.assertEqual(self.message.answer, "")
+        self.assertEqual(ReportingUsageRecord.objects.count(), 0)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_trailing_slash_in_base_url_is_handled(self, mock_post):
+        connection = HarnessConnection.get()
+        connection.base_url = "http://harness:8000/"
+        connection.save()
+        _respond(mock_post, {"answer": "ok"})
+
+        ask_harness(self.message.pk)
+
+        args, _ = mock_post.call_args
+        self.assertEqual(args[0], "http://harness:8000/query")
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_cache_tokens_are_recorded(self, mock_post):
+        _respond(
+            mock_post,
+            {
+                "answer": "ok",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "cache_read_tokens": 4000,
+                    "cache_write_tokens": 300,
+                },
+            },
+        )
+
+        ask_harness(self.message.pk)
+
+        record = ReportingUsageRecord.objects.get()
+        self.assertEqual(record.cache_read_tokens, 4000)
+        self.assertEqual(record.cache_write_tokens, 300)
+
+
+class NewSessionTest(test.APITestCase):
+    """The first question in a session tells the harness to start a fresh
+    conversation."""
+
+    def setUp(self):
+        self.user = structure_factories.UserFactory()
+        self.session = ReportingSession.objects.create(user=self.user)
+
+    def _ask(self, mock_post, prompt):
+        message = ReportingMessage.objects.create(session=self.session, prompt=prompt)
+        _respond(mock_post, {"answer": "ok"})
+        ask_harness(message.pk)
+        return _sent_body(mock_post)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_first_question_starts_a_new_harness_conversation(self, mock_post):
+        self.assertIs(self._ask(mock_post, "first")["new_session"], True)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_follow_up_continues_the_conversation(self, mock_post):
+        self._ask(mock_post, "first")
+        self.assertNotIn("new_session", self._ask(mock_post, "follow-up"))
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_question_after_a_failed_first_one_still_starts_fresh(self, mock_post):
+        ReportingMessage.objects.create(
+            session=self.session, prompt="x", status=ReportingMessage.Status.FAILED
+        )
+        self.assertIs(self._ask(mock_post, "retry")["new_session"], True)
+
+
+class FailStaleReportingMessagesTest(test.APITestCase):
+    def setUp(self):
+        self.user = structure_factories.UserFactory()
+        self.session = ReportingSession.objects.create(user=self.user)
+
+    def _pending(self, minutes_old):
+        message = ReportingMessage.objects.create(session=self.session, prompt="x")
+        ReportingMessage.objects.filter(pk=message.pk).update(
+            created=timezone.now() - timedelta(minutes=minutes_old)
+        )
+        return message
+
+    @override_constance_config(AI_REPORTING_REQUEST_TIMEOUT_SECONDS=600)
+    def test_long_pending_message_is_failed(self):
+        message = self._pending(minutes_old=30)
+
+        fail_stale_reporting_messages()
+
+        message.refresh_from_db()
+        self.assertEqual(message.status, ReportingMessage.Status.FAILED)
+        self.assertTrue(message.error_message)
+        self.assertEqual(ReportingUsageRecord.objects.count(), 1)
+
+    @override_constance_config(AI_REPORTING_REQUEST_TIMEOUT_SECONDS=600)
+    def test_recent_pending_message_is_left_alone(self):
+        message = self._pending(minutes_old=5)
+
+        fail_stale_reporting_messages()
+
+        message.refresh_from_db()
+        self.assertEqual(message.status, ReportingMessage.Status.PENDING)
 
 
 class HarnessOverridesTest(test.APITestCase):

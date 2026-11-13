@@ -1,9 +1,11 @@
 import base64
+import datetime
 from unittest import mock
 
 from constance.test.unittest import override_config as override_constance_config
 from django.core.files.base import ContentFile
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework import status, test
 
 from waldur_core.structure.tests import factories as structure_factories
@@ -16,6 +18,7 @@ from waldur_mastermind.ai_reporting.models import (
 )
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class FeatureEnabledSwitchTest(test.APITestCase):
     """AI_REPORTING_ENABLED gates every action, not just ask."""
 
@@ -36,12 +39,12 @@ class FeatureEnabledSwitchTest(test.APITestCase):
         self.assertEqual(response.status_code, status.HTTP_424_FAILED_DEPENDENCY)
 
     def test_ask_works_normally_once_enabled_again(self):
-        # Enabled by default.
         with mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay"):
             response = self.client.post(self.ask_url, {"prompt": "How many projects?"})
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class AskUsageLimitTest(test.APITestCase):
     """ask rejects over-limit requests before creating anything. The limit
     logic itself is tested in test_limits."""
@@ -74,6 +77,7 @@ class AskUsageLimitTest(test.APITestCase):
         )
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class AskPermissionTest(test.APITestCase):
     def setUp(self):
         self.ask_url = reverse("ai-reporting-message-ask")
@@ -116,6 +120,7 @@ class AskPermissionTest(test.APITestCase):
         )
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class AskActionTest(test.APITestCase):
     def setUp(self):
         self.staff = structure_factories.UserFactory(is_staff=True)
@@ -158,20 +163,21 @@ class AskActionTest(test.APITestCase):
         self.assertEqual(first.data["uuid"], second.data["uuid"])
 
     @mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay")
-    def test_new_session_bypasses_the_pending_reuse_check(self, mock_delay):
+    def test_question_in_another_session_waits_for_the_pending_one(self, mock_delay):
+        """The harness answers one question per user at a time."""
         self.client.post(self.ask_url, {"prompt": "first"})
         response = self.client.post(
             self.ask_url, {"prompt": "second", "new_session": True}
         )
 
-        self.assertEqual(mock_delay.call_count, 2)
-        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(mock_delay.call_count, 1)
+        self.assertEqual(ReportingSession.objects.filter(user=self.staff).count(), 1)
 
     @mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay")
     def test_new_session_actually_creates_a_second_session_row(self, mock_delay):
-        """new_session creates a separate session, so two tabs can run
-        independently."""
         self.client.post(self.ask_url, {"prompt": "first"})
+        ReportingMessage.objects.update(status=ReportingMessage.Status.DONE)
         self.client.post(self.ask_url, {"prompt": "second", "new_session": True})
 
         self.assertEqual(ReportingSession.objects.filter(user=self.staff).count(), 2)
@@ -179,7 +185,9 @@ class AskActionTest(test.APITestCase):
     @mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay")
     def test_ask_can_target_a_specific_existing_session(self, mock_delay):
         first_response = self.client.post(self.ask_url, {"prompt": "first"})
+        ReportingMessage.objects.update(status=ReportingMessage.Status.DONE)
         self.client.post(self.ask_url, {"prompt": "second", "new_session": True})
+        ReportingMessage.objects.update(status=ReportingMessage.Status.DONE)
         first_session = first_response.data["session"]
 
         response = self.client.post(
@@ -194,14 +202,18 @@ class AskActionTest(test.APITestCase):
         other_user = structure_factories.UserFactory(is_staff=True)
         other_session = ReportingSession.objects.create(user=other_user)
 
-        response = self.client.post(
+        foreign = self.client.post(
             self.ask_url, {"prompt": "hi", "session": other_session.uuid}
         )
+        unknown = self.client.post(self.ask_url, {"prompt": "hi", "session": "0" * 32})
 
-        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        # Same answer either way, so it doesn't reveal that the session exists.
+        self.assertEqual(foreign.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(foreign.status_code, unknown.status_code)
         mock_delay.assert_not_called()
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class ReportingMessageViewSetTest(test.APITestCase):
     def setUp(self):
         self.staff = structure_factories.UserFactory(is_staff=True)
@@ -268,6 +280,7 @@ class ReportingMessageViewSetTest(test.APITestCase):
         )
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class UsageStatsTest(test.APITestCase):
     """usage_stats covers every user, not just the caller. It reads usage
     records, so these tests create those directly."""
@@ -319,10 +332,6 @@ class UsageStatsTest(test.APITestCase):
         self.assertEqual(by_user["other"]["input_tokens"], 200)
 
     def test_daily_groups_by_calendar_date(self):
-        import datetime
-
-        from django.utils import timezone
-
         today_message = self._message(self.staff, input_tokens=10, output_tokens=5)
         yesterday_message = self._message(self.staff, input_tokens=20, output_tokens=10)
         ReportingUsageRecord.objects.filter(pk=yesterday_message.pk).update(
@@ -339,10 +348,6 @@ class UsageStatsTest(test.APITestCase):
         self.assertEqual(by_date[today_date]["input_tokens"], 10)
 
     def test_days_outside_the_window_are_excluded(self):
-        import datetime
-
-        from django.utils import timezone
-
         old_message = self._message(self.staff, input_tokens=999, output_tokens=999)
         ReportingUsageRecord.objects.filter(pk=old_message.pk).update(
             created=timezone.now() - datetime.timedelta(days=40)
@@ -371,6 +376,31 @@ class UsageStatsTest(test.APITestCase):
         self.assertEqual(response.data["daily"], [])
         self.assertEqual(response.data["by_user"], [])
 
+    def test_deleted_user_still_appears_in_the_breakdown(self):
+        self._message(self.other_user, input_tokens=7, output_tokens=3)
+        self.other_user.delete()
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        row = response.data["by_user"][0]
+        self.assertIsNone(row["user"])
+        self.assertEqual(row["full_name"], "")
+        self.assertEqual(row["input_tokens"], 7)
+
+    def test_cache_tokens_are_totalled(self):
+        ReportingUsageRecord.objects.create(
+            user=self.staff,
+            status=ReportingUsageRecord.Status.DONE,
+            cache_read_tokens=4000,
+            cache_write_tokens=300,
+        )
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.data["total_cache_read_tokens"], 4000)
+        self.assertEqual(response.data["total_cache_write_tokens"], 300)
+
     def test_usage_survives_the_message_that_produced_it_being_deleted(self):
         # Usage must survive the message being deleted.
         session = ReportingSession.objects.create(user=self.staff)
@@ -396,6 +426,7 @@ class UsageStatsTest(test.APITestCase):
         self.assertEqual(response.data["total_requests"], 1)
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class EnabledRolesIntegrationTest(test.APITestCase):
     """check_enabled_roles is applied to the real endpoints, except
     usage_stats, which stays staff/support only."""
@@ -427,6 +458,7 @@ class EnabledRolesIntegrationTest(test.APITestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class ReportingFileViewSetTest(test.APITestCase):
     def setUp(self):
         self.staff = structure_factories.UserFactory(is_staff=True)
@@ -532,6 +564,7 @@ class ReportingFileViewSetTest(test.APITestCase):
         self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class ReportingSessionViewSetTest(test.APITestCase):
     def setUp(self):
         self.staff = structure_factories.UserFactory(is_staff=True)
@@ -612,6 +645,7 @@ class ReportingSessionViewSetTest(test.APITestCase):
 _FAKE_KEY = base64.b64encode(b"0" * 32).decode()
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class HarnessConnectionApiTest(test.APITestCase):
     """Same read/write split as the Formbricks connection API."""
 
@@ -700,3 +734,13 @@ class HarnessConnectionApiTest(test.APITestCase):
             self.url, {"base_url": "http://waldur-harness:8000"}
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class DefaultOffTest(test.APITestCase):
+    def test_feature_is_off_until_switched_on(self):
+        staff = structure_factories.UserFactory(is_staff=True)
+        self.client.force_authenticate(user=staff)
+
+        response = self.client.get(reverse("ai-reporting-message-list"))
+
+        self.assertEqual(response.status_code, status.HTTP_424_FAILED_DEPENDENCY)
