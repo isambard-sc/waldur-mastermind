@@ -20,9 +20,8 @@ def validate_http_url(value):
 
 
 class ReportingSession(UuidMixin, TimeStampedModel):
-    """One AI reporting conversation. A user may have several. The harness
-    itself keeps one conversation per user, restarted when a session's
-    first question is asked."""
+    """One AI reporting conversation. A user may have several, each with its
+    own conversation on the harness side, keyed by this model's uuid."""
 
     user = models.ForeignKey(
         User, on_delete=models.CASCADE, related_name="ai_reporting_sessions"

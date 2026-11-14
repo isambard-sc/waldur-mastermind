@@ -91,8 +91,8 @@ class AskHarnessTaskTest(test.APITestCase):
     def test_identity_headers_use_the_authenticated_users_and_sessions_real_uuids(
         self, mock_post
     ):
-        """Headers come from the message's own session and user, never from
-        the request."""
+        """The user and session come from the message itself, never from the
+        request. The session goes in the signed body."""
         mock_post.return_value = mock.Mock(
             status_code=200, json=lambda: {"answer": "ok", "new_files": []}
         )
@@ -102,9 +102,7 @@ class AskHarnessTaskTest(test.APITestCase):
 
         _, kwargs = mock_post.call_args
         self.assertEqual(kwargs["headers"]["X-Waldur-User-Id"], str(self.user.uuid))
-        self.assertEqual(
-            kwargs["headers"]["X-Waldur-Session-Id"], str(self.session.uuid)
-        )
+        self.assertEqual(json.loads(kwargs["data"])["session"], str(self.session.uuid))
 
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
     def test_request_is_unsigned_when_no_signing_key_configured(self, mock_post):
@@ -233,6 +231,7 @@ class AskHarnessTaskTest(test.APITestCase):
             json.loads(kwargs["data"]),
             {
                 "prompt": self.message.prompt,
+                "session": str(self.session.uuid),
                 "name": "Isambard Reporting Assistant",
                 "new_session": True,
             },
@@ -479,6 +478,44 @@ class NewSessionTest(test.APITestCase):
             session=self.session, prompt="x", status=ReportingMessage.Status.FAILED
         )
         self.assertIs(self._ask(mock_post, "retry")["new_session"], True)
+
+
+class FileDownloadTest(test.APITestCase):
+    def setUp(self):
+        self.user = structure_factories.UserFactory()
+        self.session = ReportingSession.objects.create(user=self.user)
+        self.message = ReportingMessage.objects.create(session=self.session, prompt="x")
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.get")
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_files_are_fetched_from_the_messages_own_session(self, mock_post, mock_get):
+        _respond(mock_post, {"answer": "ok", "new_files": ["chart.png"]})
+        mock_get.return_value = mock.Mock(content=b"png")
+        mock_get.return_value.raise_for_status = mock.Mock()
+
+        ask_harness(self.message.pk)
+
+        args, _ = mock_get.call_args
+        self.assertTrue(
+            args[0].endswith(f"/files/chart.png?session={self.session.uuid}")
+        )
+        self.assertEqual(self.message.files.get().name, "chart.png")
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.get")
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_signature_covers_the_session_parameter(self, mock_post, mock_get):
+        _respond(mock_post, {"answer": "ok", "new_files": ["chart.png"]})
+        mock_get.return_value = mock.Mock(content=b"png")
+        mock_get.return_value.raise_for_status = mock.Mock()
+
+        with mock.patch(
+            "waldur_mastermind.ai_reporting.tasks.signing.sign_request",
+            return_value={},
+        ) as sign:
+            ask_harness(self.message.pk)
+
+        signed_paths = [call.args[1] for call in sign.call_args_list]
+        self.assertIn(f"/files/chart.png?session={self.session.uuid}", signed_paths)
 
 
 class FailStaleReportingMessagesTest(test.APITestCase):

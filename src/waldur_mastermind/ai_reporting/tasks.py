@@ -51,14 +51,13 @@ def _copy_files_from_harness(
     logged and skipped - the text answer is still useful without it."""
     connection = HarnessConnection.get()
     for filename in filenames:
-        path = f"/files/{filename}"
+        # The session is in the signed path, so it can't be swapped.
+        path = f"/files/{filename}?session={message.session.uuid}"
         try:
             response = requests.get(
                 connection.endpoint(path),
-                # Same headers as the /query call.
                 headers={
                     "X-Waldur-User-Id": str(user.uuid),
-                    "X-Waldur-Session-Id": str(message.session.uuid),
                     **signing.sign_request(str(user.uuid), path, b""),
                 },
                 timeout=_HARNESS_FILE_TIMEOUT_SECONDS,
@@ -123,9 +122,14 @@ def _fail(message: ReportingMessage, user, error: str) -> None:
 
 
 def _query_harness(message: ReportingMessage, user) -> dict:
-    body = {"prompt": message.prompt, **_harness_overrides()}
-    # The harness keeps one conversation per user, so a session's first
-    # question restarts it.
+    # The harness keeps a separate conversation per session.
+    body = {
+        "prompt": message.prompt,
+        "session": str(message.session.uuid),
+        **_harness_overrides(),
+    }
+    # A harness from before per-session conversations keeps one per user, so
+    # a session's first question restarts it.
     if not message.session.messages.filter(
         pk__lt=message.pk, status=ReportingMessage.Status.DONE
     ).exists():
@@ -135,10 +139,7 @@ def _query_harness(message: ReportingMessage, user) -> dict:
     response = requests.post(
         HarnessConnection.get().endpoint("/query"),
         headers={
-            # The harness keys conversations on the user id; it doesn't
-            # read the session id yet.
             "X-Waldur-User-Id": str(user.uuid),
-            "X-Waldur-Session-Id": str(message.session.uuid),
             "Content-Type": "application/json",
             **signing.sign_request(str(user.uuid), "/query", data),
         },
