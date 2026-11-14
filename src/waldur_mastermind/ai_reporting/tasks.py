@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from datetime import timedelta
 
 import requests
@@ -136,21 +137,57 @@ def _query_harness(message: ReportingMessage, user) -> dict:
         body["new_session"] = True
     # Encoded by hand so we sign exactly the bytes that are sent.
     data = json.dumps(body).encode("utf-8")
+    timeout = config.AI_REPORTING_REQUEST_TIMEOUT_SECONDS
+    # With stream=True the timeout only limits the gap between chunks, so the
+    # whole question gets its own deadline.
+    deadline = time.monotonic() + timeout
     response = requests.post(
         HarnessConnection.get().endpoint("/query"),
         headers={
             "X-Waldur-User-Id": str(user.uuid),
             "Content-Type": "application/json",
+            # A harness that can't stream ignores this and sends one JSON body.
+            "Accept": "application/x-ndjson, application/json",
             **signing.sign_request(str(user.uuid), "/query", data),
         },
         data=data,
-        timeout=config.AI_REPORTING_REQUEST_TIMEOUT_SECONDS,
+        timeout=timeout,
+        stream=True,
     )
-    response.raise_for_status()
-    payload = response.json()
+    try:
+        response.raise_for_status()
+        if "application/x-ndjson" in response.headers.get("Content-Type", ""):
+            payload = _read_events(message, response, deadline)
+        else:
+            payload = response.json()
+    finally:
+        response.close()
     if not isinstance(payload, dict):
         raise ValueError("The harness response is not a JSON object.")
     return payload
+
+
+def _read_events(message: ReportingMessage, response, deadline: float) -> dict:
+    """Save each progress line on the message until the answer arrives."""
+    last_progress = None
+    for line in response.iter_lines():
+        if time.monotonic() > deadline:
+            raise requests.Timeout("The question ran past the request timeout.")
+        if not line:
+            continue
+        event = json.loads(line)
+        kind = event.get("type") if isinstance(event, dict) else None
+        if kind == "done":
+            return event
+        if kind == "error":
+            raise ValueError(f"The harness reported an error: {event.get('error')}")
+        text = event.get("text") if kind == "progress" else None
+        if isinstance(text, str) and text != last_progress:
+            ReportingMessage.objects.filter(
+                pk=message.pk, status=ReportingMessage.Status.PENDING
+            ).update(progress=text[:200], modified=timezone.now())
+            last_progress = text
+    raise ValueError("The harness stream ended without an answer.")
 
 
 @shared_task(name="waldur_mastermind.ai_reporting.ask_harness")

@@ -24,10 +24,25 @@ from waldur_mastermind.ai_reporting.tasks import (
     fail_stale_reporting_messages,
 )
 
+# What a harness that doesn't stream sends.
+_JSON = {"Content-Type": "application/json"}
+
+
+def _stream(mock_post, events):
+    """Make the mocked harness stream `events` (dicts, or a generator of them)."""
+    mock_post.return_value = mock.Mock(
+        status_code=200,
+        headers={"Content-Type": "application/x-ndjson"},
+        iter_lines=lambda: (json.dumps(event).encode() for event in events),
+    )
+    mock_post.return_value.raise_for_status = mock.Mock()
+
 
 def _respond(mock_post, payload):
     """Make the mocked harness return `payload` as its JSON body."""
-    mock_post.return_value = mock.Mock(status_code=200, json=lambda: payload)
+    mock_post.return_value = mock.Mock(
+        status_code=200, headers=_JSON, json=lambda: payload
+    )
     mock_post.return_value.raise_for_status = mock.Mock()
 
 
@@ -54,6 +69,7 @@ class AskHarnessTaskTest(test.APITestCase):
     def test_success_marks_done_and_stores_answer(self, mock_post):
         mock_post.return_value = mock.Mock(
             status_code=200,
+            headers=_JSON,
             json=lambda: {
                 "answer": "There are 26 projects.",
                 "new_files": ["a.png"],
@@ -77,6 +93,7 @@ class AskHarnessTaskTest(test.APITestCase):
         not an error."""
         mock_post.return_value = mock.Mock(
             status_code=200,
+            headers=_JSON,
             json=lambda: {"answer": "ok", "new_files": []},
         )
         mock_post.return_value.raise_for_status = mock.Mock()
@@ -94,7 +111,9 @@ class AskHarnessTaskTest(test.APITestCase):
         """The user and session come from the message itself, never from the
         request. The session goes in the signed body."""
         mock_post.return_value = mock.Mock(
-            status_code=200, json=lambda: {"answer": "ok", "new_files": []}
+            status_code=200,
+            headers=_JSON,
+            json=lambda: {"answer": "ok", "new_files": []},
         )
         mock_post.return_value.raise_for_status = mock.Mock()
 
@@ -108,7 +127,9 @@ class AskHarnessTaskTest(test.APITestCase):
     def test_request_is_unsigned_when_no_signing_key_configured(self, mock_post):
         _set_signing_private_key("")
         mock_post.return_value = mock.Mock(
-            status_code=200, json=lambda: {"answer": "ok", "new_files": []}
+            status_code=200,
+            headers=_JSON,
+            json=lambda: {"answer": "ok", "new_files": []},
         )
         mock_post.return_value.raise_for_status = mock.Mock()
 
@@ -130,7 +151,9 @@ class AskHarnessTaskTest(test.APITestCase):
         ).decode()
 
         mock_post.return_value = mock.Mock(
-            status_code=200, json=lambda: {"answer": "ok", "new_files": []}
+            status_code=200,
+            headers=_JSON,
+            json=lambda: {"answer": "ok", "new_files": []},
         )
         mock_post.return_value.raise_for_status = mock.Mock()
 
@@ -182,7 +205,9 @@ class AskHarnessTaskTest(test.APITestCase):
     @override_constance_config(AI_REPORTING_REQUEST_TIMEOUT_SECONDS=42)
     def test_request_timeout_is_constance_driven(self, mock_post):
         mock_post.return_value = mock.Mock(
-            status_code=200, json=lambda: {"answer": "ok", "new_files": []}
+            status_code=200,
+            headers=_JSON,
+            json=lambda: {"answer": "ok", "new_files": []},
         )
         mock_post.return_value.raise_for_status = mock.Mock()
 
@@ -201,7 +226,9 @@ class AskHarnessTaskTest(test.APITestCase):
     )
     def test_configured_overrides_are_sent_in_the_request_body(self, mock_post):
         mock_post.return_value = mock.Mock(
-            status_code=200, json=lambda: {"answer": "ok", "new_files": []}
+            status_code=200,
+            headers=_JSON,
+            json=lambda: {"answer": "ok", "new_files": []},
         )
         mock_post.return_value.raise_for_status = mock.Mock()
 
@@ -220,7 +247,9 @@ class AskHarnessTaskTest(test.APITestCase):
         """Unset overrides are omitted. Name is sent by default because its
         setting has a real default value."""
         mock_post.return_value = mock.Mock(
-            status_code=200, json=lambda: {"answer": "ok", "new_files": []}
+            status_code=200,
+            headers=_JSON,
+            json=lambda: {"answer": "ok", "new_files": []},
         )
         mock_post.return_value.raise_for_status = mock.Mock()
 
@@ -253,6 +282,7 @@ class RecordUsageTest(test.APITestCase):
     def test_success_creates_a_done_usage_record_with_real_tokens(self, mock_post):
         mock_post.return_value = mock.Mock(
             status_code=200,
+            headers=_JSON,
             json=lambda: {
                 "answer": "26 projects.",
                 "new_files": [],
@@ -294,6 +324,7 @@ class RecordUsageTest(test.APITestCase):
     def test_usage_record_survives_the_message_being_deleted(self, mock_post):
         mock_post.return_value = mock.Mock(
             status_code=200,
+            headers=_JSON,
             json=lambda: {
                 "answer": "ok",
                 "new_files": [],
@@ -313,6 +344,7 @@ class RecordUsageTest(test.APITestCase):
     def test_usage_record_survives_the_user_being_deleted(self, mock_post):
         mock_post.return_value = mock.Mock(
             status_code=200,
+            headers=_JSON,
             json=lambda: {
                 "answer": "ok",
                 "new_files": [],
@@ -478,6 +510,96 @@ class NewSessionTest(test.APITestCase):
             session=self.session, prompt="x", status=ReportingMessage.Status.FAILED
         )
         self.assertIs(self._ask(mock_post, "retry")["new_session"], True)
+
+
+class StreamingTest(test.APITestCase):
+    def setUp(self):
+        self.user = structure_factories.UserFactory()
+        self.session = ReportingSession.objects.create(user=self.user)
+        self.message = ReportingMessage.objects.create(session=self.session, prompt="x")
+
+    def _done(self, answer="ok"):
+        return {
+            "type": "done",
+            "answer": answer,
+            "new_files": [],
+            "usage": {"input_tokens": 3, "output_tokens": 2},
+        }
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_asks_for_a_stream(self, mock_post):
+        _stream(mock_post, [self._done()])
+
+        ask_harness(self.message.pk)
+
+        _, kwargs = mock_post.call_args
+        self.assertIn("application/x-ndjson", kwargs["headers"]["Accept"])
+        self.assertIs(kwargs["stream"], True)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_streamed_answer_is_saved(self, mock_post):
+        _stream(mock_post, [{"type": "progress", "text": "Working"}, self._done("26")])
+
+        ask_harness(self.message.pk)
+
+        self.message.refresh_from_db()
+        self.assertEqual(self.message.status, ReportingMessage.Status.DONE)
+        self.assertEqual(self.message.answer, "26")
+        self.assertEqual(self.message.input_tokens, 3)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_progress_is_visible_while_the_question_runs(self, mock_post):
+        seen = []
+
+        def events():
+            yield {"type": "progress", "text": "Fetching projects from Waldur"}
+            seen.append(ReportingMessage.objects.get(pk=self.message.pk).progress)
+            yield self._done()
+
+        _stream(mock_post, events())
+
+        ask_harness(self.message.pk)
+
+        self.assertEqual(seen, ["Fetching projects from Waldur"])
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_error_event_marks_failed(self, mock_post):
+        _stream(mock_post, [{"type": "error", "error": "internal error"}])
+
+        ask_harness(self.message.pk)
+
+        self.message.refresh_from_db()
+        self.assertEqual(self.message.status, ReportingMessage.Status.FAILED)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_stream_ending_without_an_answer_marks_failed(self, mock_post):
+        _stream(mock_post, [{"type": "progress", "text": "Working"}])
+
+        ask_harness(self.message.pk)
+
+        self.message.refresh_from_db()
+        self.assertEqual(self.message.status, ReportingMessage.Status.FAILED)
+
+    @override_constance_config(AI_REPORTING_REQUEST_TIMEOUT_SECONDS=60)
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.time.monotonic")
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_stream_running_past_the_timeout_fails(self, mock_post, monotonic):
+        # Progress keeps arriving, but the whole question has taken too long.
+        monotonic.side_effect = [0, 30, 61, 61]
+        _stream(
+            mock_post,
+            [
+                {"type": "progress", "text": "a"},
+                {"type": "progress", "text": "b"},
+                self._done(),
+            ],
+        )
+
+        ask_harness(self.message.pk)
+
+        self.message.refresh_from_db()
+        self.assertEqual(self.message.status, ReportingMessage.Status.FAILED)
+        self.assertIn("too long", self.message.error_message)
 
 
 class FileDownloadTest(test.APITestCase):
