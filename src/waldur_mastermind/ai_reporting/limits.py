@@ -28,9 +28,17 @@ _PER_USER_TOKEN_LIMITS = (
 def _tokens_used_since(since, **filters) -> int:
     # Reads usage records, not messages: messages can be cleaned up before
     # the weekly/monthly window ends, which would reset the limit early.
+    # Counts cache tokens too, since most input is served from cache.
     total = (
         ReportingUsageRecord.objects.filter(created__gte=since, **filters)
-        .aggregate(total=Sum(F("input_tokens") + F("output_tokens")))
+        .aggregate(
+            total=Sum(
+                F("input_tokens")
+                + F("output_tokens")
+                + F("cache_read_tokens")
+                + F("cache_write_tokens")
+            )
+        )
         .get("total")
     )
     return total or 0

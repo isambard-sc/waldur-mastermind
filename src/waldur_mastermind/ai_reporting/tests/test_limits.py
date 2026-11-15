@@ -15,7 +15,15 @@ from waldur_mastermind.ai_reporting.models import (
 )
 
 
-def _message(user, *, input_tokens=0, output_tokens=0, session=None):
+def _message(
+    user,
+    *,
+    input_tokens=0,
+    output_tokens=0,
+    cache_read_tokens=0,
+    cache_write_tokens=0,
+    session=None,
+):
     """Creates the message and the usage record, like ask_harness does."""
     session = session or ReportingSession.objects.create(user=user)
     message = ReportingMessage.objects.create(
@@ -30,6 +38,8 @@ def _message(user, *, input_tokens=0, output_tokens=0, session=None):
         status=ReportingUsageRecord.Status.DONE,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
     )
     return message
 
@@ -75,6 +85,29 @@ class EnforceUsageLimitsTest(test.APITestCase):
         other_user = structure_factories.UserFactory()
         _message(other_user, input_tokens=1000, output_tokens=1000)
         enforce_usage_limits(self.user)  # must not raise - that usage isn't mine
+
+    @override_constance_config(
+        **{**ALL_UNLIMITED, "AI_REPORTING_TOKEN_LIMIT_DAILY": 100}
+    )
+    def test_per_user_limit_counts_cache_tokens(self):
+        # Most input is cached, so leaving cache out would barely count it.
+        _message(
+            self.user,
+            input_tokens=5,
+            output_tokens=5,
+            cache_read_tokens=60,
+            cache_write_tokens=30,
+        )  # 100 >= 100
+        with self.assertRaises(Throttled):
+            enforce_usage_limits(self.user)
+
+    @override_constance_config(
+        **{**ALL_UNLIMITED, "AI_REPORTING_GLOBAL_DAILY_TOKEN_BUDGET": 100}
+    )
+    def test_global_budget_counts_cache_tokens(self):
+        _message(self.user, cache_read_tokens=100)
+        with self.assertRaises(Throttled):
+            enforce_usage_limits(self.user)
 
     @override_constance_config(
         **{**ALL_UNLIMITED, "AI_REPORTING_GLOBAL_DAILY_TOKEN_BUDGET": 100}
