@@ -1608,20 +1608,23 @@ CONSTANCE_CONFIG = {
     ),
     "AI_REPORTING_TOKEN_LIMIT_DAILY": (
         -1,
-        "Per-user daily token cap for AI reporting. -1 means unlimited.",
+        "Per-user daily token cap for AI reporting, counting input, output "
+        "and cache tokens. -1 means unlimited.",
     ),
     "AI_REPORTING_TOKEN_LIMIT_WEEKLY": (
         -1,
-        "Per-user weekly token cap for AI reporting. -1 means unlimited.",
+        "Per-user weekly token cap for AI reporting, counting input, output "
+        "and cache tokens. -1 means unlimited.",
     ),
     "AI_REPORTING_TOKEN_LIMIT_MONTHLY": (
         -1,
-        "Per-user monthly token cap for AI reporting. -1 means unlimited.",
+        "Per-user monthly token cap for AI reporting, counting input, output "
+        "and cache tokens. -1 means unlimited.",
     ),
     "AI_REPORTING_GLOBAL_DAILY_TOKEN_BUDGET": (
         5000000,
         "Site-wide token cap per calendar day (UTC) across all AI reporting "
-        "traffic. -1 means unlimited.",
+        "traffic, counting input, output and cache tokens. -1 means unlimited.",
     ),
     "AI_REPORTING_GLOBAL_REQUESTS_PER_MINUTE": (
         60,
