@@ -16,6 +16,7 @@ from rest_framework.response import Response
 
 from waldur_core.core import permissions as core_permissions
 from waldur_core.core.exceptions import IncorrectStateException
+from waldur_core.core.models import User
 from waldur_core.core.views import ActionsViewSet, ConstanceCheckExtensionMixin
 from waldur_core.structure import permissions as structure_permissions
 from waldur_mastermind.ai_reporting import limits, permissions, serializers, tasks
@@ -103,7 +104,9 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
         new_session = request_serializer.validated_data["new_session"]
         requested_session = request_serializer.validated_data["session"]
 
-        # The harness answers one question per user at a time.
+        # The harness answers one question per user at a time. Locking the
+        # user's row stops two quick asks both seeing nothing pending.
+        User.objects.select_for_update().filter(pk=request.user.pk).first()
         pending = ReportingMessage.objects.filter(
             session__user=request.user, status=ReportingMessage.Status.PENDING
         ).first()
@@ -132,7 +135,8 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
             )
 
         message = ReportingMessage.objects.create(session=session, prompt=prompt)
-        tasks.ask_harness.delay(message.pk)
+        # After commit, or a fast worker may not find the message yet.
+        transaction.on_commit(lambda: tasks.ask_harness.delay(message.pk))
 
         return Response(
             serializers.ReportingMessageSerializer(message, context=context).data,

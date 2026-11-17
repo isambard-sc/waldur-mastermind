@@ -1580,9 +1580,9 @@ CONSTANCE_CONFIG = {
     ),
     "AI_REPORTING_MODEL": (
         "",
-        "Bedrock model id override for the AI reporting harness, e.g. "
-        "'anthropic.claude-opus-5-5'. Leave empty to use the harness's own "
-        "configured default instead.",
+        "Bedrock model id for AI reporting, e.g. 'anthropic.claude-opus-5-5'. "
+        "Leave empty to use the model set in the harness's ConfigMap "
+        "(WALDUR_AGENT_MODEL).",
     ),
     "AI_REPORTING_CUSTOM_INSTRUCTIONS": (
         "",
@@ -1597,9 +1597,10 @@ CONSTANCE_CONFIG = {
         "context window. -1 means unlimited.",
     ),
     "AI_REPORTING_MAX_TURNS": (
-        -1,
+        25,
         "Maximum tool-use turns the harness may take per question before it "
-        "must give a final answer. -1 means use the harness's own default.",
+        "must give a final answer. -1 means use the harness's own default "
+        "(also 25).",
     ),
     "AI_REPORTING_REQUEST_TIMEOUT_SECONDS": (
         600,

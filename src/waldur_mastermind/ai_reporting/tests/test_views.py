@@ -138,6 +138,18 @@ class AskActionTest(test.APITestCase):
         mock_delay.assert_called_once_with(message.pk)
 
     @mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay")
+    def test_task_is_queued_only_after_the_message_is_committed(self, mock_delay):
+        # conftest runs on_commit callbacks at once, so capture it instead.
+        with mock.patch(
+            "waldur_mastermind.ai_reporting.views.transaction.on_commit"
+        ) as on_commit:
+            self.client.post(self.ask_url, {"prompt": "How many projects?"})
+        mock_delay.assert_not_called()
+
+        on_commit.call_args.args[0]()
+        mock_delay.assert_called_once()
+
+    @mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay")
     def test_ask_reuses_the_same_session_across_calls(self, mock_delay):
         self.client.post(self.ask_url, {"prompt": "first"})
         self.client.post(self.ask_url, {"prompt": "second"})

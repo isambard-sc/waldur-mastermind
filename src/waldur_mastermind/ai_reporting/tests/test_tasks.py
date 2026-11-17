@@ -243,9 +243,9 @@ class AskHarnessTaskTest(test.APITestCase):
         self.assertEqual(body["history_limit"], 10)
 
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
-    def test_default_config_sends_only_the_name_override(self, mock_post):
-        """Unset overrides are omitted. Name is sent by default because its
-        setting has a real default value."""
+    def test_default_config_sends_only_name_and_max_turns(self, mock_post):
+        """Unset overrides are omitted. Name and max turns are sent by default
+        because their settings have real default values."""
         mock_post.return_value = mock.Mock(
             status_code=200,
             headers=_JSON,
@@ -262,6 +262,7 @@ class AskHarnessTaskTest(test.APITestCase):
                 "prompt": self.message.prompt,
                 "session": str(self.session.uuid),
                 "name": "Isambard Reporting Assistant",
+                "max_turns": 25,
                 "new_session": True,
             },
         )
@@ -601,6 +602,20 @@ class StreamingTest(test.APITestCase):
         self.assertEqual(self.message.status, ReportingMessage.Status.FAILED)
         self.assertIn("too long", self.message.error_message)
 
+    @override_constance_config(AI_REPORTING_REQUEST_TIMEOUT_SECONDS=60)
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.time.monotonic")
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_answer_arriving_just_after_the_deadline_is_kept(
+        self, mock_post, monotonic
+    ):
+        monotonic.side_effect = [0, 61, 61]
+        _stream(mock_post, [self._done()])
+
+        ask_harness(self.message.pk)
+
+        self.message.refresh_from_db()
+        self.assertEqual(self.message.status, ReportingMessage.Status.DONE)
+
 
 class FileDownloadTest(test.APITestCase):
     def setUp(self):
@@ -664,6 +679,16 @@ class FailStaleReportingMessagesTest(test.APITestCase):
         self.assertEqual(ReportingUsageRecord.objects.count(), 1)
 
     @override_constance_config(AI_REPORTING_REQUEST_TIMEOUT_SECONDS=600)
+    def test_message_still_inside_twice_the_timeout_is_left_alone(self):
+        # A stream can run one read timeout past its deadline.
+        message = self._pending(minutes_old=20)
+
+        fail_stale_reporting_messages()
+
+        message.refresh_from_db()
+        self.assertEqual(message.status, ReportingMessage.Status.PENDING)
+
+    @override_constance_config(AI_REPORTING_REQUEST_TIMEOUT_SECONDS=600)
     def test_recent_pending_message_is_left_alone(self):
         message = self._pending(minutes_old=5)
 
@@ -685,7 +710,9 @@ class HarnessOverridesTest(test.APITestCase):
         self.assertEqual(_harness_overrides(), {})
 
     @override_constance_config(
-        AI_REPORTING_MODEL="anthropic.claude-opus-5-5", AI_REPORTING_NAME=""
+        AI_REPORTING_MODEL="anthropic.claude-opus-5-5",
+        AI_REPORTING_NAME="",
+        AI_REPORTING_MAX_TURNS=-1,
     )
     def test_model_override_included_when_set(self):
         self.assertEqual(_harness_overrides(), {"model": "anthropic.claude-opus-5-5"})

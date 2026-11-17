@@ -84,8 +84,9 @@ _FAILED_MESSAGE = (
 _TIMEOUT_MESSAGE = "This question took too long to answer. Try a narrower question."
 _INTERRUPTED_MESSAGE = "This question was interrupted. Please ask it again."
 
-# How long past the request timeout a message may stay pending before
-# fail_stale_reporting_messages gives up on it.
+# How long past twice the request timeout a message may stay pending before
+# fail_stale_reporting_messages gives up on it. Twice, because a stream can
+# run one more read timeout past its deadline.
 _STALE_PENDING_MARGIN = timedelta(minutes=5)
 
 
@@ -171,14 +172,15 @@ def _read_events(message: ReportingMessage, response, deadline: float) -> dict:
     """Save each progress line on the message until the answer arrives."""
     last_progress = None
     for line in response.iter_lines():
+        event = json.loads(line) if line else None
+        kind = event.get("type") if isinstance(event, dict) else None
+        # An answer is kept even if it arrives just after the deadline.
+        if kind == "done":
+            return event
         if time.monotonic() > deadline:
             raise requests.Timeout("The question ran past the request timeout.")
         if not line:
             continue
-        event = json.loads(line)
-        kind = event.get("type") if isinstance(event, dict) else None
-        if kind == "done":
-            return event
         if kind == "error":
             raise ValueError(f"The harness reported an error: {event.get('error')}")
         text = event.get("text") if kind == "progress" else None
@@ -244,7 +246,7 @@ def fail_stale_reporting_messages():
     was lost, for example to a worker restart."""
     cutoff = (
         timezone.now()
-        - timedelta(seconds=config.AI_REPORTING_REQUEST_TIMEOUT_SECONDS)
+        - 2 * timedelta(seconds=config.AI_REPORTING_REQUEST_TIMEOUT_SECONDS)
         - _STALE_PENDING_MARGIN
     )
     stale = ReportingMessage.objects.filter(
