@@ -39,9 +39,12 @@ class CheckEnabledRolesTest(test.APITestCase):
             check_enabled_roles(_Request(self.regular), view=None)
 
     @override_constance_config(AI_REPORTING_ENABLED_ROLES="all")
-    def test_all_allows_everyone(self):
+    def test_all_users_is_not_an_option(self):
+        """The harness reads as a support account, so it must never be
+        opened to every user, even if an old "all" value is stored."""
         for user in (self.staff, self.support, self.regular):
-            check_enabled_roles(_Request(user), view=None)  # must not raise
+            with self.assertRaises(PermissionDenied):
+                check_enabled_roles(_Request(user), view=None)
 
     @override_constance_config(AI_REPORTING_ENABLED_ROLES="something-unexpected")
     def test_unrecognised_value_fails_closed(self):

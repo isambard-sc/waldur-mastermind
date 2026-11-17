@@ -21,7 +21,9 @@ def check_enabled_roles(request, view, obj=None):
             raise exceptions.PermissionDenied(
                 "AI reporting is currently available to staff and support users only."
             )
-    elif enabled_roles != "all":
+    else:
+        # No "all users" option: the harness reads Waldur as a support
+        # account, so any user could ask it about anything.
         raise exceptions.PermissionDenied(
             "AI reporting access is not configured correctly."
         )

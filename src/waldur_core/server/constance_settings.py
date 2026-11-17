@@ -132,7 +132,6 @@ AI_ASSISTANT_ENABLED_ROLES_CHOICES = [
     ("disabled", "Disabled"),
     ("staff", "Staff users"),
     ("staff_and_support", "Staff and support users"),
-    ("all", "All users"),
     ("anonymous", "All users including anonymous"),
 ]
 
@@ -1571,7 +1570,8 @@ CONSTANCE_CONFIG = {
         "'disabled': nobody. "
         "'staff': staff users only. "
         "'staff_and_support': staff and support users. "
-        "'all': all authenticated users.",
+        "There's no option for all users: the harness reads Waldur as a "
+        "support account, so it could show anyone anything.",
         "choice_field",
     ),
     "AI_REPORTING_NAME": (

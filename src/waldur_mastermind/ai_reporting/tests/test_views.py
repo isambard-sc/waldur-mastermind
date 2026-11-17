@@ -455,18 +455,11 @@ class EnabledRolesIntegrationTest(test.APITestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     @override_constance_config(AI_REPORTING_ENABLED_ROLES="all")
-    def test_all_lets_a_regular_user_ask(self):
+    def test_an_old_all_value_does_not_let_a_regular_user_ask(self):
         regular = structure_factories.UserFactory()
         self.client.force_authenticate(user=regular)
         with mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay"):
             response = self.client.post(self.ask_url, {"prompt": "hi"})
-        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
-
-    @override_constance_config(AI_REPORTING_ENABLED_ROLES="all")
-    def test_usage_stats_stays_staff_and_support_only_even_when_all_is_set(self):
-        regular = structure_factories.UserFactory()
-        self.client.force_authenticate(user=regular)
-        response = self.client.get(self.usage_stats_url)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
 
@@ -552,9 +545,9 @@ class ReportingFileViewSetTest(test.APITestCase):
         response = self.client.get(self.list_url)
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
-    @override_constance_config(AI_REPORTING_ENABLED_ROLES="all")
-    def test_a_regular_user_can_list_and_delete_their_own_files_once_allowed(self):
-        regular = structure_factories.UserFactory()
+    @override_constance_config(AI_REPORTING_ENABLED_ROLES="staff_and_support")
+    def test_a_support_user_can_list_and_delete_their_own_files(self):
+        regular = structure_factories.UserFactory(is_support=True)
         regular_session = ReportingSession.objects.create(user=regular)
         regular_message = ReportingMessage.objects.create(
             session=regular_session, prompt="mine"
@@ -739,6 +732,16 @@ class HarnessConnectionApiTest(test.APITestCase):
         self.client.force_authenticate(self.staff)
         response = self.client.patch(self.url, {"base_url": "not-a-url"})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_address_outside_the_cluster_is_rejected(self):
+        self.client.force_authenticate(self.staff)
+        for url in (
+            "https://evil.example.com/",
+            "http://203.0.113.5:8000",
+            "http://harness.svc.example.com",
+        ):
+            response = self.client.patch(self.url, {"base_url": url})
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, url)
 
     def test_bare_in_cluster_hostname_accepted(self):
         self.client.force_authenticate(self.staff)

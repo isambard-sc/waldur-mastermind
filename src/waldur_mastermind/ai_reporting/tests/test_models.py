@@ -94,3 +94,26 @@ class HarnessConnectionModelTest(test.APITestCase):
         connection = HarnessConnection.get()
         connection.base_url = "http://waldur-harness:8000"
         connection.full_clean()  # must not raise
+
+
+class HarnessEndpointTest(test.APITestCase):
+    def test_a_stored_outside_address_is_never_used(self):
+        """A value saved before the validator existed still can't be called."""
+        connection = HarnessConnection.get()
+        HarnessConnection.objects.filter(pk=connection.pk).update(
+            base_url="https://evil.example.com"
+        )
+        connection.refresh_from_db()
+
+        with self.assertRaises(ValueError):
+            connection.endpoint("/query")
+
+    def test_in_cluster_addresses_are_used(self):
+        connection = HarnessConnection.get()
+        for url in (
+            "http://waldur-harness.waldur-harness.svc.cluster.local:8000",
+            "http://waldur-harness.waldur-harness.svc:8000",
+            "http://waldur-harness:8000",
+        ):
+            connection.base_url = url
+            self.assertEqual(connection.endpoint("/query"), url + "/query")
