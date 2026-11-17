@@ -1561,87 +1561,70 @@ CONSTANCE_CONFIG = {
     # see models.HarnessConnection.)
     "AI_REPORTING_ENABLED": (
         False,
-        "Turn AI reporting on. While off, the tab is hidden and every request "
-        "is refused.",
+        "Enable AI reporting.",
     ),
     "AI_REPORTING_ENABLED_ROLES": (
         "staff_and_support",
-        "Who can use AI reporting. "
-        "'disabled': nobody. "
-        "'staff': staff users only. "
-        "'staff_and_support': staff and support users. "
-        "There's no option for all users: the harness reads Waldur as a "
-        "support account, so it could show anyone anything.",
+        "Controls which user roles can access AI reporting. 'disabled': No "
+        "one. 'staff': Staff users only. 'staff_and_support': Staff and "
+        "support users.",
         "choice_field",
     ),
     "AI_REPORTING_NAME": (
         "Isambard Reporting Assistant",
-        "Display name for the AI reporting assistant persona.",
+        "Display name of the AI reporting assistant.",
     ),
     "AI_REPORTING_MODEL": (
         "",
-        "Bedrock model id for AI reporting, e.g. 'anthropic.claude-opus-5-5'. "
-        "Leave empty to use the model set in the harness's ConfigMap "
-        "(WALDUR_AGENT_MODEL).",
+        "Bedrock model ID for AI reporting. Leave empty to use the harness default.",
     ),
     "AI_REPORTING_CUSTOM_INSTRUCTIONS": (
         "",
-        "Additional instructions injected into the AI reporting system prompt. "
-        "Use this for organisation-specific context, terminology, or "
-        "behavioural guidelines.",
+        "Additional instructions added to the AI reporting system prompt.",
         "text_field",
     ),
     "AI_REPORTING_HISTORY_LIMIT": (
         -1,
-        "Maximum number of past messages kept in an AI reporting conversation's "
-        "context window. -1 means unlimited.",
+        "Maximum number of previous messages sent with each question. -1 for "
+        "unlimited.",
     ),
     "AI_REPORTING_MAX_TURNS": (
         25,
-        "Maximum tool-use turns the harness may take per question before it "
-        "must give a final answer. -1 means use the harness's own default "
-        "(also 25).",
+        "Maximum number of steps the assistant may take to answer a question. "
+        "-1 for the harness default.",
     ),
     "AI_REPORTING_REQUEST_TIMEOUT_SECONDS": (
         600,
-        "Timeout in seconds for a single question to the AI reporting harness. "
-        "Keep it under 1200 (20 minutes), the Celery task limit.",
+        "Maximum time in seconds to answer a question. Must be less than 1200.",
     ),
     "AI_REPORTING_TOKEN_LIMIT_DAILY": (
         -1,
-        "Per-user daily token cap for AI reporting, counting input, output "
-        "and cache tokens. -1 means unlimited.",
+        "Maximum tokens per user per day. -1 for unlimited.",
     ),
     "AI_REPORTING_TOKEN_LIMIT_WEEKLY": (
         -1,
-        "Per-user weekly token cap for AI reporting, counting input, output "
-        "and cache tokens. -1 means unlimited.",
+        "Maximum tokens per user per week. -1 for unlimited.",
     ),
     "AI_REPORTING_TOKEN_LIMIT_MONTHLY": (
         -1,
-        "Per-user monthly token cap for AI reporting, counting input, output "
-        "and cache tokens. -1 means unlimited.",
+        "Maximum tokens per user per month. -1 for unlimited.",
     ),
     "AI_REPORTING_GLOBAL_DAILY_TOKEN_BUDGET": (
         5000000,
-        "Site-wide token cap per calendar day (UTC) across all AI reporting "
-        "traffic, counting input, output and cache tokens. -1 means unlimited.",
+        "Maximum tokens per day (UTC) across all users. -1 for unlimited.",
     ),
     "AI_REPORTING_GLOBAL_REQUESTS_PER_MINUTE": (
         60,
-        "Site-wide cap on AI reporting questions per minute. -1 means unlimited.",
+        "Maximum questions per minute across all users. -1 for unlimited.",
     ),
     "AI_REPORTING_MESSAGE_RETENTION_DAYS": (
         90,
-        "Days to keep AI reporting questions and answers. Deleting a message "
-        "also deletes its files; usage records are always kept. Set to -1 to "
-        "disable automatic cleanup.",
+        "Number of days to keep questions and answers, including their files. "
+        "-1 to keep them indefinitely.",
     ),
     "AI_REPORTING_FILE_RETENTION_DAYS": (
         21,
-        "Days to keep AI reporting generated files (charts, PDFs, CSVs). "
-        "Usually shorter than message retention, since files are larger. Set "
-        "to -1 to disable automatic cleanup.",
+        "Number of days to keep generated files. -1 to keep them indefinitely.",
     ),
     # Anonymous AI assistant settings
     "ANONYMOUS_CHAT_USER_SLUG_SALT": (
