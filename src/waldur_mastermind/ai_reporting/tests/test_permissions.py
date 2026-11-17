@@ -1,4 +1,5 @@
 from constance.test.unittest import override_config as override_constance_config
+from django.conf import settings
 from rest_framework import test
 from rest_framework.exceptions import PermissionDenied
 
@@ -51,3 +52,12 @@ class CheckEnabledRolesTest(test.APITestCase):
         """A typo in the setting must deny access, not allow everyone."""
         with self.assertRaises(PermissionDenied):
             check_enabled_roles(_Request(self.staff), view=None)
+
+
+class EnabledRolesChoicesTest(test.APITestCase):
+    def test_all_users_is_not_offered(self):
+        choices = settings.CONSTANCE_CONFIG_CHOICES["AI_REPORTING_ENABLED_ROLES"]
+        self.assertEqual(
+            [value for value, _label in choices],
+            ["disabled", "staff", "staff_and_support"],
+        )

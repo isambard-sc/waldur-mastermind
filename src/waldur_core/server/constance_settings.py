@@ -132,6 +132,7 @@ AI_ASSISTANT_ENABLED_ROLES_CHOICES = [
     ("disabled", "Disabled"),
     ("staff", "Staff users"),
     ("staff_and_support", "Staff and support users"),
+    ("all", "All users"),
     ("anonymous", "All users including anonymous"),
 ]
 
@@ -141,7 +142,6 @@ AI_REPORTING_ENABLED_ROLES_CHOICES = [
     ("disabled", "Disabled"),
     ("staff", "Staff users"),
     ("staff_and_support", "Staff and support users"),
-    ("all", "All users"),
 ]
 
 NOTIFY_SYSTEM_CHOICES = [
@@ -1583,6 +1583,12 @@ CONSTANCE_CONFIG = {
         "Additional instructions added to the AI reporting system prompt.",
         "text_field",
     ),
+    "AI_REPORTING_LINK_DOMAINS": (
+        "",
+        "Domains whose links in AI reporting answers are clickable, "
+        "comma-separated, e.g. 'docs.isambard.ac.uk, bristol.ac.uk'. "
+        "Subdomains are included. Other links are shown as text.",
+    ),
     "AI_REPORTING_HISTORY_LIMIT": (
         -1,
         "Maximum number of previous messages sent with each question. -1 for "
@@ -2415,6 +2421,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "AI_REPORTING_ENABLED_ROLES",
         "AI_REPORTING_MODEL",
         "AI_REPORTING_CUSTOM_INSTRUCTIONS",
+        "AI_REPORTING_LINK_DOMAINS",
         "AI_REPORTING_HISTORY_LIMIT",
         "AI_REPORTING_MAX_TURNS",
         "AI_REPORTING_REQUEST_TIMEOUT_SECONDS",
@@ -2601,6 +2608,7 @@ PUBLIC_CONSTANCE_SETTINGS = (
     # Same reason, for the History tab - see
     # ai_reporting.tasks.cleanup_old_reporting_messages.
     "AI_REPORTING_MESSAGE_RETENTION_DAYS",
+    "AI_REPORTING_LINK_DOMAINS",
     "MATRIX_ENABLED",
     "MATRIX_EXTERNAL_LOGIN_METHOD",
     "AFFILIATES_ENABLED",

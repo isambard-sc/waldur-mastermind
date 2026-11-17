@@ -759,3 +759,14 @@ class DefaultOffTest(test.APITestCase):
         response = self.client.get(reverse("ai-reporting-message-list"))
 
         self.assertEqual(response.status_code, status.HTTP_424_FAILED_DEPENDENCY)
+
+
+class PublicConfigurationTest(test.APITestCase):
+    @override_constance_config(AI_REPORTING_LINK_DOMAINS="docs.isambard.ac.uk")
+    def test_link_domains_reach_the_portal(self):
+        self.client.force_authenticate(structure_factories.UserFactory())
+        response = self.client.get("/api/configuration/")
+        self.assertEqual(
+            response.data["WALDUR_CORE"]["AI_REPORTING_LINK_DOMAINS"],
+            "docs.isambard.ac.uk",
+        )
