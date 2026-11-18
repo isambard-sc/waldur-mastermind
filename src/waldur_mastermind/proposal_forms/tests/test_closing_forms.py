@@ -1,7 +1,9 @@
 import datetime
+import importlib
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
+from django.apps import apps
 from django.utils import timezone
 from rest_framework import status
 
@@ -46,7 +48,11 @@ def record(link, answers=None, response_id="resp-c1", finished=True):
 class ClosingFormsBase(FormsTestBase):
     def setUp(self):
         super().setUp()
-        for name, value in (("get_survey", {}), ("get_response_record", {"data": {}})):
+        for name, value in (
+            ("get_survey", {}),
+            ("get_response_record", {"data": {}}),
+            ("update_response_data", None),
+        ):
             patcher = mock.patch.object(client, name, return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -91,12 +97,12 @@ class ClosingFormsBase(FormsTestBase):
         ):
             return self.client.post(self.url("link"), {"step": "feedback"})
 
-    def issue(self, su="su-c1"):
+    def issue(self, su="su-c1", user=None):
         step = self.closing.steps[0]
         with mock.patch.object(
             client, "mint_single_use_link", return_value=mint("close1", su)
         ):
-            return responses.issue_link(self.project, step, self.pi)
+            return responses.issue_link(self.project, step, user or self.pi)
 
 
 class OpeningTest(ClosingFormsBase):
@@ -261,8 +267,8 @@ class RoutingTest(ClosingFormsBase):
         self.assertIsNone(stored.proposal)
         self.assertFalse(self.proposal.form_step_responses.exists())
 
+        self.assertEqual(self.get(self.pi).data["missing"], [])
         response = self.get(self.call_manager)
-        self.assertEqual(response.data["missing"], [])
         self.assertEqual(
             response.data["responses"][0]["questions"][0]["answer"], "Great"
         )
@@ -475,3 +481,165 @@ class CallSettingTest(ClosingFormsBase):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertTrue(self.client.get(url).data["closing_locked"])
+
+
+class EachPersonAnswersTest(ClosingFormsBase):
+    """Each person who fills in a project's end-of-project forms answers for
+    themselves: their own link, their own response, their own answers."""
+
+    def test_an_owner_does_not_get_the_pis_open_link(self):
+        pis = self.issue()
+        owners = self.issue(su="su-o1", user=self.owner)
+
+        self.assertNotEqual(owners.single_use_id, pis.single_use_id)
+        self.assertEqual(owners.issued_to, self.owner)
+        # The PI still gets their own open link back.
+        self.assertEqual(self.issue(su="su-other"), pis)
+
+    def test_each_person_keeps_their_own_answers(self):
+        responses.apply_response(record(self.issue()))
+        owners = self.issue(su="su-o1", user=self.owner)
+        self.assertEqual(
+            responses.apply_response(
+                record(owners, {"q1": "Fine"}, response_id="resp-o1")
+            ),
+            "applied",
+        )
+
+        stored = {
+            r.respondent: r.raw_response
+            for r in models.FormStepResponse.objects.filter(project=self.project)
+        }
+        self.assertEqual(stored, {self.pi: {"q1": "Great"}, self.owner: {"q1": "Fine"}})
+        self.assertFalse(models.FormbricksDeletion.objects.exists())
+
+    def test_an_edit_prefills_only_the_persons_own_answers(self):
+        responses.apply_response(record(self.issue()))
+        with mock.patch.object(
+            client, "get_response_record", return_value={"data": {"q1": "Great"}}
+        ):
+            owners = self.issue(su="su-o1", user=self.owner)
+        self.assertNotIn("q1=", owners.url)
+
+    def test_the_viewer_sees_their_own_progress_and_answers(self):
+        responses.apply_response(record(self.issue()))
+
+        owner_view = self.get(self.owner).data
+        self.assertEqual(owner_view["missing"], ["Project feedback"])
+        self.assertFalse(owner_view["steps"][0]["completed"])
+        self.assertEqual(owner_view["responses"], [])
+
+        pi_view = self.get(self.pi).data
+        self.assertEqual(pi_view["missing"], [])
+        self.assertTrue(pi_view["steps"][0]["completed"])
+        self.assertEqual(pi_view["responses"][0]["respondent_email"], "pi@example.org")
+
+    def test_call_managers_read_everyones_answers_with_who_gave_them(self):
+        responses.apply_response(record(self.issue()))
+        owners = self.issue(su="su-o1", user=self.owner)
+        responses.apply_response(record(owners, {"q1": "Fine"}, response_id="resp-o1"))
+
+        answers = self.get(self.call_manager).data["responses"]
+        self.assertEqual(
+            sorted(r["respondent_email"] for r in answers),
+            sorted(["pi@example.org", self.owner.email]),
+        )
+
+
+class IdentityWriteTest(ClosingFormsBase):
+    """Waldur writes the name and email of whoever filled the form in, and
+    the project's name, into the response in Formbricks: never into the
+    link."""
+
+    def apply(self, rec):
+        with self.captureOnCommitCallbacks(execute=True):
+            return responses.apply_response(rec)
+
+    def test_the_link_carries_no_name_or_email(self):
+        link = self.issue()
+        for value in ("pi@example.org", "user_email", "user_name", "project_name"):
+            self.assertNotIn(value, link.url)
+
+    def test_name_email_and_project_are_written_into_the_response(self):
+        self.apply(record(self.issue()))
+
+        client.update_response_data.assert_called_once_with(
+            "resp-c1",
+            {
+                "user_name": self.pi.full_name or self.pi.username,
+                "user_email": "pi@example.org",
+                "project_name": self.project.name,
+            },
+        )
+        stored = models.FormStepResponse.objects.get()
+        self.assertEqual(stored.respondent_email, "pi@example.org")
+        # They are not shown as answers.
+        self.assertEqual(stored.raw_response, {"q1": "Great"})
+
+    def test_not_written_again_once_there(self):
+        link = self.issue()
+        self.apply(record(link))
+        client.update_response_data.reset_mock()
+        # The webhook the write itself sets off.
+        written = record(
+            link,
+            {
+                "q1": "Great",
+                "user_name": self.pi.full_name or self.pi.username,
+                "user_email": "pi@example.org",
+                "project_name": self.project.name,
+            },
+        )
+        self.assertEqual(self.apply(written), "unchanged")
+        client.update_response_data.assert_not_called()
+
+    def test_a_failed_write_is_tried_again(self):
+        link = self.issue()
+        client.update_response_data.side_effect = client.FormbricksError("down")
+        self.apply(record(link))
+        client.update_response_data.side_effect = None
+        client.update_response_data.reset_mock()
+
+        self.assertEqual(self.apply(record(link)), "unchanged")
+        client.update_response_data.assert_called_once()
+
+    def test_application_forms_get_nothing_written(self):
+        proposal_models.Proposal.objects.filter(pk=self.proposal.pk).update(
+            state=ProposalStates.DRAFT
+        )
+        self.proposal.refresh_from_db()
+        with mock.patch.object(
+            client, "mint_single_use_link", return_value=mint("app1", "su-a1")
+        ):
+            link = responses.issue_link(
+                self.proposal, self.flow.steps[0], self.applicant
+            )
+        self.apply(
+            {
+                "id": "resp-a1",
+                "surveyId": link.survey_id,
+                "singleUseId": link.single_use_id,
+                "finished": True,
+                "data": {"q1": "x"},
+            }
+        )
+        client.update_response_data.assert_not_called()
+
+
+class RespondentBackfillTest(ClosingFormsBase):
+    def test_existing_answers_get_the_person_their_link_was_issued_to(self):
+        set_respondents = importlib.import_module(
+            "waldur_mastermind.proposal_forms.migrations."
+            "0005_per_respondent_closing_responses"
+        ).set_respondents
+        responses.apply_response(record(self.issue()))
+        models.FormStepResponse.objects.update(
+            respondent=None, respondent_name="", respondent_email=""
+        )
+
+        set_respondents(apps, None)
+
+        stored = models.FormStepResponse.objects.get()
+        self.assertEqual(stored.respondent, self.pi)
+        self.assertEqual(stored.respondent_email, "pi@example.org")
+        self.assertTrue(stored.respondent_name)

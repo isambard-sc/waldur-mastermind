@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from constance import config
 from django.contrib.contenttypes.models import ContentType
+from django.db import transaction
 from django.db.models import Q
 from django.db.models.query import QuerySet
 from django.utils import timezone
@@ -306,12 +307,54 @@ def permission_factory(permission, sources=None):
     return permission_function
 
 
+def project_manager_role_names() -> list[str]:
+    """The roles that count as a project's manager: PROJECT.MANAGER and any
+    the site names in PROJECT_MANAGER_ROLES (e.g. a custom "Project Lead"),
+    so a site can use its own role in its place. Copies of these (roles whose
+    template they are) count too, as for any role."""
+    names = [enums.RoleEnum.PROJECT_MANAGER]
+    for name in config.PROJECT_MANAGER_ROLES or []:
+        name = str(name).strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def expand_role_names(names) -> list[str]:
+    """Role names as matched: PROJECT.MANAGER stands for every role the site
+    counts as the project manager."""
+    names = list(names)
+    if enums.RoleEnum.PROJECT_MANAGER in names:
+        names += [n for n in project_manager_role_names() if n not in names]
+    return names
+
+
+def role_names_q(names) -> Q:
+    """UserRoles holding one of these roles, a copy of one, or (for
+    PROJECT.MANAGER) a role the site counts as the project manager."""
+    names = expand_role_names(names)
+    return Q(role__name__in=names) | Q(role__template__name__in=names)
+
+
+def role_q(role) -> Q:
+    """UserRoles holding this role or a copy of it, and, when it is
+    PROJECT.MANAGER, a role the site counts as the project manager."""
+    q = Q(role=role) | Q(role__template=role)
+    if role.name == enums.RoleEnum.PROJECT_MANAGER:
+        aliases = project_manager_role_names()[1:]
+        if aliases:
+            q |= Q(role__name__in=aliases, role__content_type=role.content_type)
+            q |= Q(
+                role__template__name__in=aliases,
+                role__content_type=role.content_type,
+            )
+    return q
+
+
 def get_users(scope, role_name=None):
     users = models.UserRole.objects.filter(is_active=True, scope=scope)
     if role_name:
-        users = users.filter(
-            Q(role__name=role_name) | Q(role__template__name=role_name)
-        )
+        users = users.filter(role_names_q([role_name]))
     user_ids = users.values_list("user_id", flat=True)
     return User.objects.filter(id__in=user_ids)
 
@@ -345,9 +388,7 @@ def get_scope_ids(user, content_type, role=None, permission=None) -> QuerySet[in
             else:
                 # This is a string (like RoleEnum) - use directly
                 role_names.append(r)
-        qs = qs.filter(
-            Q(role__name__in=role_names) | Q(role__template__name__in=role_names)
-        )
+        qs = qs.filter(role_names_q(role_names))
     if permission:
         qs = qs.filter(role__permissions__permission=permission)
     return qs.order_by().values_list("object_id", flat=True).distinct()
@@ -361,11 +402,11 @@ def get_user_ids(content_type, scope_ids, role=None):
     )
     if role:
         if isinstance(role, models.Role):
-            qs = qs.filter(Q(role=role) | Q(role__template=role))
+            qs = qs.filter(role_q(role))
         else:
             if not isinstance(role, list | tuple):
                 role = [role]
-            qs = qs.filter(Q(role__name__in=role) | Q(role__template__name__in=role))
+            qs = qs.filter(role_names_q(role))
     return qs.values_list("user_id", flat=True)
 
 
@@ -393,7 +434,7 @@ def has_user(scope, user, role=None, expiration_time=False, *, match_clones=True
     qs = models.UserRole.objects.filter(is_active=True, user=user, scope=scope)
     if role:
         if match_clones:
-            qs = qs.filter(Q(role=role) | Q(role__template=role))
+            qs = qs.filter(role_q(role))
         else:
             qs = qs.filter(role=role)
     if expiration_time is None:
@@ -484,51 +525,56 @@ def get_scope_ancestors(scope):
     return [ancestor for ancestor in ancestors if ancestor is not None]
 
 
-def count_active_project_managers(project):
+def count_active_project_managers(project, exclude=None):
+    """Active project managers of ``project``; ``exclude`` (a UserRole) is
+    left out, for a role change that replaces it."""
     now = timezone.now()
+    qs = models.UserRole.objects.filter(
+        scope=project,
+        is_active=True,
+        user__is_active=True,
+    )
+    if exclude is not None:
+        qs = qs.exclude(pk=exclude.pk)
     return (
-        models.UserRole.objects.filter(
-            scope=project,
-            is_active=True,
-            user__is_active=True,
-        )
-        .filter(
-            Q(role__name=enums.RoleEnum.PROJECT_MANAGER)
-            | Q(role__template__name=enums.RoleEnum.PROJECT_MANAGER)
-        )
+        qs.filter(role_names_q([enums.RoleEnum.PROJECT_MANAGER]))
         .filter(Q(expiration_time=None) | Q(expiration_time__gte=now))
         .count()
     )
 
 
-def validate_only_one_project_manager(scope, role):
+def validate_only_one_project_manager(scope, role, replacing=None):
     if not config.ONLY_ONE_PROJECT_MANAGER:
         return
 
     if scope._meta.model_name != "project":
         return
 
-    is_manager_role = role.name == enums.RoleEnum.PROJECT_MANAGER or (
-        role.template_id is not None
-        and role.template.name == enums.RoleEnum.PROJECT_MANAGER
+    manager_roles = project_manager_role_names()
+    is_manager_role = role.name in manager_roles or (
+        role.template_id is not None and role.template.name in manager_roles
     )
     if not is_manager_role:
         return
 
-    if count_active_project_managers(scope) >= 1:
+    if count_active_project_managers(scope, exclude=replacing) >= 1:
         raise ValidationError("Project already has an active project manager.")
 
 
-def validate_single_role_per_scope(scope, user):
+def validate_single_role_per_scope(scope, user, replacing=None):
     """Reject a second role in one scope when INVITATION_DISABLE_MULTIPLE_ROLES is on.
 
     Unlike the duplicate-grant guard in ``validate_role_grant``, this counts any
     active role the user holds in ``scope``, not only the one being granted.
+    ``replacing`` (a UserRole) is left out, for a role change that replaces it.
     """
     if not config.INVITATION_DISABLE_MULTIPLE_ROLES:
         return
 
-    if has_user(scope, user):
+    others = models.UserRole.objects.filter(is_active=True, user=user, scope=scope)
+    if replacing is not None:
+        others = others.exclude(pk=replacing.pk)
+    if others.exists():
         raise ValidationError("User already has role within this scope.")
 
 
@@ -592,7 +638,7 @@ def validate_scope_available(scope):
         raise ValidationError("Offering is not available.")
 
 
-def validate_role_grant(scope, user, role):
+def validate_role_grant(scope, user, role, replacing=None):
     """Validate a role can be granted to a user on scope.
 
     Mirrors the role/scope checks in UserRoleCreateSerializer.validate so
@@ -604,6 +650,10 @@ def validate_role_grant(scope, user, role):
     however soon it expires. A second active row for the same (user, role, scope)
     would break update_user and delete_user, which expect exactly one; changing
     how long a role lasts goes through update_user instead.
+
+    ``replacing`` is the UserRole a role change replaces (change_user_role):
+    the rules that allow one role per user, or one manager per project, leave
+    it out, as it goes in the same step.
     """
     if has_user(scope, user, role, match_clones=False):
         raise ValidationError("User has already the same role in this scope.")
@@ -618,8 +668,8 @@ def validate_role_grant(scope, user, role):
 
     check_grant_policy(scope, role)
 
-    validate_single_role_per_scope(scope, user)
-    validate_only_one_project_manager(scope, role)
+    validate_single_role_per_scope(scope, user, replacing=replacing)
+    validate_only_one_project_manager(scope, role, replacing=replacing)
     validate_user_restrictions(scope, user)
 
 
@@ -727,6 +777,46 @@ def is_quiet_grant_source(source: str) -> bool:
     return bool(source) and any(
         source.startswith(prefix) for prefix in QUIET_GRANT_SOURCE_PREFIXES
     )
+
+
+# A role change keeps the expiry the previous role had unless given one.
+KEEP_EXPIRATION = object()
+
+
+@transaction.atomic()
+def change_user_role(
+    scope,
+    user,
+    previous,
+    role,
+    changed_by=None,
+    expiration_time=KEEP_EXPIRATION,
+):
+    """Change ``user``'s role on ``scope`` from ``previous`` (their active
+    UserRole there) to ``role``, as one step.
+
+    The new role is checked as a grant first (validate_role_grant, leaving
+    out the role it replaces), then the previous role is revoked and the new
+    one granted in the same transaction: if anything fails, nothing changes
+    and the user keeps the role they had. The user is never without a role
+    on the scope, so nothing that reacts to someone *losing* access (deleting
+    their accounts on a cluster, say) runs when their role only changes:
+    side effects queued on commit see the new role in place.
+
+    ``expiration_time``: the previous role's unless given (None: permanent).
+    Returns the new UserRole.
+    """
+    previous = models.UserRole.objects.select_for_update().get(pk=previous.pk)
+    if not previous.is_active or previous.user_id != user.id:
+        raise ValidationError("The user no longer has that role.")
+    if previous.role_id == role.id:
+        raise ValidationError("The user already has this role.")
+    validate_role_grant(scope, user, role, replacing=previous)
+    if expiration_time is KEEP_EXPIRATION:
+        expiration_time = previous.expiration_time
+    reason = f"Role changed from {previous.role.name} to {role.name}."
+    previous.revoke(changed_by, reason=reason)
+    return add_user(scope, user, role, changed_by, expiration_time, reason=reason)
 
 
 def add_user(

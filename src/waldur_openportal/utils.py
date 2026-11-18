@@ -7,13 +7,18 @@ import re
 from typing import NamedTuple
 
 from constance import config as constance_config
+from django.db import transaction
 from django.utils import timezone
 
 from waldur_core.core import models as core_models
 from waldur_core.core import utils as core_utils
 from waldur_core.permissions.models import Role
 from waldur_core.permissions.utils import add_user as grant_role
-from waldur_core.permissions.utils import get_permissions, validate_role_grant
+from waldur_core.permissions.utils import (
+    change_user_role,
+    get_permissions,
+    validate_role_grant,
+)
 from waldur_core.structure import models as structure_models
 from waldur_core.structure.managers import (
     get_connected_customers,
@@ -1633,7 +1638,10 @@ def set_project_member_role(project, email, role, is_existing_member: bool = Fal
     Directly add or update a user's role in a project without sending an invitation.
 
     If is_existing_member is True, the user already has an active role on the project:
-    all their current active roles are revoked before the new one is granted.
+    it becomes the new one in one step (change_user_role), so the member is never
+    without a role and nothing that reacts to someone leaving the project (removing
+    their accounts) runs; any other roles they hold there are revoked. If the new
+    role is refused, nothing changes.
 
     If is_existing_member is False, the user is looked up (or created) by email and
     added directly.
@@ -1650,9 +1658,20 @@ def set_project_member_role(project, email, role, is_existing_member: bool = Fal
 
     user = get_or_create_user_by_email(email)
 
-    if is_existing_member:
-        for perm in get_permissions(project, user):
-            perm.revoke(current_user=robot)
+    current = list(get_permissions(project, user)) if is_existing_member else []
+    if current:
+        with transaction.atomic():
+            keep = next((p for p in current if p.role_id == role.id), None)
+            changing = None if keep is not None else current[0]
+            # Other roles go first: the member keeps the one being changed, so
+            # is never without a role here.
+            for perm in current:
+                if perm is not keep and perm is not changing:
+                    perm.revoke(current_user=robot)
+            if changing is not None:
+                change_user_role(project, user, changing, role, changed_by=robot)
+        logger.debug(f"Set role {role.name} for {email} on project {project}.")
+        return
 
     validate_role_grant(project, user, role)
     grant_role(project, user, role, created_by=robot)
@@ -3198,6 +3217,7 @@ def backfill_remote_projects(dry_run: bool = False):
                 # Explicitly set Open so that the remote portal retains
                 # full control of its own membership during migration.
                 remote_project.membership_control = models.MembershipControlChoices.OPEN
+                remote_project.allowed_domains = None
                 if allocation.is_added:
                     remote_project.state = models.RemoteProjectState.ACTIVE
                     alloc_value, _ = allocation._get_requested_allocation()

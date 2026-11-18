@@ -154,10 +154,15 @@ def get_or_create_remote_project(allocation, destination: str, remote_identifier
         None — the award is still pending approval; key on
                (destination, current_project).
 
-    Defaults applied on creation:
-        membership_control = OPEN — the receiving portal manages membership
-                             until an organisation owner locks it down
-        allowed_domains    = None — no restriction
+    Defaults applied on creation (awards from a call and remote projects
+    created by hand alike):
+        membership_control = LOCKED — this portal decides who is a member
+                             and with which role; an organisation owner can
+                             open it per award
+        allowed_domains    = the domains of the project's members now
+                             (get_allowed_domains_for_project); [] — nothing
+                             allowed — if it has none. Fixed at creation: an
+                             owner widens it with set-allowed-domains
         earliest_approve   = allocation.created + 1 hour
         link_award, link_call from proposal if attached
 
@@ -167,25 +172,29 @@ def get_or_create_remote_project(allocation, destination: str, remote_identifier
     """
     from datetime import timedelta
 
-    from waldur_openportal.utils import get_proposal_links_for_project
+    from waldur_openportal.utils import (
+        get_allowed_domains_for_project,
+        get_proposal_links_for_project,
+    )
 
     project = allocation.project
 
     # Compute defaults — used when a new record is created.
     link_award, link_call = get_proposal_links_for_project(project)
 
-    # There is no call- or round-level award policy here, so a new award starts
-    # unrestricted and an organisation owner narrows it per award through the
-    # RemoteProject actions. The fork seeds these from fields on its Round
-    # instead; that model carries scheduling only here, so the fields have no
-    # home and are deliberately not carried over.
+    # A new award starts locked to its members' institutions: this portal is
+    # authoritative for membership, and only addresses from the domains of
+    # the project's members when the award is created may join. An
+    # organisation owner opens or widens it per award through the
+    # RemoteProject actions. The domains are read only when a record is
+    # created (Django resolves a callable default then), not on every sync.
     creation_defaults = {
         "remote_allocation": allocation,
         "current_project": project,
         "state": models.RemoteProjectState.PENDING,
-        "membership_control": models.MembershipControlChoices.OPEN,
+        "membership_control": models.MembershipControlChoices.LOCKED,
         "earliest_approve": allocation.created + timedelta(hours=1),
-        "allowed_domains": None,
+        "allowed_domains": lambda: get_allowed_domains_for_project(project),
         "link_award": link_award,
         "link_call": link_call,
         "link_renewal": None,
@@ -253,7 +262,9 @@ def get_or_create_remote_project(allocation, destination: str, remote_identifier
                 # have been applied on creation.
                 for field, value in creation_defaults.items():
                     if field != "current_project":
-                        setattr(remote_project, field, value)
+                        setattr(
+                            remote_project, field, value() if callable(value) else value
+                        )
                 remote_project.error_message = ""
                 remote_project.save()
             elif remote_project.remote_allocation != allocation:

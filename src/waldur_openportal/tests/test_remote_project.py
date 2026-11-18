@@ -14,10 +14,12 @@ class RemoteProjectDefaultsTest(TestCase):
     """
     The values a brand new award starts with.
 
-    These are the permissive end of the range — anyone can join, from any
-    domain — so they are pinned here to make a change to them deliberate
-    rather than incidental. Narrowing an award is an explicit act by an
-    organisation owner through the RemoteProject actions.
+    A new award is locked to its members' institutions: this portal decides
+    who is a member, and only addresses from the domains of the project's
+    members when the award is created may join. They are pinned here to make
+    a change to them deliberate rather than incidental. Opening or widening
+    an award is an explicit act by an organisation owner through the
+    RemoteProject actions.
     """
 
     def setUp(self):
@@ -46,15 +48,23 @@ class RemoteProjectDefaultsTest(TestCase):
         )
         return self.remote_projects.get_or_create.call_args.kwargs["defaults"]
 
-    def test_membership_starts_open(self):
+    def test_membership_starts_locked(self):
         self.assertEqual(
             self.created_defaults()["membership_control"],
-            models.MembershipControlChoices.OPEN,
+            models.MembershipControlChoices.LOCKED,
         )
 
-    def test_no_domain_restriction_is_applied(self):
-        # None, not [] — an empty list would mean "nobody may join".
-        self.assertIsNone(self.created_defaults()["allowed_domains"])
+    def test_domains_are_the_members_read_on_creation(self):
+        # A callable, so the members are read only when a record is created.
+        with mock.patch(
+            "waldur_openportal.utils.get_allowed_domains_for_project",
+            return_value=["*.ac.uk", "ac.uk"],
+        ) as members_domains:
+            allowed = self.created_defaults()["allowed_domains"]
+            self.assertTrue(callable(allowed))
+            members_domains.assert_not_called()
+            self.assertEqual(allowed(), ["*.ac.uk", "ac.uk"])
+        members_domains.assert_called_once_with(self.allocation.project)
 
     def test_no_renewal_link_is_set(self):
         self.assertIsNone(self.created_defaults()["link_renewal"])

@@ -1891,7 +1891,7 @@ class ProposalReturn(core_models.UuidMixin, TimeStampedModel):
     resubmitted_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
-        ordering = ("-created",)
+        ordering = ("-created", "-id")
 
     def __str__(self):
         return f"{self.proposal} returned {self.created:%Y-%m-%d}"

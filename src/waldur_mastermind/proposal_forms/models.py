@@ -132,12 +132,14 @@ class FormFlow(core_models.UuidMixin, TimeStampedModel):
         blank=True,
         help_text=_(
             "What each step's survey asks, as read from Formbricks at the last "
-            "sync: {survey_id: {name, questions: [{id, type, label, choices}]}}."
+            "sync (or when a response answered a question it did not know): "
+            "{survey_id: {name, questions: [{id, type, label, choices}], "
+            "hidden_fields: [id]}}."
         ),
     )
 
     class Meta:
-        ordering = ("name",)
+        ordering = ("name", "id")
 
     def __str__(self):
         return self.name
@@ -313,12 +315,14 @@ class FormbricksDeletion(TimeStampedModel):
 
 
 class FormStepResponse(core_models.UuidMixin, TimeStampedModel):
-    """An applicant's answers to one step, as Formbricks has them.
+    """An applicant's answers to one step, as Formbricks has them (for an
+    end-of-project form, one person's answers).
 
     Written from the webhook or a fetch, and updated when Formbricks changes
     (it is the source of truth). The question labels are captured at the same
-    moment, so the answers always read as the questions were worded when the
-    applicant saw them, whatever happens to the survey afterwards.
+    moment, from the flow's copy of the survey, and kept with the answers, so
+    they still read right after a question is removed. A Sync relabels them
+    with the survey's current wording.
     """
 
     class Permissions:
@@ -344,6 +348,20 @@ class FormStepResponse(core_models.UuidMixin, TimeStampedModel):
     link = models.ForeignKey(
         FormLink, on_delete=models.SET_NULL, null=True, blank=True, related_name="+"
     )
+    # Whose answers these are. An end-of-project form is answered by each
+    # person who fills it in (the PI, an organisation owner), one response
+    # each; a proposal's forms are the team's, one response per form, so
+    # these stay empty there. The name and email are kept as they were when
+    # the answers came in, so the record outlives the account.
+    respondent = models.ForeignKey(
+        core_models.User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    respondent_name = models.CharField(max_length=255, blank=True)
+    respondent_email = models.CharField(max_length=320, blank=True)
     raw_response = models.JSONField(default=dict, blank=True)
     question_labels = models.JSONField(default=dict, blank=True)
     # jsonb does not keep object key order, so the order the questions were
@@ -363,9 +381,9 @@ class FormStepResponse(core_models.UuidMixin, TimeStampedModel):
                 name="proposal_forms_response_proposal_step",
             ),
             models.UniqueConstraint(
-                fields=["project", "step_key"],
+                fields=["project", "step_key", "respondent"],
                 condition=models.Q(project__isnull=False),
-                name="proposal_forms_response_project_step",
+                name="proposal_forms_response_project_step_respondent",
             ),
         ]
 

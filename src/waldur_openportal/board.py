@@ -9,6 +9,7 @@ from django.core.exceptions import ValidationError
 from django.utils import timezone
 
 from waldur_core.core.enums import ReviewStates
+from waldur_core.permissions import utils as permissions_utils
 from waldur_core.structure import models as structure_models
 from waldur_mastermind.invoices import models as invoice_models
 
@@ -17,6 +18,15 @@ from . import config, exceptions, models, utils
 logger = logging.getLogger(__name__)
 
 PROJECT_GRACE_PERIOD_DAYS = 30
+
+
+def _is_project_manager_role(role) -> bool:
+    """Whether the role is one the site counts as the project's manager."""
+    names = permissions_utils.project_manager_role_names()
+    return role.name in names or (
+        role.template_id is not None and role.template.name in names
+    )
+
 
 # An allocation increase smaller than this many credits, measured against the
 # credits last approved, is applied without review. It absorbs rounding
@@ -1247,7 +1257,28 @@ class OpenPortalBoard:
         if details.members is not None:
             can_change_roles = details.can_change_roles()
 
-            # Add missing members; enforce roles only when we are authoritative.
+            # Remove members absent from the authoritative list first, so a
+            # role they held (a project's one manager, say) is free for the
+            # member taking it over.  Only done when the sender owns
+            # membership AND actually sent a list: members=None means "do not
+            # manage membership" and must never be read as an empty
+            # authoritative list, or every member of the project would be
+            # revoked by a partial update.
+            if not can_change_membership:
+                incoming_emails = {
+                    str(e).strip().lower() for e in details.members.keys()
+                }
+
+                for email in list(current_members.keys()):
+                    if email not in incoming_emails:
+                        logger.info(
+                            f"Removing {email} from project {project} "
+                            f"(not in authoritative member list)."
+                        )
+                        utils.remove_project_member(project, email)
+                        current_members.pop(email, None)
+
+            wanted = []
             for email, role in details.members.items():
                 # get_project_members() keys on the normalised address, so the
                 # incoming address has to be normalised the same way before it
@@ -1265,17 +1296,26 @@ class OpenPortalBoard:
                         f"— skipping member {email}."
                     )
                     continue
+                wanted.append((email, local_role))
 
+            # The project's manager last: when the award moves that role from
+            # one member to another (ONLY_ONE_PROJECT_MANAGER), the previous
+            # holder has to be moved to their new role before the new holder
+            # can be given it, whatever order the sender listed them in.
+            wanted.sort(key=lambda pair: _is_project_manager_role(pair[1]))
+
+            # Add missing members; enforce roles only when we are authoritative.
+            for email, local_role in wanted:
                 existing_role_name = current_members.get(email, None)
 
-                if existing_role_name is None:
-                    # Not a member yet — add regardless of control settings.
-                    # How they are added is a site policy: invite them and let
-                    # them accept, or grant the role outright. Either way the
-                    # pending state is reported back to the sending portal as
-                    # membership, so the award converges now rather than
-                    # whenever the user gets round to acting on it.
-                    try:
+                try:
+                    if existing_role_name is None:
+                        # Not a member yet — add regardless of control settings.
+                        # How they are added is a site policy: invite them and
+                        # let them accept, or grant the role outright. Either
+                        # way the pending state is reported back to the
+                        # sending portal as membership, so the award converges
+                        # now rather than whenever the user acts on it.
                         if constance_config.OPENPORTAL_MEMBERSHIP_SYNC_MODE == "direct":
                             utils.set_project_member_role(
                                 project=project,
@@ -1290,40 +1330,23 @@ class OpenPortalBoard:
                                 role=local_role,
                                 send_email=True,
                             )
-                    except ValidationError as e:
-                        # One member failing the role rules is not a reason to
-                        # abandon the rest of the award.
-                        logger.error(
-                            f"Cannot add {email} to project {project} "
-                            f"with role {local_role.name}: {e}"
+                    elif not can_change_roles and existing_role_name != local_role.name:
+                        # Member exists with wrong role and we are
+                        # authoritative on roles.
+                        utils.set_project_member_role(
+                            project=project,
+                            email=email,
+                            role=local_role,
+                            is_existing_member=True,
                         )
-                        continue
-                elif not can_change_roles and existing_role_name != local_role.name:
-                    # Member exists with wrong role and we are authoritative on roles.
-                    utils.set_project_member_role(
-                        project=project,
-                        email=email,
-                        role=local_role,
-                        is_existing_member=True,
+                except ValidationError as e:
+                    # One member failing the role rules is not a reason to
+                    # abandon the rest of the award.
+                    logger.error(
+                        f"Cannot give {email} the role {local_role.name} on "
+                        f"project {project}: {e}"
                     )
-
-            # Remove members absent from the authoritative list.  Only done
-            # when the sender owns membership AND actually sent a list:
-            # members=None means "do not manage membership" and must never be
-            # read as an empty authoritative list, or every member of the
-            # project would be revoked by a partial update.
-            if not can_change_membership:
-                incoming_emails = {
-                    str(e).strip().lower() for e in details.members.keys()
-                }
-
-                for email in list(current_members.keys()):
-                    if email not in incoming_emails:
-                        logger.info(
-                            f"Removing {email} from project {project} "
-                            f"(not in authoritative member list)."
-                        )
-                        utils.remove_project_member(project, email)
+                    continue
 
         if pending_increase is not None:
             # Everything else has been applied; only the increase waits.

@@ -97,7 +97,15 @@ then report `form_flow: null` and are submitted with Waldur's form alone.
 
    Formbricks merges an update into the survey, so nothing else is written.
    Only surveys that are a step of a flow are ever changed. Sync also stores
-   each survey's questions on the flow.
+   each survey's questions on the flow, which label the answers.
+
+   **Editing a live survey.** Answers are labelled from that stored copy,
+   without asking Formbricks. A response answering a question the copy does
+   not know (one added since the last sync) makes Waldur read the survey
+   once, outside any lock, and keep the new copy. A reworded question takes
+   its new wording at the next sync. Sync relabels the answers already
+   stored, too (their answers and dates are untouched), so after editing a
+   survey that is in use, **check and sync** its flow.
 
 5. **Switch on** the feature and the connection's `enabled`.
 
@@ -183,6 +191,13 @@ answers can still be given or edited after the end.
 - **Read:** those, plus the managers of the call that granted the project,
   and staff and support. Not reviewers.
 
+**Each person answers for themselves.** Everyone who fills the forms in (the
+PI, an organisation owner) gets their own link and their own response: one
+person never opens, resumes or edits another's. The state (`steps`,
+`missing`) is the viewer's own. The answers are the viewer's own too, except
+for the call's managers, staff and support, who read everyone's; each answer
+carries `respondent_name` and `respondent_email`.
+
 The PIs are emailed once when the forms open
 (`proposal.closing_forms_open`, registered and enabled by migration). A
 project whose forms opened more than a week before the site started sending
@@ -198,7 +213,13 @@ every project that ended long ago.
 | `POST /api/project-forms/<project_uuid>/fetch/` | Bring the answers up to date |
 
 Links carry IDs only: `project_uuid`, and `proposal_uuid`, `call_uuid` and
-`round_uuid` when a call granted the project. The survey's endings return to
+`round_uuid` when a call granted the project. When a response arrives, Waldur
+writes the respondent's name and email and the project's name into its
+`user_name`, `user_email` and `project_name` hidden fields through the
+Management API, so they are in Formbricks' answers and exports. They are
+never put in the link, whose address ends up in browser histories and server
+logs and could be edited. A failed write is retried on the next webhook or
+fetch. The survey's endings return to
 `<HomePort>/projects/<uuid>/?form_survey=<survey id>`.
 
 The forms stay open through the project's grace period. When Waldur removes
@@ -211,11 +232,12 @@ is permanently deleted.
 
 1. Create a flow with `purpose: closing` whose step is the survey
    (`cms6adb6t0007uk01zr97jsxc` for AIRR).
-2. Check and sync it. Sync adds the ID hidden fields and points every ending
-   at the project page. The fields the HomePort-only version used
-   (`project_name`, `project_slug`, `user_name`, `user_email`,
-   `call_reference`) are no longer set by Waldur and are never shown as
-   answers; remove them from the survey in Formbricks when convenient.
+2. Check and sync it. Sync adds the ID hidden fields and `user_name`,
+   `user_email` and `project_name` (which Waldur writes into each response),
+   and points every ending at the project page. These are never shown as
+   answers in Waldur. The HomePort-only version's other fields
+   (`project_slug`, `call_reference`) are no longer set; remove them from
+   the survey in Formbricks when convenient.
 3. Choose it as the site's closing flow (for existing awards, perhaps
    limited to the AIRR organisations), and/or as calls' closing flows.
 

@@ -9,7 +9,14 @@ from rest_framework import exceptions, status
 from waldur_core.core import models as core_models
 from waldur_mastermind.proposal.enums import ProposalStates
 from waldur_mastermind.proposal.tests import factories as proposal_factories
-from waldur_mastermind.proposal_forms import client, handlers, models, responses, tasks
+from waldur_mastermind.proposal_forms import (
+    client,
+    handlers,
+    models,
+    responses,
+    sync,
+    tasks,
+)
 
 from .test_api import SECRET, FormsTestBase
 
@@ -36,6 +43,22 @@ def record(link, answers=None, response_id="resp-1", finished=True, **overrides)
     return data
 
 
+def survey_definition(labels: dict, hidden=()) -> dict:
+    """A survey as the Management API returns it, asking these questions."""
+    return {
+        "name": "S1",
+        "blocks": [
+            {
+                "elements": [
+                    {"id": qid, "type": "openText", "headline": {"default": label}}
+                    for qid, label in labels.items()
+                ]
+            }
+        ],
+        "hiddenFields": {"enabled": True, "fieldIds": list(hidden)},
+    }
+
+
 class FormsResponseBase(FormsTestBase):
     def setUp(self):
         super().setUp()
@@ -45,6 +68,9 @@ class FormsResponseBase(FormsTestBase):
         self.flow.save()
         for name, value in (
             ("get_survey", {}),
+            # Labels come from the flow's copy; a test that needs the live
+            # survey read sets this.
+            ("get_survey_definition", {}),
             # Prefilling an edit reads the current response from Formbricks.
             ("get_response_record", {"data": {}}),
         ):
@@ -339,13 +365,15 @@ class RealPayloadTest(FormsResponseBase):
         payload["data"]["singleUseId"] = link.single_use_id
         with mock.patch.object(
             client,
-            "get_survey",
-            return_value={
-                "cid9d22768jyf65hht3sakqq": "Project title",
-                "g81oicc5tihv86395lclkfpz": "Project duration, in months",
-                "j4b388ormyl4jiwajx158uel": "GPUh requested",
-                "tf4lhp5vsvc7993sx27q5ugd": "AIRR service requested",
-            },
+            "get_survey_definition",
+            return_value=survey_definition(
+                {
+                    "cid9d22768jyf65hht3sakqq": "Project title",
+                    "g81oicc5tihv86395lclkfpz": "Project duration, in months",
+                    "j4b388ormyl4jiwajx158uel": "GPUh requested",
+                    "tf4lhp5vsvc7993sx27q5ugd": "AIRR service requested",
+                }
+            ),
         ):
             response = WebhookTest.post(self, payload)
         self.assertEqual(response.data["detail"], "applied")
@@ -496,3 +524,150 @@ class DeletionTest(FormsResponseBase):
         self.proposal.save()
         self.proposal.delete()
         self.assertFalse(models.FormbricksDeletion.objects.exists())
+
+
+class LabelsTest(FormsResponseBase):
+    """Answers are labelled from the flow's copy of the survey, kept by Sync,
+    without asking Formbricks; the survey is read only for a question the
+    copy does not know, and Sync relabels what is stored."""
+
+    def stored(self):
+        return self.proposal.form_step_responses.get()
+
+    def test_known_questions_need_no_read(self):
+        responses.apply_response(record(self.issue()))
+        client.get_survey_definition.assert_not_called()
+        self.assertEqual(self.stored().question_labels, {"q1": "Why?"})
+
+    def test_question_added_since_the_last_sync_is_read_once(self):
+        live = survey_definition({"q2": "Is the lead employed?", "q1": "Why?"})
+        client.get_survey_definition.return_value = live
+
+        responses.apply_response(record(self.issue(), {"q1": "Yes", "q2": "No"}))
+
+        stored = self.stored()
+        self.assertEqual(stored.question_labels["q2"], "Is the lead employed?")
+        self.assertEqual(stored.question_order, ["q2", "q1"])
+        # The flow's copy now knows it, so the next response needs no read.
+        self.flow.refresh_from_db()
+        self.assertEqual(
+            [q["id"] for q in self.flow.survey_schemas["survey1"]["questions"]],
+            ["q2", "q1"],
+        )
+        client.get_survey_definition.reset_mock()
+        self.assertEqual(
+            responses.labels_for(self.flow, "survey1", {"q1": "a", "q2": "b"}),
+            {"q2": "Is the lead employed?", "q1": "Why?"},
+        )
+        client.get_survey_definition.assert_not_called()
+
+    def test_a_question_since_removed_keeps_its_label(self):
+        client.get_survey_definition.return_value = survey_definition({"q2": "New?"})
+        responses.apply_response(record(self.issue(), {"q1": "Yes", "q2": "No"}))
+        self.assertEqual(self.stored().question_labels, {"q2": "New?", "q1": "Why?"})
+        self.assertEqual(self.stored().question_order, ["q2", "q1"])
+
+    def test_the_surveys_own_hidden_fields_need_no_read(self):
+        client.get_survey_definition.return_value = survey_definition(
+            {"q1": "Why?"}, hidden=["cohort"]
+        )
+        responses.apply_response(record(self.issue(), {"q1": "Yes", "cohort": "7"}))
+        client.get_survey_definition.reset_mock()
+        self.flow.refresh_from_db()
+        responses.labels_for(self.flow, "survey1", {"q1": "Yes", "cohort": "7"})
+        client.get_survey_definition.assert_not_called()
+
+    def test_unreachable_formbricks_keeps_the_saved_labels_and_the_answers(self):
+        client.get_survey_definition.side_effect = client.FormbricksError("down")
+        self.assertEqual(
+            responses.apply_response(record(self.issue(), {"q1": "Yes", "q2": "Yes"})),
+            "applied",
+        )
+        self.assertEqual(self.stored().raw_response, {"q1": "Yes", "q2": "Yes"})
+        self.assertEqual(self.stored().question_labels, {"q1": "Why?"})
+
+    def test_a_malformed_survey_keeps_the_saved_labels_and_the_answers(self):
+        # A 200 whose survey is not the expected shape raises KeyError or
+        # TypeError, not FormbricksError; the answers still count.
+        for number, survey in enumerate(
+            ({"blocks": [{"elements": [{"no": "id"}]}]}, {"blocks": 7})
+        ):
+            with self.subTest(number=number):
+                models.FormStepResponse.objects.all().delete()
+                client.get_survey_definition.return_value = survey
+                link = self.issue(su=f"su-malformed-{number}")
+                self.assertEqual(
+                    responses.apply_response(record(link, {"q1": "Y", "q2": "N"})),
+                    "applied",
+                )
+                self.assertEqual(self.stored().question_labels, {"q1": "Why?"})
+
+    def test_the_read_happens_before_anything_is_locked(self):
+        link = self.issue()
+        entered = []
+        atomic = responses.transaction.atomic
+
+        def tracking_atomic(*args, **kwargs):
+            entered.append(True)
+            return atomic(*args, **kwargs)
+
+        def read(survey_id):
+            self.assertEqual(entered, [], "survey read inside the transaction")
+            return survey_definition({"q2": "New?"})
+
+        client.get_survey_definition.side_effect = read
+        with mock.patch.object(
+            responses.transaction, "atomic", side_effect=tracking_atomic
+        ):
+            responses.apply_response(record(link, {"q2": "No"}))
+        client.get_survey_definition.assert_called_once()
+        self.assertTrue(entered)
+
+    def test_unchanged_answers_get_a_label_they_were_missing(self):
+        client.get_survey_definition.side_effect = client.FormbricksError("down")
+        link = self.issue()
+        responses.apply_response(record(link, {"q1": "Yes", "q2": "No"}))
+        self.assertNotIn("q2", self.stored().question_labels)
+        modified = self.stored().modified
+
+        client.get_survey_definition.side_effect = None
+        client.get_survey_definition.return_value = survey_definition(
+            {"q1": "Why?", "q2": "Employed?"}
+        )
+        self.assertEqual(
+            responses.apply_response(record(link, {"q1": "Yes", "q2": "No"})),
+            "unchanged",
+        )
+        self.assertEqual(self.stored().question_labels["q2"], "Employed?")
+        self.assertEqual(self.stored().modified, modified)
+
+    def test_sync_relabels_the_stored_answers(self):
+        responses.apply_response(record(self.issue()))
+        modified = self.stored().modified
+
+        count = responses.relabel_survey_responses(
+            "survey1", {"q1": "Why do you need it?"}
+        )
+
+        self.assertEqual(count, 1)
+        stored = self.stored()
+        self.assertEqual(stored.question_labels, {"q1": "Why do you need it?"})
+        self.assertEqual(stored.raw_response, {"q1": "Yes"})
+        # When the answers were given is unchanged.
+        self.assertEqual(stored.modified, modified)
+        self.assertEqual(
+            responses.relabel_survey_responses(
+                "survey1", {"q1": "Why do you need it?"}
+            ),
+            0,
+        )
+
+    def test_check_and_sync_relabels_the_stored_answers(self):
+        responses.apply_response(record(self.issue()))
+        reworded = survey_definition({"q1": "Why do you need it?"})
+        client.get_survey_definition.return_value = reworded
+        with mock.patch.object(
+            client, "update_survey", side_effect=lambda i, c: {**reworded, **c}
+        ):
+            sync.sync_flow(self.flow, "https://api.example.com/")
+        self.assertEqual(self.stored().question_labels, {"q1": "Why do you need it?"})

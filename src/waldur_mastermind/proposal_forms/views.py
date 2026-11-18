@@ -506,16 +506,26 @@ class ProjectFormViewSet(viewsets.GenericViewSet):
         return project, flow
 
     def _state(self, project, flow):
+        """The forms as the viewer fills them in: which they have answered
+        and which they have open. Each person who fills them in answers for
+        themselves, so these are their own; the answers are theirs too,
+        except for those who read everyone's (call managers, staff and
+        support)."""
         user = self.request.user
         available = client.is_available()
         is_open = responses.closing_forms_open(project)
         answered = dict(
-            responses.subject_responses(project).values_list("step_key", "modified")
+            responses.subject_responses(project)
+            .filter(respondent=user)
+            .values_list("step_key", "modified")
         )
         open_keys = set(
             responses.subject_links(project)
-            .filter(state=models.FormLink.States.ISSUED)
+            .filter(state=models.FormLink.States.ISSUED, issued_to=user)
             .values_list("step_key", flat=True)
+        )
+        reads_all = form_permissions.reads_all_closing_answers(
+            user, project, responses.project_proposal(project)
         )
         return {
             "project_uuid": project.uuid,
@@ -537,8 +547,10 @@ class ProjectFormViewSet(viewsets.GenericViewSet):
                 }
                 for step in flow.steps
             ],
-            "missing": responses.missing_steps(project, flow),
-            "responses": responses.serialize_form_responses(project, flow.steps),
+            "missing": responses.missing_steps(project, flow, user),
+            "responses": responses.serialize_form_responses(
+                project, flow.steps, respondent=None if reads_all else user
+            ),
         }
 
     @extend_schema(
