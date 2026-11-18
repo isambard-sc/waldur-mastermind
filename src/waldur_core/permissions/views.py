@@ -37,6 +37,7 @@ from waldur_core.permissions import handlers, hygiene
 from waldur_core.permissions.filters import UserPermissionFilter
 from waldur_core.permissions.utils import (
     add_user,
+    change_user_role,
     delete_user,
     get_create_permission,
     get_delete_permission,
@@ -986,6 +987,67 @@ class UserRoleMixin:
             expiration_time=expiration_time,
             current_user=request.user,
         )
+        return Response(
+            status=status.HTTP_200_OK, data={"expiration_time": perm.expiration_time}
+        )
+
+    @extend_schema(
+        summary="Change a user's role",
+        description="Changes a user's role in the current scope in one step: "
+        "previous_role, which they hold, becomes role. The new role is checked "
+        "as a grant first; if it is refused, or anything else fails, nothing "
+        "changes and the user keeps their role. The user is never without a "
+        "role here, so nothing that reacts to someone leaving (removing their "
+        "accounts) runs. expiration_time: the previous role's when left out; "
+        "null makes the new role permanent. Needs the permissions to revoke "
+        "the previous role and to grant the new one.",
+        request=serializers.UserRoleChangeSerializer,
+        responses={200: serializers.UserRoleExpirationTimeSerializer},
+        examples=[
+            OpenApiExample(
+                "Make a project member a project administrator",
+                request_only=True,
+                value={
+                    "user": "8f20242b638743b18a485f81ac685e13",
+                    "previous_role": "PROJECT.MEMBER",
+                    "role": "PROJECT.ADMIN",
+                },
+            ),
+        ],
+    )
+    @action(detail=True, methods=["POST"])
+    def change_user_role(self, request, uuid=None):
+        scope = self.get_object()
+        validate_scope_not_soft_deleted(scope)
+        if Feature.objects.filter(
+            key="project.enforce_allowed_domains", value=True
+        ).exists():
+            from waldur_openportal.utils import check_managed_project_membership_control
+
+            # A change of role, not of membership: the user stays on the
+            # scope, so the email domain rules for joining do not apply.
+            check_managed_project_membership_control(scope, "roles")
+
+        serializer = serializers.UserRoleChangeSerializer(
+            data=request.data,
+            context={"scope": scope, "request": request, "view": self},
+        )
+        # One transaction for the checks and the change, so the previous role
+        # is locked from being checked until it is replaced.
+        with transaction.atomic():
+            serializer.is_valid(raise_exception=True)
+            data = serializer.validated_data
+            kwargs = {}
+            if "expiration_time" in data:
+                kwargs["expiration_time"] = data["expiration_time"]
+            perm = change_user_role(
+                scope,
+                data["user"],
+                data["previous"],
+                data["role"],
+                changed_by=request.user,
+                **kwargs,
+            )
         return Response(
             status=status.HTTP_200_OK, data={"expiration_time": perm.expiration_time}
         )

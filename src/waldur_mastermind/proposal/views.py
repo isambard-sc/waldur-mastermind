@@ -833,6 +833,7 @@ class ProtectedCallViewSet(UserRoleMixin, ActionsViewSet, ActionMethodMixin):
     add_user_permissions = []
     update_user_permissions = []
     delete_user_permissions = []
+    change_user_role_permissions = []
 
     queryset = models.Call.objects.all()
 

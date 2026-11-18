@@ -415,6 +415,14 @@ class FormStepResponseSerializer(serializers.Serializer):
     step_key = serializers.CharField()
     step_label = serializers.CharField()
     submitted_at = serializers.DateTimeField()
+    respondent_name = serializers.CharField(
+        allow_null=True,
+        required=False,
+        help_text="Who gave these answers, as they were then: set for a "
+        "project's end-of-project forms, which each person answers for "
+        "themselves; null for a proposal's forms, which are the team's.",
+    )
+    respondent_email = serializers.CharField(allow_null=True, required=False)
     questions = FormResponseQuestionSerializer(many=True)
 
 
@@ -509,12 +517,21 @@ class ProjectFormSerializer(serializers.Serializer):
         "project's PI or an owner of its organisation, while they are open, "
         "with forms available."
     )
-    steps = ProposalFormStepStatusSerializer(many=True)
+    steps = ProposalFormStepStatusSerializer(
+        many=True,
+        help_text="The forms as the viewer fills them in: each person who "
+        "fills them in answers for themselves, so completed and in_progress "
+        "are the viewer's own.",
+    )
     missing = serializers.ListField(
         child=serializers.CharField(),
-        help_text="Labels of the forms still to answer.",
+        help_text="Labels of the forms the viewer has still to answer.",
     )
-    responses = FormStepResponseSerializer(many=True)
+    responses = FormStepResponseSerializer(
+        many=True,
+        help_text="The answers, with who gave them: everyone's for the call's "
+        "managers, staff and support; otherwise the viewer's own.",
+    )
 
 
 class ProjectFormFetchResultSerializer(ProjectFormSerializer):

@@ -7,7 +7,9 @@ For each survey a flow uses, Waldur needs:
 - the hidden fields `proposal_uuid`, `call_uuid` and `round_uuid` (and, for
   an end-of-project flow, `project_uuid`), so staff browsing Formbricks can
   see whose response is whose, and filter by call and round (Waldur itself
-  trusts only the link);
+  trusts only the link); an end-of-project survey also needs `user_name`,
+  `user_email` and `project_name`, which Waldur writes into each response
+  (never the link);
 - every ending redirecting back to the proposal in Waldur (for an
   end-of-project flow, the project).
 
@@ -21,7 +23,10 @@ Formbricks version has it. Sync leaves it alone: Formbricks 4.9 reports the
 setting but does not keep it, so it could never be in sync there.)
 
 plan() works out what is missing, without changing anything; apply() makes
-those changes. Formbricks merges an update into the stored survey, so only
+those changes. Syncing also keeps a copy of what each survey asks on the
+flow, which labels the answers, and relabels the answers already stored
+with it, so a survey edited after it went live reads right once synced.
+Formbricks merges an update into the stored survey, so only
 these settings are ever sent: questions, logic, styling and everything else
 are never written. Only surveys that are a step of a flow are touched.
 """
@@ -32,7 +37,7 @@ import string
 
 from django.urls import reverse
 
-from . import client, models
+from . import client, models, responses
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +45,9 @@ PROPOSAL_HIDDEN_FIELD = "proposal_uuid"
 PROJECT_HIDDEN_FIELD = "project_uuid"
 Purposes = models.FormFlow.Purposes
 
-# Set on every link Waldur issues, by what the flow is for. Labels only: the
-# person filling in can edit them in the link, so Waldur never reads them back.
+# The hidden fields a flow's surveys need, by what the flow is for. The IDs
+# are set on every link Waldur issues: labels only, as the person filling in
+# can edit them in the link, so Waldur never reads them back.
 HIDDEN_FIELDS = {
     Purposes.APPLICATION: (PROPOSAL_HIDDEN_FIELD, "call_uuid", "round_uuid"),
     Purposes.CLOSING: (
@@ -49,6 +55,10 @@ HIDDEN_FIELDS = {
         PROPOSAL_HIDDEN_FIELD,
         "call_uuid",
         "round_uuid",
+        # Not on the link: Waldur writes these into each response once it
+        # arrives (responses.write_identity), and Formbricks keeps only the
+        # survey's own fields.
+        *responses.IDENTITY_FIELDS,
     ),
 }
 # The hidden field naming the page an ending returns to.
@@ -243,7 +253,20 @@ def sync_flow(flow, api_base_url, user=None) -> list:
         synced[survey_id] = {
             "name": survey.get("name") or "",
             "questions": client.survey_questions(survey),
+            "hidden_fields": sorted(client.survey_hidden_fields(survey)),
         }
     flow.survey_schemas = synced
     flow.save(update_fields=["survey_schemas", "modified"])
+    # The answers already stored take the survey's current wording too, so
+    # a survey edited after it went live reads right once synced.
+    for survey_id, schema in synced.items():
+        count = responses.relabel_survey_responses(
+            survey_id, {q["id"]: q["label"] for q in schema["questions"]}
+        )
+        if count:
+            logger.info(
+                "Relabelled %s stored response(s) to Formbricks survey %s.",
+                count,
+                survey_id,
+            )
     return check_flow(flow, api_base_url)

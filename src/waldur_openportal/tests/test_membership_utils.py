@@ -74,3 +74,43 @@ class RemoveProjectMemberTest(TestCase):
         utils.remove_project_member(self.project, "nobody@example.com")
 
         self.assertEqual(len(self.active_roles()), 1)
+
+
+class SetExistingMemberRoleTest(TestCase):
+    """An award changing a member's role changes it in one step: a refused
+    role leaves the one they had, never none."""
+
+    def setUp(self):
+        self.project = structure_factories.ProjectFactory()
+        self.user = structure_factories.UserFactory(email=EMAIL, username=EMAIL)
+        add_user(self.project, self.user, ProjectRole.MEMBER)
+
+    def roles(self):
+        return sorted(
+            p.role.name for p in get_permissions(self.project, self.user) if p.is_active
+        )
+
+    def test_role_is_changed(self):
+        utils.set_project_member_role(
+            self.project, EMAIL, ProjectRole.ADMIN, is_existing_member=True
+        )
+        self.assertEqual(self.roles(), [ProjectRole.ADMIN.name])
+
+    def test_extra_roles_go_and_one_is_changed(self):
+        add_user(self.project, self.user, ProjectRole.MANAGER)
+        utils.set_project_member_role(
+            self.project, EMAIL, ProjectRole.ADMIN, is_existing_member=True
+        )
+        self.assertEqual(self.roles(), [ProjectRole.ADMIN.name])
+
+    def test_a_refused_role_keeps_the_one_they_had(self):
+        from constance.test import override_config
+        from rest_framework.exceptions import ValidationError
+
+        add_user(self.project, structure_factories.UserFactory(), ProjectRole.MANAGER)
+        with override_config(ONLY_ONE_PROJECT_MANAGER=True):
+            with self.assertRaises(ValidationError):
+                utils.set_project_member_role(
+                    self.project, EMAIL, ProjectRole.MANAGER, is_existing_member=True
+                )
+        self.assertEqual(self.roles(), [ProjectRole.MEMBER.name])

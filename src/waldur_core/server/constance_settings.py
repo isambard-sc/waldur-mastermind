@@ -573,7 +573,18 @@ CONSTANCE_CONFIG = {
     ),
     "ONLY_ONE_PROJECT_MANAGER": (
         False,
-        "If true, a project may have at most one active project manager (PROJECT.MANAGER).",
+        "If true, a project may have at most one active project manager "
+        "(PROJECT.MANAGER, or a role named in PROJECT_MANAGER_ROLES).",
+    ),
+    "PROJECT_MANAGER_ROLES": (
+        [],
+        "Names of project roles that count as the project's manager, besides "
+        "PROJECT.MANAGER, e.g. a custom 'PROJECT.LEAD'. Wherever Waldur looks "
+        "for a project's managers (notifications, order authors, "
+        "ONLY_ONE_PROJECT_MANAGER) holders of these count too. Their "
+        "permissions are their own; who may grant them is set by "
+        "PROJECT.CREATE_PERMISSION as for any role. Empty: only PROJECT.MANAGER.",
+        "list_field",
     ),
     "DEFAULT_IDP": (
         "",
@@ -2314,6 +2325,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ENABLE_STRICT_CHECK_ACCEPTING_INVITATION",
         "INVITATION_DISABLE_MULTIPLE_ROLES",
         "ONLY_ONE_PROJECT_MANAGER",
+        "PROJECT_MANAGER_ROLES",
         "INVITATION_ALLOWED_FIELDS",
     ),
     "User profile settings": (
@@ -2651,5 +2663,6 @@ PUBLIC_CONSTANCE_SETTINGS = (
     # Personal Access Tokens
     "PAT_ENABLED",
     "ONLY_ONE_PROJECT_MANAGER",
+    "PROJECT_MANAGER_ROLES",
     "INVITATION_DISABLE_MULTIPLE_ROLES",
 )

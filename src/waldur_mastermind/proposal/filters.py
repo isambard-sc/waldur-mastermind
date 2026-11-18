@@ -1,6 +1,6 @@
 import django_filters
 from django.contrib.contenttypes.models import ContentType
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
 from django_filters.widgets import BooleanWidget
 
@@ -129,6 +129,24 @@ class CallFilter(django_filters.FilterSet):
         )
 
 
+class ProposalOrderingFilter(django_filters.OrderingFilter):
+    """Sorts by submission date with drafts (no submitted_at) last in both
+    directions: PostgreSQL would put them first when descending, so "newest
+    submitted first" would open with every draft."""
+
+    NULLS_LAST_FIELDS = ("submitted_at",)
+
+    def get_ordering_value(self, param):
+        descending = param.startswith("-")
+        name = param[1:] if descending else param
+        if name in self.NULLS_LAST_FIELDS:
+            expr = F(name)
+            return (
+                expr.desc(nulls_last=True) if descending else expr.asc(nulls_last=True)
+            )
+        return super().get_ordering_value(param)
+
+
 class ProposalFilter(django_filters.FilterSet):
     slug = django_filters.CharFilter(
         field_name="slug", lookup_expr="exact", label="Slug"
@@ -159,13 +177,14 @@ class ProposalFilter(django_filters.FilterSet):
         method="filter_as_role",
         label="Only proposals the current user holds this role on",
     )
-    o = django_filters.OrderingFilter(
+    o = ProposalOrderingFilter(
         fields=(
             "round__call__name",
             "round__start_time",
             "round__cutoff_time",
             "state",
             "created",
+            "submitted_at",
             "slug",
         )
     )

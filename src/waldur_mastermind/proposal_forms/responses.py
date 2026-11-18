@@ -5,10 +5,17 @@ A form belongs to a *subject*: a proposal (its application forms, from the
 call's flow) or a project (its end-of-project forms, from the closing flow
 of the call that granted it). Formbricks holds the answers (the source of
 truth); Waldur keeps one copy per subject and form (FormStepResponse), for
-showing them. A response is matched to its subject and form only by its
+showing them - for a project, one per person who fills the form in, since
+each of them answers for themselves. A response is matched to its subject and form only by its
 single-use link id, which Waldur recorded when it issued the link
 (FormLink): a webhook and a fetch go through the same apply_response, so
 they cannot disagree, and application and end-of-project answers never mix.
+
+An end-of-project response also gets the name and email of whoever filled
+it in, and the project's name, written into its hidden fields through the
+Management API once it arrives (write_identity), for those reading the
+answers in Formbricks. They are never put in the link: a link's address
+ends up in browser histories and server logs, and could be edited.
 """
 
 import datetime
@@ -54,6 +61,44 @@ def subject_links(subject):
 
 def subject_responses(subject):
     return models.FormStepResponse.objects.filter(**_subject_filter(subject))
+
+
+def _own(subject, user) -> dict:
+    """Narrows a subject's links or responses to one person's. A project's
+    end-of-project forms are each person's own; a proposal's forms belong
+    to its whole team."""
+    return {"respondent": user} if is_project(subject) else {}
+
+
+def _own_links(subject, user) -> dict:
+    return {"issued_to": user} if is_project(subject) else {}
+
+
+# The hidden fields of an end-of-project survey Waldur fills in once a
+# response arrives (see write_identity).
+IDENTITY_FIELDS = ("user_name", "user_email", "project_name")
+
+
+def identity_values(user, project) -> dict:
+    return {
+        "user_name": user.full_name or user.username,
+        "user_email": user.email or "",
+        "project_name": project.name,
+    }
+
+
+def write_identity(response_id, values: dict):
+    """Write the respondent's name and email and the project's name into a
+    response's hidden fields. Formbricks merges them into the answers it
+    has. A failure is only logged: the next fetch or webhook tries again."""
+    try:
+        client.update_response_data(response_id, values)
+    except client.FormbricksError as e:
+        logger.warning(
+            "Name and email not written to Formbricks response %s: %s",
+            response_id,
+            e,
+        )
 
 
 def project_proposal(project):
@@ -161,12 +206,15 @@ def issue_link(subject, step, user) -> models.FormLink:
     Otherwise a new single-use link is minted; if the form was answered
     before, it is prefilled with the current answers (an edit).
     """
+    # Only the person's own open link: an end-of-project form opened by
+    # someone else (an organisation owner, say) is theirs, not the PI's.
     open_link = (
         subject_links(subject)
         .filter(
             step_key=step["key"],
             survey_id=step["survey_id"],
             state=models.FormLink.States.ISSUED,
+            **_own_links(subject, user),
         )
         .order_by("-created")
         .first()
@@ -175,7 +223,11 @@ def issue_link(subject, step, user) -> models.FormLink:
         return open_link
 
     params = {}
-    current = subject_responses(subject).filter(step_key=step["key"]).first()
+    current = (
+        subject_responses(subject)
+        .filter(step_key=step["key"], **_own(subject, user))
+        .first()
+    )
     if current is not None:
         answers = current.raw_response
         if current.response_id:
@@ -210,16 +262,84 @@ def issue_link(subject, step, user) -> models.FormLink:
 # --- taking in responses ------------------------------------------------------
 
 
-def _labels_for(flow, survey_id):
-    schema = (flow.survey_schemas or {}).get(survey_id) or {}
-    if schema.get("questions"):
-        return {q["id"]: q["label"] for q in schema["questions"]}
+def _saved_survey(flow, survey_id) -> dict:
+    return (flow.survey_schemas or {}).get(survey_id) or {}
+
+
+def _labels(questions) -> dict:
+    return {q["id"]: q["label"] for q in questions or []}
+
+
+def refresh_saved_survey(flow, survey_id) -> dict | None:
+    """Read a survey from Formbricks and keep it as the flow's copy, as Sync
+    does. Returns its labels, or None if it cannot be read: unreachable, or
+    a 200 with a survey of an unexpected shape (KeyError, TypeError)."""
     try:
-        return client.get_survey(survey_id)
-    except client.FormbricksError as e:
+        survey = client.get_survey_definition(survey_id)
+        questions = client.survey_questions(survey)
+        hidden = sorted(client.survey_hidden_fields(survey))
+    except (client.FormbricksError, KeyError, TypeError, AttributeError) as e:
         # The answers matter more than their labels.
-        logger.warning("Formbricks question labels not fetched: %s", e)
-        return {}
+        logger.warning("Formbricks survey %s not read for labels: %s", survey_id, e)
+        return None
+    schemas = dict(flow.survey_schemas or {})
+    schemas[survey_id] = {
+        "name": survey.get("name") or "",
+        "questions": questions,
+        "hidden_fields": hidden,
+    }
+    flow.survey_schemas = schemas
+    flow.save(update_fields=["survey_schemas", "modified"])
+    return _labels(questions)
+
+
+def labels_for(flow, survey_id, answer_ids) -> dict:
+    """The labels for a response's answers, {question_id: label}, in the
+    order the survey asks them.
+
+    From the flow's copy of the survey (kept by Sync), without asking
+    Formbricks. Only when an answer is to a question that copy does not know
+    (one added since the last Sync) is the survey read again, and the copy
+    replaced, so the next response needs no read either. Labels the live
+    survey no longer has (a question since removed) are kept, after it. A
+    reworded question takes its new wording at the next Sync, which also
+    relabels the answers already stored (relabel_survey_responses).
+    """
+    saved_survey = _saved_survey(flow, survey_id)
+    saved = _labels(saved_survey.get("questions"))
+    known = set(saved) | set(saved_survey.get("hidden_fields") or [])
+    if saved and set(answer_ids) <= known:
+        return saved
+    live = refresh_saved_survey(flow, survey_id)
+    if live is None:
+        return saved
+    return {**live, **{k: v for k, v in saved.items() if k not in live}}
+
+
+def relabelled(response, labels) -> dict | None:
+    """A stored response's labels and order with the given labels laid over
+    them (the wording they give wins; labels they lack are kept), or None if
+    nothing would change."""
+    question_labels = {**(response.question_labels or {}), **labels}
+    old_order = list(response.question_order or [])
+    question_order = list(labels) + [q for q in old_order if q not in labels]
+    if question_labels == response.question_labels and question_order == old_order:
+        return None
+    return {"question_labels": question_labels, "question_order": question_order}
+
+
+def relabel_survey_responses(survey_id, labels) -> int:
+    """Give the stored answers to a survey its current labels (after Sync
+    has read it). Only the labels and their order change: not the answers,
+    nor when they were given (modified), which stands for that. Returns how
+    many were relabelled."""
+    count = 0
+    for response in models.FormStepResponse.objects.filter(survey_id=survey_id):
+        changes = relabelled(response, labels)
+        if changes:
+            models.FormStepResponse.objects.filter(pk=response.pk).update(**changes)
+            count += 1
+    return count
 
 
 def _answers(data) -> dict:
@@ -242,6 +362,21 @@ def apply_response(record: dict) -> str:
     response_id = record.get("id") or ""
     if not su_id or not response_id:
         return "unknown-link"
+
+    # The labels, worked out before anything is locked: reading the survey
+    # from Formbricks, when it is needed at all, must not hold the rows.
+    labels = {}
+    unlocked = (
+        models.FormLink.objects.select_related("proposal__round__call", "project")
+        .filter(single_use_id=su_id, survey_id=record.get("surveyId"))
+        .first()
+    )
+    if unlocked is not None:
+        label_flow = flow_for(unlocked.subject)
+        if label_flow is not None:
+            labels = labels_for(
+                label_flow, unlocked.survey_id, _answers(record.get("data"))
+            )
 
     with transaction.atomic():
         link = (
@@ -272,10 +407,12 @@ def apply_response(record: dict) -> str:
             )
             return "step-removed"
 
+        respondent = link.issued_to if is_project(subject) else None
+        own = {"respondent": respondent} if is_project(subject) else {}
         current = (
             subject_responses(subject)
             .select_for_update()
-            .filter(step_key=link.step_key)
+            .filter(step_key=link.step_key, **own)
             .first()
         )
         is_current = current is not None and current.response_id == response_id
@@ -300,16 +437,38 @@ def apply_response(record: dict) -> str:
             )
             return "late"
 
+        if respondent is not None:
+            # Also when the answers are unchanged, so a write that failed is
+            # tried again; once the values are there it is not repeated, so
+            # the webhook the write itself sets off ends here.
+            identity = identity_values(respondent, subject)
+            data = record.get("data") or {}
+            if any(data.get(k) != v for k, v in identity.items()):
+                transaction.on_commit(lambda: write_identity(response_id, identity))
+
         answers = _answers(record.get("data"))
         if is_current and current.raw_response == answers:
+            # The answers stand, but their labels may have been missing (a
+            # question added before the last Sync): give them those now.
+            changes = relabelled(current, labels)
+            if changes:
+                models.FormStepResponse.objects.filter(pk=current.pk).update(**changes)
             return "unchanged"
 
-        labels = _labels_for(flow, link.survey_id)
         previous_response_id = current.response_id if current else ""
+        if respondent is not None:
+            own_defaults = {
+                "respondent_name": respondent.full_name or respondent.username,
+                "respondent_email": respondent.email or "",
+            }
+        else:
+            own_defaults = {}
         models.FormStepResponse.objects.update_or_create(
             **_subject_filter(subject),
+            **own,
             step_key=link.step_key,
             defaults={
+                **own_defaults,
                 "survey_id": link.survey_id,
                 "response_id": response_id,
                 "link": link,
@@ -419,28 +578,41 @@ def process_deletions():
 # --- reading answers ----------------------------------------------------------
 
 
-def missing_steps(subject, flow) -> list:
-    """The labels of the forms not yet answered."""
-    answered = set(subject_responses(subject).values_list("step_key", flat=True))
+def missing_steps(subject, flow, user=None) -> list:
+    """The labels of the forms not yet answered (for a project, by user)."""
+    answered = set(
+        subject_responses(subject)
+        .filter(**(_own(subject, user) if user is not None else {}))
+        .values_list("step_key", flat=True)
+    )
     return [step["label"] for step in flow.steps if step["key"] not in answered]
 
 
-def serialize_form_responses(subject, steps, step_keys=None) -> list:
+def serialize_form_responses(subject, steps, step_keys=None, respondent=None) -> list:
     """Each stored form's answers as labelled questions, in the order the
     flow asks them, for reading in the proposal.
 
     step_keys, if given, limits which forms are included (reviewers see only
     the reviewer-visible ones). A form no longer in the flow is listed last,
-    under its key.
+    under its key. respondent, if given, limits them to that person's (a
+    project's end-of-project answers, each person's own); each is listed
+    with who gave it.
     """
     stored = subject_responses(subject)
     if step_keys is not None:
         stored = stored.filter(step_key__in=step_keys)
+    if respondent is not None:
+        stored = stored.filter(respondent=respondent)
 
     position = {step["key"]: index for index, step in enumerate(steps)}
     labels = {step["key"]: step["label"] for step in steps}
     stored = sorted(
-        stored, key=lambda r: (position.get(r.step_key, len(steps)), r.step_key)
+        stored,
+        key=lambda r: (
+            position.get(r.step_key, len(steps)),
+            r.step_key,
+            r.respondent_name.lower(),
+        ),
     )
 
     result = []
@@ -457,6 +629,8 @@ def serialize_form_responses(subject, steps, step_keys=None) -> list:
                 "step_key": response.step_key,
                 "step_label": labels.get(response.step_key, response.step_key),
                 "submitted_at": response.modified,
+                "respondent_name": response.respondent_name or None,
+                "respondent_email": response.respondent_email or None,
                 "questions": [
                     {
                         "question_id": question_id,

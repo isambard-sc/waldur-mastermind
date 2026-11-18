@@ -325,6 +325,12 @@ def get_response_record(response_id) -> dict:
     return _get(f"/api/v1/management/responses/{response_id}")["data"]
 
 
+def update_response_data(response_id, data: dict):
+    """Set some of a response's fields. Formbricks merges the given data into
+    the response's, leaving the rest (and whether it is finished) as it was."""
+    _request("PUT", f"/api/v1/management/responses/{response_id}", json={"data": data})
+
+
 def delete_response(response_id):
     """Delete a response Waldur recorded. A response already gone counts as
     deleted."""

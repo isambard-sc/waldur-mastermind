@@ -779,6 +779,73 @@ class UserRoleCreateSerializer(UserRoleMutateSerializer):
         return attrs
 
 
+class UserRoleChangeSerializer(UserRoleMutateSerializer):
+    """Change a user's role on a scope in one step: ``previous_role`` (one
+    they hold there) becomes ``role``. Allowed to whoever may both revoke the
+    previous role and grant the new one there; the new role is checked as a
+    grant. ``expiration_time``: the previous role's when left out."""
+
+    change = RoleChange.GRANT
+
+    previous_role = serializers.CharField(
+        help_text="The role the user holds now (name or UUID)."
+    )
+
+    def get_permission(self, scope):
+        return get_create_permission(scope)
+
+    def validate_previous_role(self, value):
+        return self.validate_role(value)
+
+    def validate(self, attrs):
+        # Granting the new role: the scope's create permission, and the role
+        # change guards for a grant.
+        attrs = super().validate(attrs)
+        scope = self.context["scope"]
+        request = self.context["request"]
+        target_user = attrs["user"]
+        previous_role: models.Role = attrs["previous_role"]
+
+        # Revoking the previous one: the scope's delete permission, and the
+        # guards for a revocation.
+        permission = get_delete_permission(scope)
+        customer = _get_customer(scope)
+        if not (
+            has_permission(request, permission, customer)
+            or has_permission(request, permission, scope)
+        ):
+            can_manage_by_oversight = getattr(
+                self.context.get("view"), "can_manage_role_by_oversight", None
+            )
+            if not (
+                can_manage_by_oversight
+                and can_manage_by_oversight(scope, previous_role, request)
+            ):
+                raise PermissionDenied()
+        validate_role_change(
+            scope, previous_role, request.user, RoleChange.REVOKE, user=target_user
+        )
+
+        if not target_user.is_active and not request.user.is_staff:
+            raise ValidationError(
+                "Only staff users can assign roles to deactivated users."
+            )
+
+        previous = (
+            models.UserRole.objects.filter(
+                scope=scope, user=target_user, role=previous_role, is_active=True
+            )
+            .order_by("-created")
+            .first()
+        )
+        if previous is None:
+            raise ValidationError(
+                {"previous_role": "The user does not have this role here."}
+            )
+        attrs["previous"] = previous
+        return attrs
+
+
 class UserRoleUpdateSerializer(UserRoleMutateSerializer):
     change = RoleChange.UPDATE
 

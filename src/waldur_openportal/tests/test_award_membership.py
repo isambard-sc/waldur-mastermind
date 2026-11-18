@@ -315,3 +315,87 @@ class MembershipSyncModeTest(MembershipSyncFixture, TestCase):
         self.utils.remove_project_member.assert_called_once_with(
             self.project, "bob@example.com"
         )
+
+
+@override_config(
+    OPENPORTAL_MEMBERSHIP_SYNC_MODE="direct",
+    PROJECT_MANAGER_ROLES=["PROJECT.LEAD"],
+    ONLY_ONE_PROJECT_MANAGER=True,
+)
+class LeadHandoverOrderTest(MembershipSyncFixture, TestCase):
+    """When the awarding portal moves the project's Lead (a manager role)
+    from one member to another, the previous Lead is moved or removed first,
+    whatever order the members are listed in, so the project is never left
+    without its Lead and the one-manager rule never refuses the new one."""
+
+    def setUp(self):
+        super().setUp()
+        self.lead_role = mock.Mock(template_id=None)
+        self.lead_role.name = "PROJECT.LEAD"
+        self.member_role = mock.Mock(template_id=None)
+        self.member_role.name = "PROJECT.MEMBER"
+        self.project_template.get_local_role_for.side_effect = {
+            "pi": self.lead_role,
+            "member": self.member_role,
+        }.__getitem__
+        self.utils.get_project_members.return_value = {
+            "alice@example.com": "PROJECT.LEAD",
+            "bob@example.com": "PROJECT.MEMBER",
+        }
+
+    def changes(self):
+        return [
+            (
+                name,
+                kwargs.get("email") or args[1],
+                getattr(kwargs.get("role"), "name", None),
+            )
+            for name, args, kwargs in self.utils.mock_calls
+            if name in ("set_project_member_role", "remove_project_member")
+        ]
+
+    def test_previous_lead_is_moved_before_the_new_one_is_appointed(self):
+        # Members arrive sorted by address, so the new Lead (aaron) comes
+        # before the previous one (zoe).
+        self.utils.get_project_members.return_value = {
+            "zoe@example.com": "PROJECT.LEAD",
+            "aaron@example.com": "PROJECT.MEMBER",
+        }
+        self.update(
+            build_details(
+                membership_control="locked",
+                members={"aaron@example.com": "pi", "zoe@example.com": "member"},
+            )
+        )
+        self.assertEqual(
+            self.changes(),
+            [
+                ("set_project_member_role", "zoe@example.com", "PROJECT.MEMBER"),
+                ("set_project_member_role", "aaron@example.com", "PROJECT.LEAD"),
+            ],
+        )
+
+    def test_previous_lead_is_removed_before_the_new_one_is_added(self):
+        self.update(
+            build_details(
+                membership_control="locked",
+                members={"carol@example.com": "pi", "bob@example.com": "member"},
+            )
+        )
+        self.assertEqual(
+            self.changes(),
+            [
+                ("remove_project_member", "alice@example.com", None),
+                ("set_project_member_role", "carol@example.com", "PROJECT.LEAD"),
+            ],
+        )
+
+    def test_a_refused_role_change_does_not_fail_the_award(self):
+        self.utils.set_project_member_role.side_effect = ValidationError("no")
+        self.update(
+            build_details(
+                membership_control="locked",
+                members={"bob@example.com": "pi", "alice@example.com": "member"},
+            )
+        )
+        self.assertEqual(self.utils.set_project_member_role.call_count, 2)

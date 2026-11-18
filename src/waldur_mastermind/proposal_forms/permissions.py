@@ -68,3 +68,14 @@ def can_read_closing(user, project, proposal) -> bool:
     return proposal is not None and proposal_permissions.oversees_proposal_call(
         user, proposal
     )
+
+
+def reads_all_closing_answers(user, project, proposal) -> bool:
+    """Whether the viewer reads everyone's end-of-project answers: the
+    managers of the call that granted the project, staff and support. Those
+    who fill them in (the PI, the organisation's owners) read their own."""
+    if user.is_staff or user.is_support:
+        return True
+    return proposal is not None and proposal_permissions.oversees_proposal_call(
+        user, proposal
+    )

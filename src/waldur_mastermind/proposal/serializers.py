@@ -1361,6 +1361,9 @@ class PublicCallSerializer(
             "evaluation_start",
             # Public so an applicant can be told results come with the round.
             "publish_results",
+            # Public so a proposal's manager is offered to hand it over, and
+            # told that only its one manager may submit it.
+            "single_proposal_manager",
         )
         view_name = "proposal-public-call-detail"
         extra_kwargs = {
@@ -2196,7 +2199,6 @@ class ProtectedCallSerializer(PublicCallSerializer):
             "one_request_per_offering",
             "minimum_number_of_documents",
             "copy_summary_to_project",
-            "single_proposal_manager",
             "undecided_at_round_completion",
         )
         view_name = "proposal-protected-call-detail"
@@ -3019,6 +3021,7 @@ class ProposalSerializer(
             "science_domain_name",
             "allocation_comment",
             "created",
+            "submitted_at",
             "compliance_status",
             "can_submit",
             "awaiting_manual_advance",
