@@ -6,7 +6,9 @@ from waldur_mastermind.ai_reporting import models
 
 
 class AskRequestSerializer(serializers.Serializer):
-    prompt = serializers.CharField(allow_blank=False, trim_whitespace=True)
+    prompt = serializers.CharField(
+        allow_blank=False, trim_whitespace=True, max_length=10_000
+    )
     # Omit to reuse the latest session, or set new_session to start a
     # fresh one.
     session = serializers.SlugRelatedField(

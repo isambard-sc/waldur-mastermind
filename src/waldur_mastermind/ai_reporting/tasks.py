@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 from datetime import timedelta
 
@@ -16,6 +17,7 @@ from waldur_mastermind.ai_reporting.models import (
     ReportingMessage,
     ReportingUsageRecord,
 )
+from waldur_mastermind.ai_reporting.permissions import role_denial
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,61 @@ _FILE_CLEANUP_CHUNK_SIZE = 100
 # Fetching a finished file is quick; this just stops one bad download from
 # hanging the task.
 _HARNESS_FILE_TIMEOUT_SECONDS = 60
+
+# Waldur doesn't rely on the harness to behave: it may be compromised, or
+# steered by text planted in Waldur data. So files are capped and checked.
+_MAX_FILES = 20
+_MAX_FILE_BYTES = 20 * 1024 * 1024
+_MAX_ANSWER_CHARS = 100_000
+_FILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+# Allowed types, checked by content as well as name: an SVG or HTML file,
+# even one named .png, could run script in the portal. None means text.
+_FILE_SIGNATURES = {
+    "png": (b"\x89PNG\r\n\x1a\n",),
+    "jpg": (b"\xff\xd8\xff",),
+    "jpeg": (b"\xff\xd8\xff",),
+    "gif": (b"GIF87a", b"GIF89a"),
+    "pdf": (b"%PDF-",),
+    "xlsx": (b"PK\x03\x04",),
+    "csv": None,
+    "txt": None,
+}
+
+
+def _allowed_name(name) -> bool:
+    return (
+        isinstance(name, str)
+        and bool(_FILE_NAME.fullmatch(name))
+        and name.rsplit(".", 1)[-1].lower() in _FILE_SIGNATURES
+    )
+
+
+def _content_matches(name: str, content: bytes) -> bool:
+    signatures = _FILE_SIGNATURES[name.rsplit(".", 1)[-1].lower()]
+    if signatures is None:
+        # Text: refuse markup, which a browser could render as a page.
+        return not content.lstrip().startswith(b"<")
+    return content.startswith(signatures)
+
+
+def _check_status(response) -> None:
+    # Redirects are never followed: the harness must answer itself, not send
+    # Waldur on to some other address.
+    if 300 <= response.status_code < 400:
+        raise requests.HTTPError(
+            f"Unexpected redirect from the harness ({response.status_code}).",
+            response=response,
+        )
+    response.raise_for_status()
+
+
+def _read_capped(response, limit: int) -> bytes:
+    content = b""
+    for chunk in response.iter_content(chunk_size=64 * 1024):
+        content += chunk
+        if len(content) > limit:
+            raise ValueError(f"File is larger than {limit} bytes.")
+    return content
 
 
 def _harness_overrides() -> dict:
@@ -62,11 +119,24 @@ def _copy_files_from_harness(
                     **signing.sign_request(str(user.uuid), path, b""),
                 },
                 timeout=_HARNESS_FILE_TIMEOUT_SECONDS,
+                allow_redirects=False,
+                stream=True,
             )
-            response.raise_for_status()
-        except requests.RequestException:
+            try:
+                _check_status(response)
+                content = _read_capped(response, _MAX_FILE_BYTES)
+            finally:
+                response.close()
+        except (requests.RequestException, ValueError):
             logger.exception(
                 "ask_harness: could not fetch file %r for message %s",
+                filename,
+                message.pk,
+            )
+            continue
+        if not _content_matches(filename, content):
+            logger.warning(
+                "ask_harness: dropped file %r for message %s: content doesn't match its type",
                 filename,
                 message.pk,
             )
@@ -74,7 +144,7 @@ def _copy_files_from_harness(
         ReportingFile.objects.create(
             message=message,
             name=filename,
-            file=ContentFile(response.content, name=filename),
+            file=ContentFile(content, name=filename),
         )
 
 
@@ -83,6 +153,7 @@ _FAILED_MESSAGE = (
 )
 _TIMEOUT_MESSAGE = "This question took too long to answer. Try a narrower question."
 _INTERRUPTED_MESSAGE = "This question was interrupted. Please ask it again."
+_NOT_AVAILABLE_MESSAGE = "AI reporting is not available to you."
 
 # How long past twice the request timeout a message may stay pending before
 # fail_stale_reporting_messages gives up on it. Twice, because a stream can
@@ -154,9 +225,10 @@ def _query_harness(message: ReportingMessage, user) -> dict:
         data=data,
         timeout=timeout,
         stream=True,
+        allow_redirects=False,
     )
     try:
-        response.raise_for_status()
+        _check_status(response)
         if "application/x-ndjson" in response.headers.get("Content-Type", ""):
             payload = _read_events(message, response, deadline)
         else:
@@ -207,6 +279,10 @@ def ask_harness(message_id: int):
         return
 
     user = message.session.user
+    # It may have waited in the queue: check access again before sending.
+    if not config.AI_REPORTING_ENABLED or not user.is_active or role_denial(user):
+        _fail(message, user, _NOT_AVAILABLE_MESSAGE)
+        return
     try:
         payload = _query_harness(message, user)
     except requests.Timeout:
@@ -223,15 +299,14 @@ def ask_harness(message_id: int):
     usage = payload.get("usage")
     if not isinstance(usage, dict):
         usage = {}
-    new_files = [
-        name for name in payload.get("new_files") or [] if isinstance(name, str)
-    ]
+    new_files = [name for name in payload.get("new_files") or [] if _allowed_name(name)]
+    new_files = new_files[:_MAX_FILES]
     finished = _finish(
         message,
         user,
         usage,
         status=ReportingMessage.Status.DONE,
-        answer=payload.get("answer") or "",
+        answer=str(payload.get("answer") or "")[:_MAX_ANSWER_CHARS],
         new_files=new_files,
         input_tokens=_count(usage, "input_tokens"),
         output_tokens=_count(usage, "output_tokens"),

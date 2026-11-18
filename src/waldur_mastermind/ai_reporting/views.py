@@ -145,7 +145,10 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
 
     # Staff/support only, whatever AI_REPORTING_ENABLED_ROLES says - other
     # users' usage is more sensitive than being able to use the tool.
-    usage_stats_permissions = [structure_permissions.is_staff_or_support]
+    usage_stats_permissions = [
+        structure_permissions.is_staff_or_support,
+        permissions.check_support_scope,
+    ]
     usage_stats_serializer_class = serializers.UsageStatsResponseSerializer
 
     @extend_schema(
@@ -299,17 +302,17 @@ class HarnessConnectionView(views.APIView):
     """The site's AI reporting harness connection. Staff may change it;
     support may read it."""
 
-    permission_classes = (IsAuthenticated,)
-
-    def _check(self, request):
-        permissions.is_staff_or_support_for_reads(request, self)
+    # Includes the access-token scopes: staff scope to change, support to read.
+    permission_classes = (
+        IsAuthenticated,
+        core_permissions.IsStaffWriterOrSupportReader,
+    )
 
     @extend_schema(
         operation_id="ai_reporting_harness_connection_retrieve",
         responses=serializers.HarnessConnectionSerializer,
     )
     def get(self, request):
-        self._check(request)
         serializer = serializers.HarnessConnectionSerializer(HarnessConnection.get())
         return Response(serializer.data)
 
@@ -319,7 +322,6 @@ class HarnessConnectionView(views.APIView):
         responses=serializers.HarnessConnectionSerializer,
     )
     def patch(self, request):
-        self._check(request)
         with transaction.atomic():
             connection = HarnessConnection.objects.select_for_update().get(
                 pk=HarnessConnection.get().pk

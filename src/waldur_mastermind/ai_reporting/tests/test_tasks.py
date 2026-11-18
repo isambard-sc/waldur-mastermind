@@ -46,6 +46,15 @@ def _respond(mock_post, payload):
     mock_post.return_value.raise_for_status = mock.Mock()
 
 
+_PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 20
+
+
+def _file_response(content: bytes):
+    response = mock.Mock(status_code=200, iter_content=lambda chunk_size: [content])
+    response.raise_for_status = mock.Mock()
+    return response
+
+
 def _sent_body(mock_post) -> dict:
     _, kwargs = mock_post.call_args
     return json.loads(kwargs["data"])
@@ -57,9 +66,10 @@ def _set_signing_private_key(value: str) -> None:
     connection.save()
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class AskHarnessTaskTest(test.APITestCase):
     def setUp(self):
-        self.user = structure_factories.UserFactory()
+        self.user = structure_factories.UserFactory(is_support=True)
         self.session = ReportingSession.objects.create(user=self.user)
         self.message = ReportingMessage.objects.create(
             session=self.session, prompt="How many projects are there?"
@@ -268,12 +278,13 @@ class AskHarnessTaskTest(test.APITestCase):
         )
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class RecordUsageTest(test.APITestCase):
     """ask_harness leaves a usage record for every outcome, and it survives
     the message being deleted."""
 
     def setUp(self):
-        self.user = structure_factories.UserFactory()
+        self.user = structure_factories.UserFactory(is_support=True)
         self.session = ReportingSession.objects.create(user=self.user)
         self.message = ReportingMessage.objects.create(
             session=self.session, prompt="How many projects are there?"
@@ -363,12 +374,13 @@ class RecordUsageTest(test.APITestCase):
         self.assertEqual(record.input_tokens, 10)
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class AskHarnessRobustnessTest(test.APITestCase):
     """Whatever the harness does, the message must end up done or failed,
     never stuck on pending."""
 
     def setUp(self):
-        self.user = structure_factories.UserFactory()
+        self.user = structure_factories.UserFactory(is_support=True)
         self.session = ReportingSession.objects.create(user=self.user)
         self.message = ReportingMessage.objects.create(
             session=self.session, prompt="How many projects are there?"
@@ -451,14 +463,14 @@ class AskHarnessRobustnessTest(test.APITestCase):
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
     def test_trailing_slash_in_base_url_is_handled(self, mock_post):
         connection = HarnessConnection.get()
-        connection.base_url = "http://harness:8000/"
+        connection.base_url = "http://harness.ns.svc:8000/"
         connection.save()
         _respond(mock_post, {"answer": "ok"})
 
         ask_harness(self.message.pk)
 
         args, _ = mock_post.call_args
-        self.assertEqual(args[0], "http://harness:8000/query")
+        self.assertEqual(args[0], "http://harness.ns.svc:8000/query")
 
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
     def test_cache_tokens_are_recorded(self, mock_post):
@@ -482,12 +494,13 @@ class AskHarnessRobustnessTest(test.APITestCase):
         self.assertEqual(record.cache_write_tokens, 300)
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class NewSessionTest(test.APITestCase):
     """The first question in a session tells the harness to start a fresh
     conversation."""
 
     def setUp(self):
-        self.user = structure_factories.UserFactory()
+        self.user = structure_factories.UserFactory(is_support=True)
         self.session = ReportingSession.objects.create(user=self.user)
 
     def _ask(self, mock_post, prompt):
@@ -513,9 +526,10 @@ class NewSessionTest(test.APITestCase):
         self.assertIs(self._ask(mock_post, "retry")["new_session"], True)
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class StreamingTest(test.APITestCase):
     def setUp(self):
-        self.user = structure_factories.UserFactory()
+        self.user = structure_factories.UserFactory(is_support=True)
         self.session = ReportingSession.objects.create(user=self.user)
         self.message = ReportingMessage.objects.create(session=self.session, prompt="x")
 
@@ -617,9 +631,10 @@ class StreamingTest(test.APITestCase):
         self.assertEqual(self.message.status, ReportingMessage.Status.DONE)
 
 
+@override_constance_config(AI_REPORTING_ENABLED=True)
 class FileDownloadTest(test.APITestCase):
     def setUp(self):
-        self.user = structure_factories.UserFactory()
+        self.user = structure_factories.UserFactory(is_support=True)
         self.session = ReportingSession.objects.create(user=self.user)
         self.message = ReportingMessage.objects.create(session=self.session, prompt="x")
 
@@ -627,8 +642,7 @@ class FileDownloadTest(test.APITestCase):
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
     def test_files_are_fetched_from_the_messages_own_session(self, mock_post, mock_get):
         _respond(mock_post, {"answer": "ok", "new_files": ["chart.png"]})
-        mock_get.return_value = mock.Mock(content=b"png")
-        mock_get.return_value.raise_for_status = mock.Mock()
+        mock_get.return_value = _file_response(_PNG)
 
         ask_harness(self.message.pk)
 
@@ -642,8 +656,7 @@ class FileDownloadTest(test.APITestCase):
     @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
     def test_signature_covers_the_session_parameter(self, mock_post, mock_get):
         _respond(mock_post, {"answer": "ok", "new_files": ["chart.png"]})
-        mock_get.return_value = mock.Mock(content=b"png")
-        mock_get.return_value.raise_for_status = mock.Mock()
+        mock_get.return_value = _file_response(_PNG)
 
         with mock.patch(
             "waldur_mastermind.ai_reporting.tasks.signing.sign_request",
@@ -721,3 +734,145 @@ class HarnessOverridesTest(test.APITestCase):
     def test_max_turns_zero_is_a_real_override_not_treated_as_unset(self):
         """0 is a real limit; only -1 means no override."""
         self.assertEqual(_harness_overrides(), {"max_turns": 0})
+
+
+@override_constance_config(AI_REPORTING_ENABLED=True)
+class UntrustedHarnessResponseTest(test.APITestCase):
+    """Waldur doesn't rely on the harness to behave: it may be compromised, or
+    steered by text planted in Waldur data."""
+
+    def setUp(self):
+        self.user = structure_factories.UserFactory(is_support=True)
+        self.session = ReportingSession.objects.create(user=self.user)
+        self.message = ReportingMessage.objects.create(session=self.session, prompt="x")
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_a_redirect_is_not_followed(self, mock_post):
+        mock_post.return_value = mock.Mock(
+            status_code=307, headers={"Location": "http://169.254.169.254/"}
+        )
+        mock_post.return_value.raise_for_status = mock.Mock()
+
+        ask_harness(self.message.pk)
+
+        self.assertIs(mock_post.call_args.kwargs["allow_redirects"], False)
+        self.message.refresh_from_db()
+        self.assertEqual(self.message.status, ReportingMessage.Status.FAILED)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.get")
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_a_redirected_file_is_not_saved(self, mock_post, mock_get):
+        _respond(mock_post, {"answer": "ok", "new_files": ["chart.png"]})
+        mock_get.return_value = mock.Mock(
+            status_code=302, iter_content=lambda chunk_size: [_PNG]
+        )
+        mock_get.return_value.raise_for_status = mock.Mock()
+
+        ask_harness(self.message.pk)
+
+        self.assertIs(mock_get.call_args.kwargs["allow_redirects"], False)
+        self.assertFalse(self.message.files.exists())
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.get")
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_only_safe_file_types_and_names_are_fetched(self, mock_post, mock_get):
+        names = [
+            "chart.svg",
+            "page.html",
+            "../x.png",
+            ".hidden.csv",
+            "a b.csv",
+            "ok.csv",
+        ]
+        _respond(mock_post, {"answer": "ok", "new_files": names})
+        mock_get.return_value = _file_response(b"a,b\n1,2\n")
+
+        ask_harness(self.message.pk)
+
+        self.message.refresh_from_db()
+        self.assertEqual(self.message.new_files, ["ok.csv"])
+        self.assertEqual(mock_get.call_count, 1)
+        self.assertEqual(
+            list(self.message.files.values_list("name", flat=True)), ["ok.csv"]
+        )
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.get")
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_a_file_whose_content_does_not_match_its_type_is_dropped(
+        self, mock_post, mock_get
+    ):
+        _respond(mock_post, {"answer": "ok", "new_files": ["chart.png", "data.csv"]})
+        svg = b'<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>'
+        mock_get.return_value = _file_response(svg)
+
+        ask_harness(self.message.pk)
+
+        self.assertFalse(self.message.files.exists())
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks._MAX_FILE_BYTES", 100)
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.get")
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_an_oversized_file_is_dropped(self, mock_post, mock_get, *_):
+        _respond(mock_post, {"answer": "ok", "new_files": ["chart.png"]})
+        mock_get.return_value = _file_response(_PNG + b"0" * 200)
+
+        ask_harness(self.message.pk)
+
+        self.assertFalse(self.message.files.exists())
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.get")
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_the_number_of_files_is_capped(self, mock_post, mock_get):
+        names = [f"chart{i}.png" for i in range(50)]
+        _respond(mock_post, {"answer": "ok", "new_files": names})
+        mock_get.return_value = _file_response(_PNG)
+
+        ask_harness(self.message.pk)
+
+        self.message.refresh_from_db()
+        self.assertEqual(len(self.message.new_files), 20)
+        self.assertEqual(self.message.files.count(), 20)
+
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_a_huge_answer_is_cut_short(self, mock_post):
+        _respond(mock_post, {"answer": "x" * 500_000, "new_files": []})
+
+        ask_harness(self.message.pk)
+
+        self.message.refresh_from_db()
+        self.assertEqual(len(self.message.answer), 100_000)
+
+
+class AccessRecheckedWhenTheQuestionRunsTest(test.APITestCase):
+    """A question queued just before the feature was switched off, or before
+    its asker lost their role, is not sent."""
+
+    def setUp(self):
+        self.user = structure_factories.UserFactory(is_support=True)
+        session = ReportingSession.objects.create(user=self.user)
+        self.message = ReportingMessage.objects.create(session=session, prompt="x")
+
+    def assert_not_sent(self, mock_post):
+        ask_harness(self.message.pk)
+        mock_post.assert_not_called()
+        self.message.refresh_from_db()
+        self.assertEqual(self.message.status, ReportingMessage.Status.FAILED)
+
+    @override_constance_config(AI_REPORTING_ENABLED=False)
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_feature_switched_off(self, mock_post):
+        self.assert_not_sent(mock_post)
+
+    @override_constance_config(
+        AI_REPORTING_ENABLED=True, AI_REPORTING_ENABLED_ROLES="staff"
+    )
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_role_no_longer_allowed(self, mock_post):
+        self.assert_not_sent(mock_post)
+
+    @override_constance_config(AI_REPORTING_ENABLED=True)
+    @mock.patch("waldur_mastermind.ai_reporting.tasks.requests.post")
+    def test_user_deactivated(self, mock_post):
+        self.user.is_active = False
+        self.user.save()
+        self.assert_not_sent(mock_post)

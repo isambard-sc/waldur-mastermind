@@ -1,42 +1,50 @@
+import re
 from urllib.parse import urlsplit
 
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 from model_utils.models import TimeStampedModel
+from urllib3.exceptions import LocationParseError
+from urllib3.util import parse_url
 
 from waldur_core.core import fields as core_fields
 from waldur_core.core.models import User, UuidMixin
 
-# Suffixes of addresses inside the cluster or VPC. Questions and answers go
-# to this URL, so it must never point outside.
-_INTERNAL_HOST_SUFFIXES = (".svc", ".svc.cluster.local", ".internal")
-_LOCAL_HOSTS = ("localhost", "127.0.0.1")
+# Questions and answers go to this URL, so it must be a Kubernetes Service
+# name (<name>.<namespace>.svc[.cluster.local]): never a public host, an IP
+# address or a bare name that could reach other internal services.
+_LABEL = r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+_SERVICE_HOST = re.compile(rf"{_LABEL}(\.{_LABEL})+\.svc(\.cluster\.local)?")
 
 
-def is_internal_host(host: str | None) -> bool:
-    host = (host or "").lower().rstrip(".")
-    if not host:
+def is_cluster_service_url(value: str) -> bool:
+    # "@" and "\\" make urlsplit and requests disagree on the host.
+    if not value or "@" in value or "\\" in value:
         return False
-    return (
-        "." not in host
-        or host in _LOCAL_HOSTS
-        or host.endswith(_INTERNAL_HOST_SUFFIXES)
-    )
+    parts = urlsplit(value)
+    if parts.scheme not in ("http", "https") or parts.query or parts.fragment:
+        return False
+    host = parts.hostname or ""
+    try:
+        sent_to = (parse_url(value).host or "").lower()
+    except LocationParseError:
+        return False
+    return bool(_SERVICE_HOST.fullmatch(host)) and sent_to == host
 
 
 def validate_http_url(value):
-    """An http(s) URL to a host inside the cluster - not Django's
-    URLValidator, which rejects the harness's bare in-cluster hostname."""
+    """An http(s) URL to a Kubernetes Service - not Django's URLValidator,
+    which accepts public hosts."""
     if not value:
         return
     parts = urlsplit(value)
     if parts.scheme not in ("http", "https") or not parts.netloc:
         raise ValidationError(_("Enter an http or https URL, including its host."))
-    if not is_internal_host(parts.hostname):
+    if not is_cluster_service_url(value):
         raise ValidationError(
             _(
-                "The harness must be inside the cluster, e.g. "
+                "The harness must be a service inside the cluster, e.g. "
                 "http://waldur-harness.waldur-harness.svc.cluster.local:8000."
             )
         )
@@ -185,7 +193,7 @@ class HarnessConnection(TimeStampedModel):
 
     def endpoint(self, path: str) -> str:
         # Checked here too, in case a value was stored before the validator.
-        if not is_internal_host(urlsplit(self.base_url).hostname):
+        if not is_cluster_service_url(self.base_url):
             raise ValueError("The harness URL is not an in-cluster address.")
         return self.base_url.rstrip("/") + path
 

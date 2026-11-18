@@ -3,11 +3,16 @@ import datetime
 from unittest import mock
 
 from constance.test.unittest import override_config as override_constance_config
+from django.core.cache import cache
 from django.core.files.base import ContentFile
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status, test
 
+from waldur_core.core.models import PersonalAccessToken
+from waldur_core.media import access as media_access
+from waldur_core.media import models as media_models
+from waldur_core.permissions.enums import PermissionEnum
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.ai_reporting.models import (
     HarnessConnection,
@@ -699,11 +704,11 @@ class HarnessConnectionApiTest(test.APITestCase):
         connection.save()
 
         self.client.force_authenticate(self.staff)
-        response = self.client.patch(self.url, {"base_url": "http://x:8000"})
+        response = self.client.patch(self.url, {"base_url": "http://x.ns.svc:8000"})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         connection.refresh_from_db()
-        self.assertEqual(connection.base_url, "http://x:8000")
+        self.assertEqual(connection.base_url, "http://x.ns.svc:8000")
         self.assertEqual(connection.signing_private_key, _FAKE_KEY)  # left out: kept
 
     def test_sending_an_empty_key_clears_it(self):
@@ -743,12 +748,12 @@ class HarnessConnectionApiTest(test.APITestCase):
             response = self.client.patch(self.url, {"base_url": url})
             self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, url)
 
-    def test_bare_in_cluster_hostname_accepted(self):
+    def test_bare_hostname_rejected(self):
         self.client.force_authenticate(self.staff)
         response = self.client.patch(
             self.url, {"base_url": "http://waldur-harness:8000"}
         )
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
 class DefaultOffTest(test.APITestCase):
@@ -770,3 +775,109 @@ class PublicConfigurationTest(test.APITestCase):
             response.data["WALDUR_CORE"]["AI_REPORTING_LINK_DOMAINS"],
             "docs.isambard.ac.uk",
         )
+
+
+def _access_token(user, scopes):
+    expires_at = timezone.now() + datetime.timedelta(days=1)
+    full_token, prefix, token_hash = PersonalAccessToken.generate_token(expires_at)
+    PersonalAccessToken.objects.create(
+        user=user,
+        name="test",
+        token_prefix=prefix,
+        token_hash=token_hash,
+        scopes=scopes,
+        expires_at=expires_at,
+    )
+    return f"Bearer {full_token}"
+
+
+@override_constance_config(AI_REPORTING_ENABLED=True, PAT_ENABLED=True)
+class AccessTokenScopeTest(test.APITestCase):
+    """A narrowly scoped access token of a staff user must not reach AI
+    reporting: the harness reads all of Waldur."""
+
+    connection_url = "/api/ai-reporting-harness-connection/"
+
+    def setUp(self):
+        cache.clear()
+        self.staff = structure_factories.UserFactory(
+            is_staff=True, can_use_personal_access_tokens=True
+        )
+        self.ask_url = reverse("ai-reporting-message-ask")
+
+    def use(self, scopes):
+        self.client.credentials(HTTP_AUTHORIZATION=_access_token(self.staff, scopes))
+
+    def test_a_token_without_staff_scope_cannot_change_the_harness(self):
+        self.use([PermissionEnum.LIST_ORDERS.value])
+        response = self.client.patch(
+            self.connection_url,
+            {"base_url": "http://other.waldur-harness.svc:8000"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_a_token_with_staff_scope_can_change_the_harness(self):
+        self.use([PermissionEnum.STAFF_ACCESS.value])
+        response = self.client.patch(
+            self.connection_url,
+            {"base_url": "http://other.waldur-harness.svc:8000"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_a_token_without_support_scope_cannot_ask_or_see_usage(self):
+        self.use([PermissionEnum.LIST_ORDERS.value])
+        with mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay"):
+            response = self.client.post(self.ask_url, {"prompt": "hi"})
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        response = self.client.get(reverse("ai-reporting-message-usage-stats"))
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_a_token_with_support_scope_can_ask(self):
+        self.use([PermissionEnum.SUPPORT_ACCESS.value])
+        with mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay"):
+            response = self.client.post(self.ask_url, {"prompt": "hi"})
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+
+
+@override_constance_config(AI_REPORTING_ENABLED=True)
+class PromptLengthTest(test.APITestCase):
+    def test_a_very_long_question_is_refused(self):
+        self.client.force_authenticate(structure_factories.UserFactory(is_staff=True))
+        with mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay"):
+            response = self.client.post(
+                reverse("ai-reporting-message-ask"), {"prompt": "x" * 10_001}
+            )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class FileDownloadAccessTest(test.APITestCase):
+    """Downloading a file follows the same switch and roles as the API."""
+
+    def setUp(self):
+        self.user = structure_factories.UserFactory(is_support=True)
+        session = ReportingSession.objects.create(user=self.user)
+        message = ReportingMessage.objects.create(session=session, prompt="x")
+        report = ReportingFile.objects.create(
+            message=message, name="a.csv", file=ContentFile(b"a,b", name="a.csv")
+        )
+        self.stored = media_models.File.objects.get(name=report.file.name)
+
+    def can_download(self, user=None):
+        return media_access.user_can_access_file(self.stored, user or self.user)
+
+    @override_constance_config(AI_REPORTING_ENABLED=True)
+    def test_the_owner_can_download_while_allowed(self):
+        self.assertTrue(self.can_download())
+        self.assertFalse(
+            self.can_download(structure_factories.UserFactory(is_staff=True))
+        )
+
+    @override_constance_config(AI_REPORTING_ENABLED=False)
+    def test_not_while_the_feature_is_off(self):
+        self.assertFalse(self.can_download())
+
+    @override_constance_config(
+        AI_REPORTING_ENABLED=True, AI_REPORTING_ENABLED_ROLES="staff"
+    )
+    def test_not_once_the_owners_role_is_no_longer_allowed(self):
+        self.assertFalse(self.can_download())

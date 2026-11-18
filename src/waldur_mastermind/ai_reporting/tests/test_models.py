@@ -89,11 +89,37 @@ class HarnessConnectionModelTest(test.APITestCase):
         with self.assertRaises(ValidationError):
             connection.full_clean()
 
-    def test_accepts_a_bare_in_cluster_hostname(self):
-        """Django's URLValidator would reject this, since it has no dot."""
+    def test_accepts_a_cluster_service_address(self):
         connection = HarnessConnection.get()
-        connection.base_url = "http://waldur-harness:8000"
-        connection.full_clean()  # must not raise
+        for url in (
+            "http://waldur-harness.waldur-harness.svc.cluster.local:8000",
+            "http://waldur-harness.waldur-harness.svc:8000",
+        ):
+            connection.base_url = url
+            connection.full_clean()  # must not raise
+
+    def test_rejects_anything_but_a_cluster_service_address(self):
+        """Including tricks where the check and requests disagree on the host."""
+        connection = HarnessConnection.get()
+        for url in (
+            "http://evil.com\\@waldur-harness.waldur-harness.svc:8000",
+            "http://user@waldur-harness.waldur-harness.svc:8000",
+            "http://waldur-harness:8000",
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+            "http://2852039166",
+            "http://0x7f000001",
+            "http://[fd00:ec2::254]",
+            "http://metadata.google.internal",
+            "http://redis:6379",
+            "http://waldur-harness.waldur-harness.svc.:8000",
+            "http://waldur-harness.waldur-harness.svc:8000/?x=1",
+            "http://waldur-harness.waldur-harness.svc:8000/#x",
+            "ftp://waldur-harness.waldur-harness.svc",
+        ):
+            connection.base_url = url
+            with self.assertRaises(ValidationError, msg=url):
+                connection.full_clean()
 
 
 class HarnessEndpointTest(test.APITestCase):
@@ -113,7 +139,16 @@ class HarnessEndpointTest(test.APITestCase):
         for url in (
             "http://waldur-harness.waldur-harness.svc.cluster.local:8000",
             "http://waldur-harness.waldur-harness.svc:8000",
-            "http://waldur-harness:8000",
         ):
             connection.base_url = url
             self.assertEqual(connection.endpoint("/query"), url + "/query")
+
+    def test_a_stored_bypass_address_is_never_used(self):
+        connection = HarnessConnection.get()
+        HarnessConnection.objects.filter(pk=connection.pk).update(
+            base_url="http://evil.com\\@waldur-harness.waldur-harness.svc:8000"
+        )
+        connection.refresh_from_db()
+
+        with self.assertRaises(ValueError):
+            connection.endpoint("/query")
