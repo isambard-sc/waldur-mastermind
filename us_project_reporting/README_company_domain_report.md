@@ -1,8 +1,9 @@
 # Company domain report
 
 `company_domain_report.py` estimates **how many companies use the Waldur
-instance** (portal-api.isambard.ac.uk by default) and how many **Isambard-AI
-Phase 2 node hours** each one has used, broken down by organisation, project
+instance** (portal-api.isambard.ac.uk by default) for **Isambard-AI Phase 2**,
+meaning they have at least one project with a resource on that offering, and
+how many node hours each one has used, broken down by organisation, project
 and month. It writes two Excel workbooks with the same layout: one for
 companies and one for everything else (universities, research institutes,
 government, ...), grouped by institution.
@@ -69,7 +70,7 @@ check came back 0), so it is not used.
 Instead the script works bottom-up: it takes every user's email address, groups
 users by the domain after the `@`, discards domains that are clearly not
 companies (universities, government, consumer mail providers, ...), and counts
-each remaining domain as one company. Usernames here are professional email
+each remaining domain with a project on the offering as one company. Usernames here are professional email
 addresses, which is what makes this workable.
 
 The result is a **list for a human to review**, not ground truth. It can:
@@ -200,6 +201,12 @@ revoked roles; a revoked role counts only if it was still active after the
 project's first resource on the offering was created. Hard-deleted users and
 offering users leave no trace in any of this.
 
+A domain (company, or non-company institution) with **no** offering project is
+left out of both domain sheets, the summary counts and the new/changed review
+list: its users are on Waldur but have never been in a project with a resource
+on the offering. With `--no-usage` there is no project data, so every domain is
+listed.
+
 ### Column definitions that are easy to confuse
 
 | Column | Counts |
@@ -234,7 +241,9 @@ With `--no-usage` each workbook has only its first sheet, without the usage colu
 
 #### Company domains
 
-One row per surviving company (domains merged with `same_as` are one row),
+One row per surviving company with at least one offering project (see
+[Which projects are listed against a domain](#which-projects-are-listed-against-a-domain);
+domains merged with `same_as` are one row),
 sorted by `user_count` descending, then domain A-Z. This is **not** the order
 companies joined.
 
@@ -315,7 +324,8 @@ folded into a row are listed in `merged_domains`.
 
 #### Non-company domains
 
-Same columns as Company domains, with these differences:
+Same columns as Company domains, and likewise only institutions with at least
+one offering project are listed. The differences:
 
 | Column | Meaning |
 |--------|---------|

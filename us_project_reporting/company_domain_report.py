@@ -915,9 +915,43 @@ def main():
             users_by_category[c["category"]] += n
         inst["category"] = min(users_by_category, key=lambda cat: (-users_by_category[cat], cat))
 
+    # Projects (and their organisations) ordered by the hours recorded against
+    # them, then by name for member-only projects.
+    def project_order(p):
+        return (-sum(p["hours"].values(), Decimal(0)), p["organisation"], p["project"])
+
+    def projects_by_key(projects: dict) -> dict[str, list]:
+        grouped = defaultdict(list)
+        for (key, _), p in sorted(projects.items(), key=lambda kv: project_order(kv[1])):
+            grouped[key].append(p)
+        return grouped
+
+    projects_by_company = projects_by_key(company_projects)
+    projects_by_institution = projects_by_key(excluded_projects)
+
+    # With usage, only companies and institutions with a project on the
+    # offering are listed: users who are on Waldur but in no such project
+    # (current member, or revoked after the project's first resource) are
+    # left out. Without usage there is no project data, so every domain is.
+    def listed_projects(projects_by: dict, key: str) -> list | None:
+        """A domain sheet row's projects, or None to leave the row out."""
+        if not usage_enabled:
+            return []
+        return projects_by.get(key) or None
+
+    listed_companies = {d for d in companies if listed_projects(projects_by_company, d) is not None}
+    listed_institutions = {k for k in institutions if listed_projects(projects_by_institution, k) is not None}
+    listed_excluded = [(d, e, c) for d, e, c in excluded_rows if institution_of(d, c) in listed_institutions]
+
     eprint(f"\n=== Summary ===")
-    eprint(f"Domain-distinct company count: {len(companies)}")
-    eprint(f"Non-company institutions: {len(institutions)} (from {len(excluded_rows)} domain(s))")
+    if usage_enabled:
+        eprint(
+            f"Leaving out {len(companies) - len(listed_companies)} company domain(s) and "
+            f"{len(institutions) - len(listed_institutions)} non-company institution(s) "
+            f"with no project on the offering."
+        )
+    eprint(f"Domain-distinct company count: {len(listed_companies)}")
+    eprint(f"Non-company institutions: {len(listed_institutions)} (from {len(listed_excluded)} domain(s))")
 
     def review_status(domain: str, category: str) -> str:
         """'' if unchanged since the previous report or decided by an override, else 'yes' / 'changed (...)'."""
@@ -955,20 +989,6 @@ def main():
     # most-obviously-real entries are at the top and the single-user long tail
     # (most likely to contain the false positives/negatives called out above)
     # is at the bottom where it's easiest to eyeball in one pass.
-
-    # Projects (and their organisations) ordered by the hours recorded against
-    # them, then by name for member-only projects.
-    def project_order(p):
-        return (-sum(p["hours"].values(), Decimal(0)), p["organisation"], p["project"])
-
-    def projects_by_key(projects: dict) -> dict[str, list]:
-        grouped = defaultdict(list)
-        for (key, _), p in sorted(projects.items(), key=lambda kv: project_order(kv[1])):
-            grouped[key].append(p)
-        return grouped
-
-    projects_by_company = projects_by_key(company_projects)
-    projects_by_institution = projects_by_key(excluded_projects)
 
     usage_header = (
         [f"{USAGE_COMPONENT_TYPE}_{unit}", "first_project_added", "first_usage_month", "last_usage_month", "active_months",
@@ -1032,6 +1052,7 @@ def main():
             (d, review_status(d, "company"), [], c["emails"], access.get(d, set()), projects_by_company[d],
              [", ".join(sorted(c["merged"])), "; ".join(c["notes"])])
             for d, c in sorted(companies.items(), key=lambda kv: (-len(kv[1]["emails"]), kv[0]))
+            if d in listed_companies
         ]
 
     def institution_review(inst) -> str:
@@ -1050,6 +1071,7 @@ def main():
             for key, inst in sorted(
                 institutions.items(), key=lambda kv: (kv[1]["category"], -len(kv[1]["emails"]), kv[0])
             )
+            if key in listed_institutions
         ]
 
     def write_monthly_sheet(sheet, entity, hours_, month_users_, entity_hours):
@@ -1198,8 +1220,8 @@ def main():
     wb.save(non_company_output)
 
     to_review = sorted(
-        [(d, "company", len(c["emails"])) for d, c in companies.items()]
-        + [(d, c["category"], len(e)) for d, e, c in excluded_rows]
+        [(d, "company", len(c["emails"])) for d, c in companies.items() if d in listed_companies]
+        + [(d, c["category"], len(e)) for d, e, c in listed_excluded]
     )
     flagged = [(d, cat, n, status) for d, cat, n in to_review if (status := review_status(d, cat))]
     if previous is None:
@@ -1215,8 +1237,8 @@ def main():
         eprint(f"\nNo domains new or changed since {args.previous.name}.")
 
     eprint(
-        f"\n{len(companies)} candidate company domain(s) written to {args.output}, "
-        f"{len(institutions)} non-company institution(s) to {non_company_output}. "
+        f"\n{len(listed_companies)} candidate company domain(s) written to {args.output}, "
+        f"{len(listed_institutions)} non-company institution(s) to {non_company_output}. "
         f"Review single-user domains especially closely — they're the likeliest "
         f"false positives (personal-looking domain, contractor, typo) or, if a "
         f"generic-looking address was actually a company alias, false negatives."
