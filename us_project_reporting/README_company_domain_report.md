@@ -1,12 +1,13 @@
 # Company domain report
 
 `company_domain_report.py` estimates **how many companies use the Waldur
-instance** (portal-api.isambard.ac.uk by default) for **Isambard-AI Phase 2**,
-meaning they have at least one project with a resource on that offering, and
-how many node hours each one has used, broken down by organisation, project
-and month. It writes two Excel workbooks with the same layout: one for
-companies and one for everything else (universities, research institutes,
-government, ...), grouped by institution.
+instance** (portal-api.isambard.ac.uk by default) for **Isambard-AI Phase 1
+and Phase 2**, and how many node hours each one has used on them, broken down by
+offering, organisation, project and month. Only people who have used, or been
+given access to, one of those offerings are counted (see
+[Who is counted](#who-is-counted)). It writes two Excel workbooks with the same
+layout: one for companies and one for everything else (universities, research
+institutes, government, ...), grouped by institution.
 
 `verify_usage_totals.py` is a separate cross-check of the usage numbers (see
 [Verifying the usage totals](#verifying-the-usage-totals)).
@@ -58,6 +59,10 @@ WALDUR_TOKEN=<staff token> uv run company_domain_report.py
   runs reuse the cache for 30 days. The cache is not committed; it is created
   next to the script on first use. `--refresh-edugain` forces a re-download and
   `--no-edugain` skips that rule entirely.
+- Offerings are looked up by exact name. If a name does not match exactly one
+  offering, the run stops and lists what it found; pass the right
+  `--offering-name` or `--offering-uuid` (see
+  [Command-line options](#command-line-options)).
 
 Emails are **not** written to either workbook unless you pass `--include-emails`.
 
@@ -67,11 +72,11 @@ Emails are **not** written to either workbook unless you pass `--include-emails`
 `Project.is_industry` looked like a candidate but is not set in practice (a live
 check came back 0), so it is not used.
 
-Instead the script works bottom-up: it takes every user's email address, groups
-users by the domain after the `@`, discards domains that are clearly not
-companies (universities, government, consumer mail providers, ...), and counts
-each remaining domain with a project on the offering as one company. Usernames
-here are professional email addresses, which is what makes this workable.
+Instead the script works bottom-up: it takes every counted user's email
+address, groups users by the domain after the `@`, discards domains that are
+clearly not companies (universities, government, consumer mail providers, ...),
+and counts each remaining domain as one company. Usernames here are professional
+email addresses, which is what makes this workable.
 
 The result is a **list for a human to review**, not ground truth. It can:
 
@@ -150,12 +155,12 @@ fields the script needs (`field=`), and pins a sort order so that paging is stab
 | Endpoint | Used for |
 |----------|----------|
 | `/api/users/` (uuid, email) | Every user and their email domain. Includes users whose project/organisation role has expired or been revoked: revoking a role does not delete the user. Users are only deactivated, never hard-deleted. |
-| `/api/marketplace-provider-offerings/` (name_exact) | Resolve the offering name (default `Isambard-AI Phase 2`) to its UUID. Skipped with `--offering-uuid`. |
-| `/api/marketplace-offering-users/` | The offering's users: links each cluster username and offering user to a Waldur user, and so to an email domain. This is also what `users_with_access` counts. |
+| `/api/marketplace-provider-offerings/` (name_exact) | Resolve each offering name (default `Isambard-AI Phase 1` and `Isambard-AI Phase 2`) to its UUID. Skipped with `--offering-uuid`. |
+| `/api/marketplace-offering-users/` | Each offering's users: links each cluster username and offering user to a Waldur user, and so to an email domain. This is also what `users_with_access` counts, and one of the ways a user is counted. |
 | `/api/marketplace-component-user-usages/` (type=node) | Per-user monthly node hours: one row per cluster username, allocation and billing month. |
-| `/api/marketplace-resources/` | The projects (and their organisations) that have a resource (allocation) on the offering, and when each project's first resource was created. |
+| `/api/marketplace-resources/` | The projects (and their organisations) that have a resource (allocation) on each offering, and when each project's first resource was created. |
 | `/api/projects/?include_terminated=true` | Project creation, start and end dates, including projects that have since ended and been soft-deleted. |
-| `/api/user-permissions/?scope_type=project&show_inactive=true` | Current **and revoked** project memberships, to list former members and the projects of companies with no usage. |
+| `/api/user-permissions/?scope_type=project&show_inactive=true` | Current **and revoked** project memberships: to decide who is counted, and to list former members and the projects of companies with no usage. |
 
 `verify_usage_totals.py` additionally uses `/api/marketplace-component-usages/`
 (allocation level).
@@ -179,42 +184,67 @@ For each per-user usage row:
 3. If it still cannot be resolved to an email it goes to the **Unmatched usage**
    sheet.
 4. Each row carries the project and organisation it was recorded against, so
-   hours are attributed to the (company, organisation, project, month) it
-   happened in.
+   hours are attributed to the (company, offering, organisation, project, month)
+   it happened in.
 5. Rows are then routed to the company the domain belongs to (after merging
    `same_as` domains), or to the institution a non-company domain belongs to
    (see [Non-company workbook](#non-company-workbook)).
 
-Only **node hours on one offering** are counted (`type=node`; the unit comes
-from the API and is normally hours). Zero-usage rows are ignored, so a user with
-a zero in a month is not counted as active in that month.
+Only **node hours on the report's offerings** are counted (`type=node`; the
+unit comes from the API and is normally hours). By default these are
+**Isambard-AI Phase 1** and **Isambard-AI Phase 2**. Every row carries the
+offering it came from:
 
-**Companies with no usage stay in the list** with 0 hours, as long as their
-users are or were members of an offering project (see below). Those projects
-and their organisations are shown.
+- the domain sheets show the **total across both offerings**;
+- the projects, Monthly usage and Unmatched usage sheets have an `offering`
+  column, so Phase 1 and Phase 2 can be split with a filter or pivot;
+- Sector totals has a column per offering plus the combined total.
+
+The two machines' node hours are added as they are, without weighting. Zero-usage
+rows are ignored, so a user with a zero in a month is not counted as active in
+that month.
+
+**Companies with no usage stay in the list** with 0 hours, as long as they have
+a counted user (see below).
 
 ### Which projects are listed against a domain
 
 A project is listed against a domain if the domain's users either **recorded
 usage** in it or **were members** of it. A project counts as an "offering
-project" only if it has a resource on the offering. Past memberships come from
-revoked roles; a revoked role counts only if it was still active after the
-project's first resource on the offering was created. Hard-deleted users and
-offering users leave no trace in any of this.
+project" only if it has a resource on **any** of the report's offerings. Past
+memberships come from revoked roles; a revoked role counts only if it was still
+active after the project's first resource on the offerings (the earliest across
+them) was created. Hard-deleted users and offering users leave no trace in any
+of this.
 
-A domain (company, or non-company institution) with **no** offering project is
-left out of both domain sheets, the summary counts and the new/changed review
-list: its users are on Waldur but have never been in a project with a resource
-on the offering. With `--no-usage` there is no project data, so every domain is
-listed.
+### Who is counted
+
+Only users connected to one of the offerings are counted anywhere in the report:
+in `user_count`, in which domains appear, in the summary counts, in the
+generic-provider note and in the new/changed review list. A user is counted if
+they have **any** of:
+
+- an account (offering user) on one of the offerings;
+- usage on one of them;
+- a current membership of an offering project, or a revoked one that lasted
+  until after the project's first resource on the offerings was created.
+
+Users on Waldur with none of these, for example people whose projects never had a
+Phase 1 or Phase 2 resource, are left out entirely, and a domain whose users are
+all left out does not appear. The run prints how many users were left out. A
+domain with a counted user but no project (an account on an offering only) is
+still listed, with no projects.
+
+With `--no-usage` none of this data is fetched, so every user on Waldur is
+counted.
 
 ### Column definitions that are easy to confuse
 
 | Column | Counts |
 |--------|--------|
-| `user_count` | Waldur users with an email at this domain, whether or not they ever touched the offering. |
-| `users_with_access` | Of those, users who have an account (offering user) on the offering. |
-| `users_with_usage` | Of those, users with non-zero node hours on the offering. |
+| `user_count` | Counted users (see [Who is counted](#who-is-counted)) with an email at this domain. |
+| `users_with_access` | Of those, users who have an account (offering user) on one of the offerings. |
+| `users_with_usage` | Of those, users with non-zero node hours on one of the offerings. |
 
 Pre-created users (added to a project before they have logged in) can show up
 with placeholder names; they still count as users of their email domain.
@@ -242,18 +272,18 @@ With `--no-usage` each workbook has only its first sheet, without the usage colu
 
 #### Company domains
 
-One row per surviving company with at least one offering project (see
-[Which projects are listed against a domain](#which-projects-are-listed-against-a-domain);
-domains merged with `same_as` are one row), sorted by `user_count` descending,
-then domain A-Z. This is **not** the order companies joined.
+One row per surviving company with at least one counted user (see
+[Who is counted](#who-is-counted); domains merged with `same_as` are one row),
+sorted by `user_count` descending, then domain A-Z. This is **not** the order
+companies joined.
 
 | Column | Meaning |
 |--------|---------|
 | `domain` | The company's domain. |
 | `new` | Only with a previous report (see [Monthly workflow](#monthly-workflow)). `yes` = not in the previous report; `changed (was X)` = it was, under another category; blank = unchanged, or decided by an override. |
 | `user_count` | See above. |
-| `node_hours` | Total node hours on the offering. |
-| `first_project_added` | Date the **earliest** of the listed projects was created in Waldur. Often earlier than the company's first access to Phase 2, as projects are created before they get an allocation. |
+| `node_hours` | Total node hours across the offerings. |
+| `first_project_added` | Date the **earliest** of the listed projects was created in Waldur. Often earlier than the company's first access to Isambard-AI, as projects are created before they get an allocation. |
 | `first_usage_month` / `last_usage_month` | First and last month (`YYYY-MM`) with non-zero usage. Blank without usage. |
 | `active_months` | Number of months with non-zero usage. |
 | `users_with_access` / `users_with_usage` | See above. |
@@ -271,38 +301,46 @@ list is on the projects sheets.
 
 #### Sovereign AI
 
-One row per company per project in the **Sovereign AI** organisation, for the
-companies whose users recorded usage in, or were members of, one of its offering
-projects. Same columns as Other projects below.
+One row per company per project and offering in the **Sovereign AI**
+organisation, for the companies whose users recorded usage in, or were members
+of, one of its offering projects. Same columns and rules as Other projects below.
 
 #### Other projects
 
-One row per company per offering project **not** in the Sovereign AI
-organisation: organisation, project, project start and end date, node hours (0 if
-none), users with usage, current members, former members, first and last month
-with usage. Together with the Sovereign AI sheet this is every company project.
+One row per company per offering project per offering, for projects **not** in
+the Sovereign AI organisation: offering, organisation, project, project start and
+end date, node hours (0 if none), users with usage, current members, former
+members, first and last month with usage. Together with the Sovereign AI sheet
+this is every company project.
+
+Node hours, users with usage and the usage months are for that row's offering.
+Members are project-wide, as Waldur records membership per project, not per
+offering. A company gets a row for each offering it has usage on in the project.
+If it has no usage in the project (members only), it gets a row for each offering
+the project has a resource on.
 
 #### Monthly usage
 
-Node hours and active users per company per month.
+Node hours and active users per company, offering and month.
 
 #### By month
 
-Per month across all companies: node hours, companies active, users active.
+Per month across all companies and both offerings: node hours, companies active,
+users active.
 
 #### Unmatched usage
 
-Usage rows whose user could not be resolved to an email. Cluster usernames only
-appear with `--include-emails`. Only in the company workbook, as these rows
-belong to no sector.
+Usage rows whose user could not be resolved to an email, with their offering.
+Cluster usernames only appear with `--include-emails`. Only in the company
+workbook, as these rows belong to no sector.
 
 #### Sector totals
 
-Node hours, share of total, domains with usage and users with usage per sector
-(`company`, and each non-company category), plus an `unmatched` row and a `TOTAL`.
-The TOTAL is the per-user grand total across all projects that ever had Phase 2
-usage; it is what `verify_usage_totals.py` compares against allocation-level
-usage. The same sheet is in both workbooks.
+Per sector (`company`, and each non-company category), plus an `unmatched` row
+and a `TOTAL`: node hours on each offering, node hours in total, share of the
+total, domains with usage and users with usage. The TOTAL row is the per-user
+grand total for each offering; `verify_usage_totals.py` compares one offering's
+figure with its allocation-level usage. The same sheet is in both workbooks.
 
 ### Non-company workbook
 
@@ -325,7 +363,7 @@ folded into a row are listed in `merged_domains`.
 #### Non-company domains
 
 Same columns as Company domains, and likewise only institutions with at least
-one offering project are listed. The differences:
+one counted user are listed. The differences:
 
 | Column | Meaning |
 |--------|---------|
@@ -340,10 +378,10 @@ Sorted by category, then `user_count`.
 
 #### UoB (Isambard-AI) projects
 
-Projects-sheet rows (one per institution per project) for every project in the
-**University of Bristol (Isambard-AI)** organisation. That organisation has so
-many projects that they get their own sheet, as Sovereign AI's do in the company
-workbook. The sheet name is shortened because Excel limits sheet names to 31
+Projects-sheet rows (one per institution per project and offering) for every
+project in the **University of Bristol (Isambard-AI)** organisation. That
+organisation has so many projects that they get their own sheet, as Sovereign
+AI's do in the company workbook. The sheet name is shortened because Excel limits sheet names to 31
 characters. If nothing matches the organisation name, the run prints a warning.
 
 #### Other projects
@@ -381,6 +419,10 @@ Identical to the company workbook's.
    domains) are judgement calls. Flag them to the people who own the number
    rather than deciding alone.
 
+A change to what is counted (such as adding Phase 1 users, or dropping users with
+no offering connection) causes a one-off batch of flags on the next run: domains
+that only Phase 1 users bring in show as `yes`.
+
 A separate list of reviewed domains was deliberately not kept: nobody would
 maintain it, and last month's report already records what is new.
 
@@ -397,9 +439,9 @@ maintain it, and last month's report already records what is new.
 | `--no-previous` | No comparison, no `new` column. |
 | `--no-edugain` | Skip the eduGAIN rule (and the download). |
 | `--refresh-edugain` | Re-download the eduGAIN scopes even if the cache is fresh. |
-| `--no-usage` | Domain list only; skip every usage, project and membership request. |
-| `--offering-name NAME` | Offering to report usage for (default `Isambard-AI Phase 2`). |
-| `--offering-uuid UUID` | Same, by UUID (skips the name lookup). |
+| `--no-usage` | Domain list only; skip every offering, usage, project and membership request. With nothing to tell who is connected to the offerings, every user on Waldur is counted. |
+| `--offering-name NAME` | Offering to report on. Repeat for several. Default: `Isambard-AI Phase 1` and `Isambard-AI Phase 2`. Giving any `--offering-name` or `--offering-uuid` replaces the default list. |
+| `--offering-uuid UUID` | Same, by UUID (skips the name lookup; the UUID is used as the offering's label). Repeatable, and can be combined with `--offering-name`. |
 
 ## Backend load
 
@@ -419,9 +461,9 @@ username, allocation and billing month) and the project memberships.
 | Endpoint | How it is requested | Notes |
 |----------|---------------------|-------|
 | `/api/users/` | `field=uuid,email` | Only the two fields needed. |
-| `/api/marketplace-offering-users/` | `offering_uuid`, `field=uuid,username,user_uuid` | One offering only. |
-| `/api/marketplace-component-user-usages/` | `offering_uuid`, `type=node`, field-restricted | The largest request. One extra one-row request reads the unit and `X-Result-Count`. |
-| `/api/marketplace-resources/` | `offering_uuid`, field-restricted | |
+| `/api/marketplace-offering-users/` | `offering_uuid`, `field=uuid,username,user_uuid` | Once per offering. |
+| `/api/marketplace-component-user-usages/` | `offering_uuid`, `type=node`, field-restricted | The largest request, once per offering. One extra one-row request per offering reads the unit and `X-Result-Count`. |
+| `/api/marketplace-resources/` | `offering_uuid`, field-restricted | Once per offering. |
 | `/api/projects/` | `include_terminated=true`, `field=uuid,created,start_date,end_date` | Needed for ended projects too. |
 | `/api/user-permissions/` | `scope_type=project`, `show_inactive=true` | **The heaviest per row**: this serializer does not support `field=`, so every row comes back in full. It is one pass over all project roles. |
 
@@ -429,12 +471,13 @@ Other measures:
 
 - **Server-side filtering and field restriction.** Waldur's list endpoints accept
   `field=` (a restricted serializer), so each request names the fields it needs.
-  Usage is filtered to one offering and one component type rather than fetched in
-  full and filtered locally.
+  Usage is filtered by offering and component type rather than fetched in full
+  and filtered locally. Adding Phase 1 added one pass over each offering-specific
+  endpoint; users, projects and memberships are still fetched once.
 - **Maximum page size.** The server's pagination caps `page_size` at 300, which
   is what is requested, so the number of round trips is minimal.
-- **`--no-usage`** skips every usage, project and membership request and gives
-  only the domain list from `/api/users/`.
+- **`--no-usage`** skips every offering, usage, project and membership request
+  and gives only the domain list of every user from `/api/users/`.
 - **eduGAIN** is downloaded at most once every 30 days (`edugain_scopes.json`),
   and it is a public URL, not Waldur.
 - **Retries.** Transient 502/503/504 responses on `GET`s are retried with
@@ -468,6 +511,7 @@ poor keys, so the script sets its own:
   `OfferingUserAttributeConfig` exposes email. The script therefore does not rely
   on it: it joins offering users to Waldur users by `user_uuid` and takes the
   email from `/api/users/`.
+
 ### Alternatives considered for usage
 
 Two sources of per-user usage exist: the marketplace's own records
@@ -527,8 +571,10 @@ occasionally as a sanity check.
 WALDUR_TOKEN=<staff token> uv run verify_usage_totals.py
 ```
 
-Options: `--base-url`, and `--offering-name` / `--offering-uuid` (same defaults
-as the report). It is read-only and prints aggregates only: no names or emails.
+Options: `--base-url`, and `--offering-name` / `--offering-uuid`. It checks one
+offering at a time and defaults to `Isambard-AI Phase 2`; pass
+`--offering-name "Isambard-AI Phase 1"` to check Phase 1. It is read-only and
+prints aggregates only: no names or emails.
 
 It compares the two views month by month and prints:
 
@@ -565,8 +611,9 @@ no per-user rows. Per-user rows cannot be reconstructed for it, so the report wa
 left unchanged rather than guessing; the gap is visible in this check instead.
 Re-run it to get current figures before quoting one.
 
-The report's own **Sector totals** sheet ends with the per-user grand total, which
-is the number to compare against this script's per-user TOTAL: they should match.
+The report's own **Sector totals** sheet ends with the per-user grand total per
+offering. That offering's column is the number to compare against this script's
+per-user TOTAL: they should match.
 
 ## Known limitations
 
@@ -578,8 +625,11 @@ is the number to compare against this script's per-user TOTAL: they should match
 - **Hard-deleted records leave no trace.** Users are only deactivated in normal
   operation, but a hard-deleted user or offering user takes its usage rows with it.
 - **Membership is approximate for past roles.** A revoked role counts only if it
-  ended after the project's first resource on the offering was created.
-- **`first_project_added` is project creation**, not first access to Phase 2.
+  ended after the project's first resource on the offerings was created.
+- **`first_project_added` is project creation**, not first access to Isambard-AI.
+- **Phase 1 and Phase 2 node hours are added as they are.** A node hour on one
+  machine is not necessarily equivalent to one on the other; use the `offering`
+  column or the per-offering Sector totals to keep them apart.
 - **Classification rules are heuristics.** Suffix and eduGAIN matching can both
   miss a university (add an override) or catch something that is not one.
 - **Capped project lists.** Domain sheets show the 10 most-used organisations and

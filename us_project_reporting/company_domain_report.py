@@ -5,9 +5,11 @@
 # ///
 """
 Estimate how many companies use the Waldur instance, and how many node hours
-on one offering (default: Isambard-AI Phase 2) each has used.
+on the report's offerings (default: Isambard-AI Phase 1 and Phase 2) each has
+used.
 
-Groups users by email domain, drops domains that are not companies (consumer
+Counts only users with an account on, usage on, or a project on one of the
+offerings. Groups them by email domain, drops domains that are not companies (consumer
 mail, universities, government, ...) using domain_overrides.csv, suffix rules
 and the eduGAIN federation metadata, then adds per-user node-hour usage per
 company, organisation, project and month. Writes two .xlsx workbooks with the
@@ -18,7 +20,7 @@ Usage:
     python company_domain_report.py [--token TOKEN] [--base-url URL] [--output FILE]
                                      [--include-emails] [--overrides FILE] [--previous FILE]
                                      [--no-previous] [--no-edugain] [--refresh-edugain]
-                                     [--no-usage] [--offering-name NAME | --offering-uuid UUID]
+                                     [--no-usage] [--offering-name NAME ...] [--offering-uuid UUID ...]
 
 The Waldur API token (staff) can also be provided via the WALDUR_TOKEN
 environment variable, or entered interactively when prompted.
@@ -143,7 +145,10 @@ EDUGAIN_METADATA_URL = "https://mds.edugain.org/edugain-v2.xml"
 EDUGAIN_CACHE_PATH = Path(__file__).with_name("edugain_scopes.json")
 EDUGAIN_MAX_AGE = timedelta(days=30)
 
-DEFAULT_OFFERING_NAME = "Isambard-AI Phase 2"
+# Offerings reported on by default: their usage is added up, and their projects
+# and accounts decide which users are counted.
+DEFAULT_OFFERING_NAMES = ["Isambard-AI Phase 1", "Isambard-AI Phase 2"]
+DEFAULT_OFFERING_NAME = "Isambard-AI Phase 2"  # verify_usage_totals.py's default
 SOVEREIGN_AI_ORGANISATION = "Sovereign AI"  # organisation (Waldur customer) name
 # Its projects get their own sheet in the non-company workbook, as there are
 # too many for the projects sheet. Sheet names are limited to 31 characters.
@@ -657,15 +662,20 @@ def main():
     parser.add_argument(
         "--no-usage",
         action="store_true",
-        help="Skip node-hour usage (fewer API requests; domain list only)",
+        help="Skip node-hour usage and project data (fewer API requests; domain list of every user on Waldur)",
     )
-    offering = parser.add_mutually_exclusive_group()
-    offering.add_argument(
+    parser.add_argument(
         "--offering-name",
-        default=DEFAULT_OFFERING_NAME,
-        help=f"Exact name of the offering to report usage for (default: {DEFAULT_OFFERING_NAME!r})",
+        action="append",
+        help="Exact name of an offering to report on; repeat for several "
+        f"(default: {', '.join(repr(n) for n in DEFAULT_OFFERING_NAMES)})",
     )
-    offering.add_argument("--offering-uuid", help="Offering UUID (skips the name lookup)")
+    parser.add_argument(
+        "--offering-uuid",
+        action="append",
+        help="Offering UUID (skips the name lookup); repeat for several. "
+        "Given --offering-name or --offering-uuid, only those offerings are used.",
+    )
     args = parser.parse_args()
 
     overrides = load_overrides(args.overrides)
@@ -698,22 +708,88 @@ def main():
     eprint(f"Fetching all users from {base_url}/api/users/ ...")
     all_users = list(paginate(session, f"{base_url}/api/users/", {"field": USER_FIELDS}))
     eprint(f"Fetched {len(all_users)} user(s).")
+    email_by_user_uuid = {u["uuid"]: u.get("email") or "" for u in all_users if u.get("uuid")}
+
+    # --- Step 2: the offerings' accounts, usage, projects and members ---
+    # Only users with an account on one of the offerings, usage on it, or a
+    # (current or qualifying past) membership of a project with a resource on
+    # it are counted anywhere in the report. Without usage data (--no-usage)
+    # there is nothing to tell them apart, so every user is counted.
+    usage_enabled = not args.no_usage
+    offering_labels = []  # in the order given; used for the offering columns
+    access_emails = set()
+    usage_rows = []
+    counted_memberships = []  # (membership, offering project)
+    unit = None
+    current_month = date.today().strftime("%Y-%m")
+    if usage_enabled:
+        offerings = [(uuid, uuid) for uuid in args.offering_uuid or []]
+        names = args.offering_name or ([] if args.offering_uuid else DEFAULT_OFFERING_NAMES)
+        offerings += [(resolve_offering_uuid(session, base_url, name), name) for name in names]
+        # project_uuid -> {project, organisation, first_created, offerings}
+        offering_projects = {}
+        for offering_uuid, label in offerings:
+            offering_labels.append(label)
+            eprint(f"\nOffering: {label} ({offering_uuid})")
+            emails, rows, offering_unit = fetch_offering_usage(session, base_url, offering_uuid, email_by_user_uuid)
+            if unit and offering_unit != unit:
+                eprint(f"Warning: {label} measures {USAGE_COMPONENT_TYPE} in {offering_unit}, not {unit}; adding them anyway.")
+            unit = unit or offering_unit
+            access_emails |= emails
+            for r in rows:
+                r["offering"] = label
+            usage_rows += rows
+            for project_uuid, p in fetch_offering_projects(session, base_url, offering_uuid).items():
+                known = offering_projects.setdefault(project_uuid, {**p, "offerings": set()})
+                known["offerings"].add(label)
+                if p["first_created"] and (known["first_created"] is None or p["first_created"] < known["first_created"]):
+                    known["first_created"] = p["first_created"]
+        project_dates = fetch_project_dates(session, base_url)
+        for m in fetch_project_members(session, base_url):
+            project = offering_projects.get(m["project_uuid"])
+            if project is None:
+                continue
+            # A revoked role only counts if it outlived the project's first
+            # resource on the offerings, i.e. the user was a member while the
+            # project had access to one.
+            if (
+                not m["is_active"]
+                and m["ended"] is not None
+                and project["first_created"] is not None
+                and m["ended"] < project["first_created"]
+            ):
+                continue
+            counted_memberships.append((m, project))
+        counted_emails = (
+            access_emails
+            | {r["email"] for r in usage_rows if r["email"]}
+            | {email for m, _ in counted_memberships if (email := email_by_user_uuid.get(m["user_uuid"]))}
+        )
 
     domain_users = defaultdict(list)
-    email_by_user_uuid = {u["uuid"]: u.get("email") or "" for u in all_users if u.get("uuid")}
     no_email = 0
+    not_counted = 0
     for u in all_users:
         email = u.get("email") or ""
         domain = domain_of(email)
         if domain is None:
             no_email += 1
             continue
+        if usage_enabled and email not in counted_emails:
+            not_counted += 1
+            continue
         domain_users[domain].append(email)
 
+    eprint("")
     if no_email:
-        eprint(f"  ({no_email} user(s) had no usable email address — skipped.)")
+        eprint(f"({no_email} user(s) had no usable email address — skipped.)")
+    if usage_enabled:
+        eprint(
+            f"Counting {sum(len(e) for e in domain_users.values())} user(s) with an account on, usage on, or a "
+            f"project on {' / '.join(offering_labels)}; leaving out {not_counted} user(s) with none of these."
+        )
 
-    # --- Step 2: classify every domain; merge same_as aliases into one company ---
+    # --- Step 3: classify every domain; merge same_as aliases into one company ---
     companies = defaultdict(lambda: {"emails": [], "merged": [], "notes": []})
     excluded_rows = []
     classification = {}
@@ -735,7 +811,7 @@ def main():
         by_category[c["category"]] += 1
         by_layer[c["matched_by"].split()[0]] += 1
 
-    eprint(f"\nTotal distinct email domains seen: {len(domain_users)}")
+    eprint(f"\nTotal distinct email domains of counted users: {len(domain_users)}")
     eprint(f"  excluded: {len(excluded_rows)}")
     for category, n in sorted(by_category.items(), key=lambda kv: -kv[1]):
         eprint(f"    {category}: {n}")
@@ -745,53 +821,46 @@ def main():
     if args.no_edugain:
         eprint("    (eduGAIN layer disabled with --no-edugain)")
     merged = sum(len(c["merged"]) for c in companies.values())
-    eprint(
-        f"  => candidate companies: {len(companies)}" + (f" ({merged} alias domain(s) merged)" if merged else "")
-        + (" — before leaving out those with no project on the offering" if not args.no_usage else "")
-    )
+    eprint(f"  => candidate companies: {len(companies)}" + (f" ({merged} alias domain(s) merged)" if merged else ""))
 
     generic_user_total = sum(len(e) for _, e, c in excluded_rows if c["category"] == "generic")
     if generic_user_total:
         eprint(
-            f"\nNote: {generic_user_total} user(s) on Waldur are on generic providers "
+            f"\nNote: {generic_user_total} counted user(s) are on generic providers "
             f"(e.g. a company contact who used personal Gmail) and are excluded "
             f"from the domain-distinct count — see {non_company_output} "
             f"if you want to hand-attribute any of them to a company."
         )
 
-    # --- Step 3: node-hour usage per company on one offering ---
-    usage_enabled = not args.no_usage
-    access = defaultdict(set)  # company -> emails with an account on the offering
-    hours = defaultdict(lambda: defaultdict(Decimal))  # company -> month -> hours
-    month_users = defaultdict(lambda: defaultdict(set))  # company -> month -> emails
-    # (company, project_uuid) -> project/organisation names, month -> hours,
-    # emails with usage, emails of current and former members
+    # --- Step 4: node-hour usage per company and institution, per offering ---
+    def per_offering(leaf):
+        """key -> offering -> month -> leaf()"""
+        return defaultdict(lambda: defaultdict(lambda: defaultdict(leaf)))
+
+    access = defaultdict(set)  # company -> emails with an account on an offering
+    hours = per_offering(Decimal)  # company -> offering -> month -> hours
+    month_users = per_offering(set)  # company -> offering -> month -> emails
+    # (company, project_uuid) -> project/organisation names, month -> hours
+    # (all offerings), offering -> month -> hours, offering -> emails with
+    # usage, emails of current and former members, and the offerings the
+    # project has a resource on or usage for.
     def new_project():
         return {
             "uuid": None, "organisation": "", "project": "", "hours": defaultdict(Decimal),
-            "users": set(), "members": set(), "former_members": set(),
+            "offering_hours": defaultdict(lambda: defaultdict(Decimal)), "offering_users": defaultdict(set),
+            "users": set(), "members": set(), "former_members": set(), "offerings": set(),
         }
 
     company_projects = defaultdict(new_project)
     # Same, for excluded (non-company) domains, keyed by institution (see
     # institution_of) the way same_as aliases are merged into one company.
     excluded_access = defaultdict(set)
-    excluded_hours = defaultdict(lambda: defaultdict(Decimal))
-    excluded_month_users = defaultdict(lambda: defaultdict(set))
+    excluded_hours = per_offering(Decimal)
+    excluded_month_users = per_offering(set)
     excluded_projects = defaultdict(new_project)
-    excluded_seen = set()  # excluded domains met through the offering
+    excluded_seen = set()  # excluded domains met through the offerings
     unmatched = []
-    non_company_hours = Decimal(0)
-    current_month = date.today().strftime("%Y-%m")
     if usage_enabled:
-        offering_uuid = args.offering_uuid or resolve_offering_uuid(session, base_url, args.offering_name)
-        offering_label = args.offering_uuid or args.offering_name
-        eprint(f"\nUsage offering: {offering_label} ({offering_uuid})")
-        access_emails, usage_rows, unit = fetch_offering_usage(session, base_url, offering_uuid, email_by_user_uuid)
-        offering_projects = fetch_offering_projects(session, base_url, offering_uuid)
-        project_dates = fetch_project_dates(session, base_url)
-        memberships = fetch_project_members(session, base_url)
-
         def classified(email: str | None) -> tuple[str, dict] | None:
             """(domain, classification) for an email, or None without a usable domain."""
             domain = domain_of(email or "")
@@ -816,19 +885,28 @@ def main():
                 return institution_of(*hit)
             return None
 
-        def add_usage(projects, key, r, month):
-            p = projects[(key, r.get("project_uuid"))]
-            p["uuid"] = r.get("project_uuid")
-            p["organisation"] = r.get("customer_name") or ""
-            p["project"] = r.get("project_name") or ""
-            p["hours"][month] += r["usage"]
-            p["users"].add(r["email"])
-
-        def add_member(projects, key, project_uuid, email, is_active):
+        def project_entry(projects, key, project_uuid):
             p = projects[(key, project_uuid)]
             p["uuid"] = project_uuid
-            p["project"] = p["project"] or offering_projects[project_uuid]["project"]
-            p["organisation"] = p["organisation"] or offering_projects[project_uuid]["organisation"]
+            known = offering_projects.get(project_uuid)
+            if known:
+                p["project"] = p["project"] or known["project"]
+                p["organisation"] = p["organisation"] or known["organisation"]
+                p["offerings"] |= known["offerings"]
+            return p
+
+        def add_usage(projects, key, r, month):
+            p = project_entry(projects, key, r.get("project_uuid"))
+            p["organisation"] = r.get("customer_name") or p["organisation"]
+            p["project"] = r.get("project_name") or p["project"]
+            p["offerings"].add(r["offering"])
+            p["hours"][month] += r["usage"]
+            p["offering_hours"][r["offering"]][month] += r["usage"]
+            p["users"].add(r["email"])
+            p["offering_users"][r["offering"]].add(r["email"])
+
+        def add_member(projects, key, project_uuid, email, is_active):
+            p = project_entry(projects, key, project_uuid)
             p["members" if is_active else "former_members"].add(email)
 
         for email in access_emails:
@@ -841,63 +919,55 @@ def main():
                 unmatched.append(r)
                 continue
             month = (r.get("billing_period") or "")[:7]  # YYYY-MM
-            company = company_of(r["email"])
-            if not company:
-                non_company_hours += r["usage"]
-                if institution := excluded_of(r["email"]):
-                    excluded_hours[institution][month] += r["usage"]
-                    excluded_month_users[institution][month].add(r["email"])
-                    add_usage(excluded_projects, institution, r, month)
-                continue
-            hours[company][month] += r["usage"]
-            month_users[company][month].add(r["email"])
-            add_usage(company_projects, company, r, month)
-        for m in memberships:
-            project = offering_projects.get(m["project_uuid"])
-            if project is None:
-                continue
-            # A revoked role only counts if it outlived the project's first
-            # resource on the offering, i.e. the user was a member while the
-            # project had access to it.
-            if (
-                not m["is_active"]
-                and m["ended"] is not None
-                and project["first_created"] is not None
-                and m["ended"] < project["first_created"]
-            ):
-                continue
+            if company := company_of(r["email"]):
+                hours[company][r["offering"]][month] += r["usage"]
+                month_users[company][r["offering"]][month].add(r["email"])
+                add_usage(company_projects, company, r, month)
+            elif institution := excluded_of(r["email"]):
+                excluded_hours[institution][r["offering"]][month] += r["usage"]
+                excluded_month_users[institution][r["offering"]][month].add(r["email"])
+                add_usage(excluded_projects, institution, r, month)
+        for m, _ in counted_memberships:
             email = email_by_user_uuid.get(m["user_uuid"])
             if company := company_of(email):
                 add_member(company_projects, company, m["project_uuid"], email, m["is_active"])
             elif institution := excluded_of(email):
                 add_member(excluded_projects, institution, m["project_uuid"], email, m["is_active"])
 
-        # A domain found only through the offering (user missing from
+        # A domain found only through the offerings (user missing from
         # /api/users/) still gets a row, with user_count 0.
         for company in [*access, *hours, *(c for c, _ in company_projects)]:
             companies.setdefault(company, companies.default_factory())
         listed = {domain for domain, _, _ in excluded_rows}
         for domain in sorted(excluded_seen - listed):
             excluded_rows.append((domain, [], classification[domain]))
-        company_hours = {c: sum(m.values(), Decimal(0)) for c, m in hours.items()}
-        institution_hours = {i: sum(m.values(), Decimal(0)) for i, m in excluded_hours.items()}
-        total_hours = sum(company_hours.values(), Decimal(0))
-        unmatched_hours = sum((r["usage"] for r in unmatched), Decimal(0))
 
-        # Per sector: hours, domains and users with usage. Companies are keyed
-        # by company (aliases merged), excluded domains by domain.
-        sector_hours = defaultdict(Decimal)
+        def totals(hours_):
+            return {k: sum((h for months in o.values() for h in months.values()), Decimal(0)) for k, o in hours_.items()}
+
+        company_hours = totals(hours)
+        institution_hours = totals(excluded_hours)
+
+        # Per sector and offering: hours; per sector: domains and users with
+        # usage. Companies are keyed by company (aliases merged), excluded
+        # domains by domain.
+        sector_hours = defaultdict(lambda: defaultdict(Decimal))
         sector_domains = defaultdict(set)
         sector_users = defaultdict(set)
+        offering_hours = defaultdict(Decimal)  # offering -> all hours
+        unmatched_hours = defaultdict(Decimal)  # offering -> unmatched hours
         for r in usage_rows:
+            offering_hours[r["offering"]] += r["usage"]
             hit = classified(r["email"])
             if hit is None:
-                continue  # unmatched; reported separately
+                unmatched_hours[r["offering"]] += r["usage"]
+                continue
             domain, c = hit
             sector = c["category"]
-            sector_hours[sector] += r["usage"]
+            sector_hours[sector][r["offering"]] += r["usage"]
             sector_domains[sector].add((c.get("same_as") or domain) if sector == "company" else domain)
             sector_users[sector].add(r["email"])
+        all_hours = sum(offering_hours.values(), Decimal(0))
 
     # Non-company domains grouped by institution. An institution's category is
     # that of its domains (by user count, should they ever differ).
@@ -932,29 +1002,9 @@ def main():
     projects_by_company = projects_by_key(company_projects)
     projects_by_institution = projects_by_key(excluded_projects)
 
-    # With usage, only companies and institutions with a project on the
-    # offering are listed: users who are on Waldur but in no such project
-    # (current member, or revoked after the project's first resource) are
-    # left out. Without usage there is no project data, so every domain is.
-    def listed_projects(projects_by: dict, key: str) -> list | None:
-        """A domain sheet row's projects, or None to leave the row out."""
-        if not usage_enabled:
-            return []
-        return projects_by.get(key) or None
-
-    listed_companies = {d for d in companies if listed_projects(projects_by_company, d) is not None}
-    listed_institutions = {k for k in institutions if listed_projects(projects_by_institution, k) is not None}
-    listed_excluded = [(d, e, c) for d, e, c in excluded_rows if institution_of(d, c) in listed_institutions]
-
     eprint(f"\n=== Summary ===")
-    if usage_enabled:
-        eprint(
-            f"Leaving out {len(companies) - len(listed_companies)} company domain(s) and "
-            f"{len(institutions) - len(listed_institutions)} non-company institution(s) "
-            f"with no project on the offering."
-        )
-    eprint(f"Domain-distinct company count: {len(listed_companies)}")
-    eprint(f"Non-company institutions: {len(listed_institutions)} (from {len(listed_excluded)} domain(s))")
+    eprint(f"Domain-distinct company count: {len(companies)}")
+    eprint(f"Non-company institutions: {len(institutions)} (from {len(excluded_rows)} domain(s))")
 
     def review_status(domain: str, category: str) -> str:
         """'' if unchanged since the previous report or decided by an override, else 'yes' / 'changed (...)'."""
@@ -969,21 +1019,25 @@ def main():
     new_header = ["new"] if previous is not None else []
     new_width = [16] if previous is not None else []
     if usage_enabled:
-        eprint(f"Companies with an account on {offering_label}: {len(access)}")
-        eprint(f"Companies with usage on {offering_label}: {sum(1 for h in company_hours.values() if h > 0)}")
-        eprint(f"Company {USAGE_COMPONENT_TYPE} {unit}: {total_hours:,.2f}")
-        eprint(f"Non-company {USAGE_COMPONENT_TYPE} {unit} (academic, government, ...): {non_company_hours:,.2f}")
-        all_hours = sum((r["usage"] for r in usage_rows), Decimal(0))
+        company_total = sum(company_hours.values(), Decimal(0))
+        non_company_total = sum(institution_hours.values(), Decimal(0))
+        unmatched_total = sum(unmatched_hours.values(), Decimal(0))
+        eprint(f"Companies with an account on the offerings: {len(access)}")
+        eprint(f"Companies with usage on the offerings: {sum(1 for h in company_hours.values() if h > 0)}")
+        eprint(f"Company {USAGE_COMPONENT_TYPE} {unit}: {company_total:,.2f}")
+        eprint(f"Non-company {USAGE_COMPONENT_TYPE} {unit} (academic, government, ...): {non_company_total:,.2f}")
+        for label in offering_labels:
+            eprint(f"{label} {USAGE_COMPONENT_TYPE} {unit}: {offering_hours[label]:,.2f}")
         eprint(
-            f"All {offering_label} {USAGE_COMPONENT_TYPE} {unit}: {all_hours:,.2f} "
-            f"(= company + non-company + unmatched: {total_hours + non_company_hours + unmatched_hours:,.2f})"
+            f"All {USAGE_COMPONENT_TYPE} {unit}: {all_hours:,.2f} "
+            f"(= company + non-company + unmatched: {company_total + non_company_total + unmatched_total:,.2f})"
         )
         if unmatched:
             eprint(
-                f"Unmatched: {len(unmatched)} usage row(s), {unmatched_hours:,.2f} {unit} — "
+                f"Unmatched: {len(unmatched)} usage row(s), {unmatched_total:,.2f} {unit} — "
                 f"no email could be found for the user; see the 'Unmatched usage' sheet."
             )
-        if any(current_month in m for m in hours.values()):
+        if any((r.get("billing_period") or "").startswith(current_month) for r in usage_rows):
             eprint(f"Note: {current_month} is the current month and still accumulating usage.")
 
     # --- Output: two workbooks with the same layout, one for company domains
@@ -1055,7 +1109,6 @@ def main():
             (d, review_status(d, "company"), [], c["emails"], access.get(d, set()), projects_by_company[d],
              [", ".join(sorted(c["merged"])), "; ".join(c["notes"])])
             for d, c in sorted(companies.items(), key=lambda kv: (-len(kv[1]["emails"]), kv[0]))
-            if d in listed_companies
         ]
 
     def institution_review(inst) -> str:
@@ -1074,42 +1127,52 @@ def main():
             for key, inst in sorted(
                 institutions.items(), key=lambda kv: (kv[1]["category"], -len(kv[1]["emails"]), kv[0])
             )
-            if key in listed_institutions
         ]
 
+    hours_col = f"{USAGE_COMPONENT_TYPE}_{unit}"
+
     def write_monthly_sheet(sheet, entity, hours_, month_users_, entity_hours):
-        sheet.append([entity, "month", f"{USAGE_COMPONENT_TYPE}_{unit}", "users", "partial_month"])
+        sheet.append([entity, "offering", "month", hours_col, "users", "partial_month"])
         for key in sorted(hours_, key=lambda k: (-entity_hours[k], k)):
-            for month in sorted(hours_[key]):
-                sheet.append([
-                    key,
-                    month,
-                    float(hours_[key][month]),
-                    len(month_users_[key][month]),
-                    "yes" if month == current_month else "",
-                ])
-        for col, width in zip("ABCDE", (30, 10, 16, 8, 14)):
+            for offering in [o for o in offering_labels if o in hours_[key]]:
+                for month in sorted(hours_[key][offering]):
+                    sheet.append([
+                        key,
+                        offering,
+                        month,
+                        float(hours_[key][offering][month]),
+                        len(month_users_[key][offering][month]),
+                        "yes" if month == current_month else "",
+                    ])
+        for col, width in zip("ABCDEF", (30, 22, 10, 16, 8, 14)):
             sheet.column_dimensions[col].width = width
 
     def write_by_month_sheet(sheet, entities, hours_, month_users_):
-        sheet.append(["month", f"{USAGE_COMPONENT_TYPE}_{unit}", f"{entities}_active", "users_active", "partial_month"])
-        for month in sorted({m for k in hours_.values() for m in k}):
-            active = [k for k in hours_ if hours_[k].get(month, 0) > 0]
+        """Per month, across all entities and offerings."""
+        sheet.append(["month", hours_col, f"{entities}_active", "users_active", "partial_month"])
+        months = sorted({m for o in hours_.values() for months in o.values() for m in months})
+        for month in months:
+            month_hours = {k: sum((o[month] for o in hours_[k].values() if month in o), Decimal(0)) for k in hours_}
+            active = [k for k, h in month_hours.items() if h > 0]
             sheet.append([
                 month,
-                float(sum((hours_[k][month] for k in active), Decimal(0))),
+                float(sum(month_hours.values(), Decimal(0))),
                 len(active),
-                len(set().union(*(month_users_[k][month] for k in active))),
+                len(set().union(*(u[month] for k in active for u in month_users_[k].values() if month in u))),
                 "yes" if month == current_month else "",
             ])
         for col, width in zip("ABCDE", (10, 16, 22, 14, 14)):
             sheet.column_dimensions[col].width = width
 
     def write_projects_sheet(sheet, entity, projects_by, entity_hours, keep=lambda p: True):
-        """One row per entity per offering project, for the projects keep() accepts."""
+        """One row per entity per offering project per offering, for the projects keep() accepts.
+
+        Hours, users with usage and usage months are the offering's; members are
+        project-wide. An entity gets a row for each offering it used in the
+        project, or, without usage there, for each offering the project has.
+        """
         sheet.append([
-            entity, "organisation", "project", "project_start_date", "project_end_date",
-            f"{USAGE_COMPONENT_TYPE}_{unit}",
+            entity, "offering", "organisation", "project", "project_start_date", "project_end_date", hours_col,
             "users_with_usage", "current_members", "former_members", "first_usage_month", "last_usage_month",
         ])
         written = 0
@@ -1117,53 +1180,70 @@ def main():
             for p in projects_by[key]:
                 if not keep(p):
                     continue
-                used = months_with_usage(p["hours"])
-                sheet.append([
-                    key,
-                    p["organisation"],
-                    p["project"],
-                    project_dates.get(p["uuid"], {}).get("start_date"),
-                    project_dates.get(p["uuid"], {}).get("end_date"),
-                    float(sum(p["hours"].values(), Decimal(0))),
-                    len(p["users"]),
-                    len(p["members"]),
-                    len(p["former_members"] - p["members"]),
-                    used[0] if used else None,
-                    used[-1] if used else None,
-                ])
-                written += 1
-        for col, width in zip("ABCDEFGHIJK", (30, 40, 40, 18, 18, 16, 16, 16, 16, 18, 18)):
+                used_offerings = {o for o, months in p["offering_hours"].items() if any(months.values())}
+                for offering in [o for o in offering_labels if o in (used_offerings or p["offerings"])]:
+                    used = months_with_usage(p["offering_hours"][offering])
+                    sheet.append([
+                        key,
+                        offering,
+                        p["organisation"],
+                        p["project"],
+                        project_dates.get(p["uuid"], {}).get("start_date"),
+                        project_dates.get(p["uuid"], {}).get("end_date"),
+                        float(sum(p["offering_hours"][offering].values(), Decimal(0))),
+                        len(p["offering_users"][offering]),
+                        len(p["members"]),
+                        len(p["former_members"] - p["members"]),
+                        used[0] if used else None,
+                        used[-1] if used else None,
+                    ])
+                    written += 1
+        for col, width in zip("ABCDEFGHIJKL", (30, 22, 40, 40, 18, 18, 16, 16, 16, 16, 18, 18)):
             sheet.column_dimensions[col].width = width
         return written
 
     def write_unmatched_sheet(sheet):
         sheet.append(
-            ["month", f"{USAGE_COMPONENT_TYPE}_{unit}", "organisation", "project"] + (["username"] if args.include_emails else [])
+            ["month", "offering", hours_col, "organisation", "project"] + (["username"] if args.include_emails else [])
         )
-        for r in sorted(unmatched, key=lambda r: (r.get("billing_period") or "", r.get("project_name") or "")):
-            row = [(r.get("billing_period") or "")[:7], float(r["usage"]), r.get("customer_name"), r.get("project_name")]
+        for r in sorted(unmatched, key=lambda r: (r.get("billing_period") or "", r["offering"], r.get("project_name") or "")):
+            row = [
+                (r.get("billing_period") or "")[:7], r["offering"], float(r["usage"]),
+                r.get("customer_name"), r.get("project_name"),
+            ]
             if args.include_emails:
                 row.append(r.get("username"))
             sheet.append(row)
-        for col, width in zip("ABCDE", (10, 16, 40, 40, 30)):
+        for col, width in zip("ABCDEF", (10, 22, 16, 40, 40, 30)):
             sheet.column_dimensions[col].width = width
 
     def write_sector_totals_sheet(sheet):
-        sheet.append(["sector", f"{USAGE_COMPONENT_TYPE}_{unit}", "share_of_per_user_total", "domains_with_usage", "users_with_usage"])
+        """Hours per sector, per offering and in total, with each sector's share of the total."""
+        sheet.append(
+            ["sector", *(f"{hours_col} ({o})" for o in offering_labels), hours_col,
+             "share_of_per_user_total", "domains_with_usage", "users_with_usage"]
+        )
 
         def share(h):
             return round(float(h / all_hours), 4) if all_hours else None
 
+        def hours_cells(by_offering):
+            total = sum(by_offering.values(), Decimal(0))
+            return [*(float(by_offering.get(o, Decimal(0))) for o in offering_labels), float(total), share(total)]
+
         for sector in SECTORS:
-            h = sector_hours.get(sector, Decimal(0))
-            sheet.append([sector, float(h), share(h), len(sector_domains[sector]), len(sector_users[sector])])
-        sheet.append(["unmatched (no email)", float(unmatched_hours), share(unmatched_hours), None, None])
-        sheet.append(["TOTAL (per-user usage)", float(all_hours), share(all_hours), None, None])
-        for row in sheet.iter_rows(min_row=2, min_col=3, max_col=3):
+            sheet.append(
+                [sector, *hours_cells(sector_hours[sector]), len(sector_domains[sector]), len(sector_users[sector])]
+            )
+        sheet.append(["unmatched (no email)", *hours_cells(unmatched_hours), None, None])
+        sheet.append(["TOTAL (per-user usage)", *hours_cells(offering_hours), None, None])
+        share_col = len(offering_labels) + 3
+        for row in sheet.iter_rows(min_row=2, min_col=share_col, max_col=share_col):
             for cell in row:
                 cell.number_format = "0.0%"
-        for col, width in zip("ABCDE", (28, 16, 24, 20, 18)):
-            sheet.column_dimensions[col].width = width
+        widths = [28, *([30] * len(offering_labels)), 16, 24, 20, 18]
+        for i, width in enumerate(widths):
+            sheet.column_dimensions[get_column_letter(i + 1)].width = width
 
     # Company workbook.
     wb = Workbook()
@@ -1223,8 +1303,8 @@ def main():
     wb.save(non_company_output)
 
     to_review = sorted(
-        [(d, "company", len(c["emails"])) for d, c in companies.items() if d in listed_companies]
-        + [(d, c["category"], len(e)) for d, e, c in listed_excluded]
+        [(d, "company", len(c["emails"])) for d, c in companies.items()]
+        + [(d, c["category"], len(e)) for d, e, c in excluded_rows]
     )
     flagged = [(d, cat, n, status) for d, cat, n in to_review if (status := review_status(d, cat))]
     if previous is None:
@@ -1240,8 +1320,8 @@ def main():
         eprint(f"\nNo domains new or changed since {args.previous.name}.")
 
     eprint(
-        f"\n{len(listed_companies)} candidate company domain(s) written to {args.output}, "
-        f"{len(listed_institutions)} non-company institution(s) to {non_company_output}. "
+        f"\n{len(companies)} candidate company domain(s) written to {args.output}, "
+        f"{len(institutions)} non-company institution(s) to {non_company_output}. "
         f"Review single-user domains especially closely — they're the likeliest "
         f"false positives (personal-looking domain, contractor, typo) or, if a "
         f"generic-looking address was actually a company alias, false negatives."
