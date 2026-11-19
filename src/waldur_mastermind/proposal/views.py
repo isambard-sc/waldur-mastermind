@@ -75,6 +75,7 @@ from waldur_mastermind.proposal import (
     filters,
     models,
     orcid_service,
+    reports,
     review_import,
     round_lifecycle,
     serializers,
@@ -336,6 +337,16 @@ def reviewers_with_email_invitation(call, reviewers):
     }
 
 
+# Who may read a call managing organisation's reports and statistics (#1108,
+# ported from upstream): call organisers, the organisation's call managers
+# (over their own calls), staff, and support (reads).
+_ORGANISATION_REPORT_PERMISSIONS = [
+    proposal_permissions.support_can_read(
+        proposal_permissions.can_read_organisation_reports
+    )
+]
+
+
 class CallManagingOrganisationViewSet(
     UserRoleMixin, PublicViewsetMixin, BaseMarketplaceView
 ):
@@ -358,7 +369,12 @@ class CallManagingOrganisationViewSet(
             )
 
     @extend_schema(
-        description="Return statistics for call managing organisation.",
+        description=(
+            "Return statistics for call managing organisation, counted over "
+            "the active calls the caller may report on: a call manager's "
+            "figures cover their own calls. For call organisers, the "
+            "organisation's call managers, staff and support."
+        ),
         request=None,
         responses=serializers.CallManagingOrganisationStatSerializer,
     )
@@ -367,52 +383,51 @@ class CallManagingOrganisationViewSet(
         instance: models.CallManagingOrganisation = self.get_object()
         now = timezone.now()
         one_week_from_now = now + timedelta(weeks=1)
+        # Counted over the calls the organisation reports cover, so a call
+        # manager's figures leave out the organisation's other calls.
+        calls = reports.organisation_calls(request, instance).filter(
+            state=CallStates.ACTIVE
+        )
 
-        open_calls = models.Call.objects.filter(
-            state=CallStates.ACTIVE, manager=instance
-        ).count()
+        open_calls = calls.count()
         active_rounds = models.Round.objects.filter(
             cutoff_time__gte=now,
-            call__manager=instance,
-            call__state=CallStates.ACTIVE,
+            call__in=calls,
         ).count()
         accepted_proposals = models.Proposal.objects.filter(
             state=ProposalStates.ACCEPTED,
-            round__call__manager=instance,
-            round__call__state=CallStates.ACTIVE,
+            round__call__in=calls,
         ).count()
         pending_proposals = models.Proposal.objects.filter(
             state__in=[
                 ProposalStates.IN_REVIEW,
                 ProposalStates.SUBMITTED,
             ],
-            round__call__manager=instance,
-            round__call__state=CallStates.ACTIVE,
+            round__call__in=calls,
         ).count()
         pending_review = models.Review.objects.filter(
             state=models.Review.States.SUBMITTED,
-            proposal__round__call__manager=instance,
-            proposal__round__call__state=CallStates.ACTIVE,
+            proposal__round__call__in=calls,
         ).count()
 
         rounds_closing_in_one_week = models.Round.objects.filter(
             cutoff_time__gte=now,
             cutoff_time__lte=one_week_from_now,
-            call__manager=instance,
-            call__state=CallStates.ACTIVE,
+            call__in=calls,
         ).count()
 
-        calls_closing_in_one_week = models.Call.objects.filter(
-            state=CallStates.ACTIVE,
-            round__cutoff_time__gte=now,
-            round__cutoff_time__lte=one_week_from_now,
-            manager=instance,
-        ).count()
+        calls_closing_in_one_week = (
+            calls.filter(
+                round__cutoff_time__gte=now,
+                round__cutoff_time__lte=one_week_from_now,
+            )
+            .distinct()
+            .count()
+        )
 
         offering_requests_pending = models.RequestedOffering.objects.filter(
             state=RequestedOfferingStates.REQUESTED,
-            call__manager=instance,
-            call__state=CallStates.ACTIVE,
+            call__in=calls,
         ).count()
 
         return response.Response(
@@ -428,6 +443,8 @@ class CallManagingOrganisationViewSet(
             },
             status=status.HTTP_200_OK,
         )
+
+    stats_permissions = _ORGANISATION_REPORT_PERMISSIONS
 
     @extend_schema(
         description="Get call performance statistics across all calls.",

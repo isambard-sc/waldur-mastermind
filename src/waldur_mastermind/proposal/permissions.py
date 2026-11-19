@@ -2,6 +2,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.db.models import Q
 from rest_framework import exceptions, permissions
 
+from waldur_core.core.auth_utils import is_pat_auth
 from waldur_core.core.exceptions import IncorrectStateException
 from waldur_core.permissions import models as permissions_models
 from waldur_core.permissions.enums import PermissionEnum, RoleEnum
@@ -146,6 +147,71 @@ def is_active_proposal_manager(user, proposal) -> bool:
         is_active=True,
         role__name=RoleEnum.PROPOSAL_MANAGER,
     ).exists()
+
+
+# Ported from upstream (#1108, 9b57c79c): who may read a call managing
+# organisation's statistics. Kept as upstream has them so they merge cleanly.
+
+
+def configurable_call_ids(user):
+    """Ids of the calls whose configuration ``user`` may change: UPDATE_CALL
+    on the call itself, on its managing organisation, or on the customer
+    running that organisation. Staff and support are not special-cased here."""
+    from waldur_core.structure import models as structure_models
+
+    def scope(model):
+        return get_scope_ids(
+            user,
+            ContentType.objects.get_for_model(model),
+            permission=PermissionEnum.UPDATE_CALL,
+        )
+
+    return proposal_models.Call.objects.filter(
+        Q(pk__in=scope(proposal_models.Call))
+        | Q(manager_id__in=scope(proposal_models.CallManagingOrganisation))
+        | Q(manager__customer_id__in=scope(structure_models.Customer))
+    ).values_list("pk", flat=True)
+
+
+# The sources configurable_call_ids reads CALL.UPDATE from.
+_CONFIGURABLE_CALL_SOURCES = ["*", "manager", "manager.customer"]
+
+
+def configurable_calls(request, calls):
+    """``calls`` narrowed to those whose configuration the request may change:
+    configurable_call_ids for its user and, for a personal access token, only
+    those its scopes and bindings allow CALL.UPDATE on."""
+    calls = calls.filter(pk__in=configurable_call_ids(request.user))
+    if not is_pat_auth(getattr(request, "auth", None)):
+        return calls
+    return calls.filter(
+        pk__in=[
+            call.pk
+            for call in calls.select_related("manager__customer")
+            if has_permission_on_any_source(
+                request, PermissionEnum.UPDATE_CALL, call, _CONFIGURABLE_CALL_SOURCES
+            )
+        ]
+    )
+
+
+def can_read_organisation_reports(
+    request, view, obj: "proposal_models.CallManagingOrganisation | None" = None
+):
+    """CALL.UPDATE on the call managing organisation or its customer, or on
+    one of the organisation's calls: such a call manager reports on their
+    own calls only."""
+    if obj is None:
+        return
+    if has_permission_on_any_source(
+        request, PermissionEnum.UPDATE_CALL, obj, ["*", "customer"]
+    ):
+        return
+    if configurable_calls(
+        request, proposal_models.Call.objects.filter(manager=obj)
+    ).exists():
+        return
+    raise exceptions.PermissionDenied()
 
 
 def support_can_read(check):
