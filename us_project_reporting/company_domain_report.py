@@ -10,8 +10,9 @@ on one offering (default: Isambard-AI Phase 2) each has used.
 Groups users by email domain, drops domains that are not companies (consumer
 mail, universities, government, ...) using domain_overrides.csv, suffix rules
 and the eduGAIN federation metadata, then adds per-user node-hour usage per
-company, organisation, project and month. Writes an .xlsx workbook; emails are
-only included with --include-emails.
+company, organisation, project and month. Writes two .xlsx workbooks with the
+same layout: company domains, and non-company domains grouped by institution.
+Emails are only included with --include-emails.
 
 Usage:
     python company_domain_report.py [--token TOKEN] [--base-url URL] [--output FILE]
@@ -22,8 +23,9 @@ Usage:
 The Waldur API token (staff) can also be provided via the WALDUR_TOKEN
 environment variable, or entered interactively when prompted.
 
-Example (monthly run; writes company_domains_<today>.xlsx and compares it with
-the most recent earlier dated report in the same folder):
+Example (monthly run; writes company_domains_<today>.xlsx and
+non_company_domains_<today>.xlsx, and compares them with the most recent
+earlier dated report in the same folder):
     WALDUR_TOKEN=abc123 uv run company_domain_report.py
 
 How domains are classified, what each sheet and column means, where the data
@@ -126,6 +128,7 @@ _GENERIC_PROVIDERS = {
 
 OVERRIDES_PATH = Path(__file__).with_name("domain_overrides.csv")
 REPORT_PREFIX = "company_domains_"  # default report name: company_domains_YYYY-MM-DD.xlsx
+NON_COMPANY_PREFIX = "non_company_domains_"  # its non-company companion: non_company_domains_YYYY-MM-DD.xlsx
 OVERRIDE_CATEGORIES = {
     "company",
     "academic",
@@ -142,9 +145,13 @@ EDUGAIN_MAX_AGE = timedelta(days=30)
 
 DEFAULT_OFFERING_NAME = "Isambard-AI Phase 2"
 SOVEREIGN_AI_ORGANISATION = "Sovereign AI"  # organisation (Waldur customer) name
+# Its projects get their own sheet in the non-company workbook, as there are
+# too many for the projects sheet. Sheet names are limited to 31 characters.
+BRISTOL_ORGANISATION = "University of Bristol (Isambard-AI)"
+BRISTOL_SHEET = "UoB (Isambard-AI) projects"
 # Organisations/projects listed in a sheet cell, most-used first; the rest is
-# summarised as "(+N more)" (project_count has the full number, and the Projects
-# sheet lists every company project).
+# summarised as "(+N more)" (project_count has the full number, and the projects
+# sheets list every project).
 LIST_LIMIT = 10
 USAGE_COMPONENT_TYPE = "node"  # node hours
 
@@ -232,8 +239,15 @@ def load_overrides(path: Path) -> dict[str, dict]:
     return overrides
 
 
+def non_company_path(company_path: Path) -> Path:
+    """The non-company workbook written alongside a company report."""
+    if company_path.name.startswith(REPORT_PREFIX):
+        return company_path.with_name(NON_COMPANY_PREFIX + company_path.name.removeprefix(REPORT_PREFIX))
+    return company_path.with_stem(company_path.stem + "_non_company")
+
+
 def find_previous_report(output: Path) -> Path | None:
-    """The most recent dated report next to output, other than output itself."""
+    """The most recent dated company report next to output, other than output itself."""
     dated = []
     for path in output.parent.glob(f"{REPORT_PREFIX}????-??-??.xlsx"):
         try:
@@ -246,23 +260,40 @@ def find_previous_report(output: Path) -> Path | None:
 
 
 def load_previous_report(path: Path) -> dict[str, str]:
-    """{domain: category} from an earlier report: Company domains -> "company", Excluded -> its category."""
+    """{domain: category} from an earlier report and its non-company workbook, if any.
+
+    Company domains -> "company"; Non-company domains (or the Excluded sheet of
+    reports from before the split) -> its category. Domains listed in a row's
+    merged_domains get that row's category.
+    """
     if not path.exists():
         sys.exit(f"Error: previous report {path} not found")
-    wb = load_workbook(path, read_only=True)
     categories = {}
-    for sheet_name, fixed_category in (("Company domains", "company"), ("Excluded", None)):
-        if sheet_name not in wb.sheetnames:
+    for workbook_path in (path, non_company_path(path)):
+        if not workbook_path.exists():
             continue
-        rows = wb[sheet_name].iter_rows(values_only=True)
-        header = list(next(rows, ()))
-        domain_col = header.index("domain")
-        category_col = header.index("category") if fixed_category is None else None
-        for row in rows:
-            if row[domain_col]:
-                categories[row[domain_col]] = fixed_category or row[category_col]
-    wb.close()
-    eprint(f"Loaded {len(categories)} domain(s) from previous report {path}.")
+        wb = load_workbook(workbook_path, read_only=True)
+        for sheet_name, fixed_category in (
+            ("Company domains", "company"), ("Excluded", None), ("Non-company domains", None)
+        ):
+            if sheet_name not in wb.sheetnames:
+                continue
+            rows = wb[sheet_name].iter_rows(values_only=True)
+            header = list(next(rows, ()))
+            domain_col = header.index("domain")
+            category_col = header.index("category") if fixed_category is None else None
+            merged_col = header.index("merged_domains") if "merged_domains" in header else None
+            for row in rows:
+                if not row[domain_col]:
+                    continue
+                category = fixed_category or row[category_col]
+                categories[row[domain_col]] = category
+                for domain in (row[merged_col] or "").split(", ") if merged_col is not None else []:
+                    if domain:
+                        categories[domain] = category
+        wb.close()
+        eprint(f"Read previous report {workbook_path}.")
+    eprint(f"Loaded {len(categories)} domain(s) from the previous report.")
     return categories
 
 
@@ -587,7 +618,8 @@ def main():
     )
     parser.add_argument(
         "--output",
-        help=f"Path to write the .xlsx report to (default: {REPORT_PREFIX}YYYY-MM-DD.xlsx, today's date)",
+        help=f"Path to write the company .xlsx report to (default: {REPORT_PREFIX}YYYY-MM-DD.xlsx, today's date); "
+        f"the non-company workbook goes next to it ({NON_COMPANY_PREFIX}YYYY-MM-DD.xlsx, or <name>_non_company.xlsx)",
     )
     parser.add_argument(
         "--include-emails",
@@ -604,8 +636,8 @@ def main():
     parser.add_argument(
         "--previous",
         type=Path,
-        help="Earlier report to compare with for the 'new' column "
-        f"(default: the most recent earlier {REPORT_PREFIX}YYYY-MM-DD.xlsx next to the output)",
+        help="Earlier company report to compare with for the 'new' column; its non-company workbook is read "
+        f"too if it exists (default: the most recent earlier {REPORT_PREFIX}YYYY-MM-DD.xlsx next to the output)",
     )
     parser.add_argument(
         "--no-previous",
@@ -638,6 +670,7 @@ def main():
 
     overrides = load_overrides(args.overrides)
     args.output = Path(args.output or f"{REPORT_PREFIX}{date.today().isoformat()}.xlsx")
+    non_company_output = non_company_path(args.output)
     if args.no_previous:
         args.previous = None
     elif args.previous is None:
@@ -719,8 +752,8 @@ def main():
         eprint(
             f"\nNote: {generic_user_total} user(s) are on generic providers "
             f"(e.g. a company contact who used personal Gmail) and are excluded "
-            f"from the domain-distinct count — see the 'Excluded' sheet in the "
-            f"output file if you want to hand-attribute any of them to a company."
+            f"from the domain-distinct count — see {non_company_output} "
+            f"if you want to hand-attribute any of them to a company."
         )
 
     # --- Step 3: node-hour usage per company on one offering ---
@@ -737,9 +770,13 @@ def main():
         }
 
     company_projects = defaultdict(new_project)
-    # Same, for excluded domains: (domain, project_uuid) -> ...
+    # Same, for excluded (non-company) domains, keyed by institution (see
+    # institution_of) the way same_as aliases are merged into one company.
     excluded_access = defaultdict(set)
+    excluded_hours = defaultdict(lambda: defaultdict(Decimal))
+    excluded_month_users = defaultdict(lambda: defaultdict(set))
     excluded_projects = defaultdict(new_project)
+    excluded_seen = set()  # excluded domains met through the offering
     unmatched = []
     non_company_hours = Decimal(0)
     current_month = date.today().strftime("%Y-%m")
@@ -769,10 +806,11 @@ def main():
             return None
 
         def excluded_of(email: str | None) -> str | None:
-            """Domain for an email whose domain is excluded (not a company)."""
+            """Institution key for an email whose domain is excluded (not a company)."""
             hit = classified(email)
             if hit and hit[1]["category"] != "company":
-                return hit[0]
+                excluded_seen.add(hit[0])
+                return institution_of(*hit)
             return None
 
         def add_usage(projects, key, r, month):
@@ -793,8 +831,8 @@ def main():
         for email in access_emails:
             if company := company_of(email):
                 access[company].add(email)
-            elif domain := excluded_of(email):
-                excluded_access[domain].add(email)
+            elif institution := excluded_of(email):
+                excluded_access[institution].add(email)
         for r in usage_rows:
             if not domain_of(r["email"] or ""):
                 unmatched.append(r)
@@ -803,8 +841,10 @@ def main():
             company = company_of(r["email"])
             if not company:
                 non_company_hours += r["usage"]
-                if domain := excluded_of(r["email"]):
-                    add_usage(excluded_projects, domain, r, month)
+                if institution := excluded_of(r["email"]):
+                    excluded_hours[institution][month] += r["usage"]
+                    excluded_month_users[institution][month].add(r["email"])
+                    add_usage(excluded_projects, institution, r, month)
                 continue
             hours[company][month] += r["usage"]
             month_users[company][month].add(r["email"])
@@ -826,18 +866,18 @@ def main():
             email = email_by_user_uuid.get(m["user_uuid"])
             if company := company_of(email):
                 add_member(company_projects, company, m["project_uuid"], email, m["is_active"])
-            elif domain := excluded_of(email):
-                add_member(excluded_projects, domain, m["project_uuid"], email, m["is_active"])
+            elif institution := excluded_of(email):
+                add_member(excluded_projects, institution, m["project_uuid"], email, m["is_active"])
 
         # A domain found only through the offering (user missing from
         # /api/users/) still gets a row, with user_count 0.
         for company in [*access, *hours, *(c for c, _ in company_projects)]:
             companies.setdefault(company, companies.default_factory())
         listed = {domain for domain, _, _ in excluded_rows}
-        for domain in dict.fromkeys([*excluded_access, *(d for d, _ in excluded_projects)]):
-            if domain not in listed:
-                excluded_rows.append((domain, [], classification[domain]))
+        for domain in sorted(excluded_seen - listed):
+            excluded_rows.append((domain, [], classification[domain]))
         company_hours = {c: sum(m.values(), Decimal(0)) for c, m in hours.items()}
+        institution_hours = {i: sum(m.values(), Decimal(0)) for i, m in excluded_hours.items()}
         total_hours = sum(company_hours.values(), Decimal(0))
         unmatched_hours = sum((r["usage"] for r in unmatched), Decimal(0))
 
@@ -856,8 +896,28 @@ def main():
             sector_domains[sector].add((c.get("same_as") or domain) if sector == "company" else domain)
             sector_users[sector].add(r["email"])
 
+    # Non-company domains grouped by institution. An institution's category is
+    # that of its domains (by user count, should they ever differ).
+    institutions = defaultdict(lambda: {"emails": [], "merged": [], "notes": [], "matched_by": [], "domains": []})
+    for domain, emails, c in sorted(excluded_rows, key=lambda r: r[0]):
+        key = institution_of(domain, c)
+        inst = institutions[key]
+        inst["emails"].extend(emails)
+        inst["domains"].append((domain, c, len(emails)))
+        if domain != key:
+            inst["merged"].append(domain)
+        for field, value in (("notes", c.get("note")), ("matched_by", c["matched_by"])):
+            if value and value not in inst[field]:
+                inst[field].append(value)
+    for inst in institutions.values():
+        users_by_category = defaultdict(int)
+        for _, c, n in inst["domains"]:
+            users_by_category[c["category"]] += n
+        inst["category"] = min(users_by_category, key=lambda cat: (-users_by_category[cat], cat))
+
     eprint(f"\n=== Summary ===")
     eprint(f"Domain-distinct company count: {len(companies)}")
+    eprint(f"Non-company institutions: {len(institutions)} (from {len(excluded_rows)} domain(s))")
 
     def review_status(domain: str, category: str) -> str:
         """'' if unchanged since the previous report or decided by an override, else 'yes' / 'changed (...)'."""
@@ -889,27 +949,26 @@ def main():
         if any(current_month in m for m in hours.values()):
             eprint(f"Note: {current_month} is the current month and still accumulating usage.")
 
-    # --- Output: company domain list for manual review ---
-    # Sorted by user_count desc so the biggest, most-obviously-real companies
-    # are at the top and the single-user long tail (most likely to contain
-    # the false positives/negatives called out above) is at the bottom where
-    # it's easiest to eyeball in one pass.
-    wb = Workbook()
+    # --- Output: two workbooks with the same layout, one for company domains
+    # and one for non-company domains grouped by institution ---
+    # Domain sheets are sorted by user_count desc so the biggest,
+    # most-obviously-real entries are at the top and the single-user long tail
+    # (most likely to contain the false positives/negatives called out above)
+    # is at the bottom where it's easiest to eyeball in one pass.
 
-    ws = wb.active
-    ws.title = "Company domains"
-    if usage_enabled:
-        # Per company: projects (and their organisations) ordered by the hours
-        # recorded against them, then by name for member-only projects.
-        def project_order(p):
-            return (-sum(p["hours"].values(), Decimal(0)), p["organisation"], p["project"])
+    # Projects (and their organisations) ordered by the hours recorded against
+    # them, then by name for member-only projects.
+    def project_order(p):
+        return (-sum(p["hours"].values(), Decimal(0)), p["organisation"], p["project"])
 
-        projects_by_company = defaultdict(list)
-        for (company, _), p in sorted(company_projects.items(), key=lambda kv: project_order(kv[1])):
-            projects_by_company[company].append(p)
-        projects_by_excluded = defaultdict(list)
-        for (domain, _), p in sorted(excluded_projects.items(), key=lambda kv: project_order(kv[1])):
-            projects_by_excluded[domain].append(p)
+    def projects_by_key(projects: dict) -> dict[str, list]:
+        grouped = defaultdict(list)
+        for (key, _), p in sorted(projects.items(), key=lambda kv: project_order(kv[1])):
+            grouped[key].append(p)
+        return grouped
+
+    projects_by_company = projects_by_key(company_projects)
+    projects_by_institution = projects_by_key(excluded_projects)
 
     usage_header = (
         [f"{USAGE_COMPONENT_TYPE}_{unit}", "first_project_added", "first_usage_month", "last_usage_month", "active_months",
@@ -946,18 +1005,18 @@ def main():
         ]
 
     def write_domain_sheet(sheet, rows, lead_header, lead_widths, tail_header, tail_widths):
-        """Shared layout of the Company domains, Sovereign AI and Excluded sheets.
+        """Shared layout of the Company domains, Sovereign AI and Non-company domains sheets.
 
         domain, [new], <lead columns>, user_count, <usage columns>, <tail columns>, [emails].
-        rows: (domain, review category, lead cells, emails, access emails, projects, tail cells),
+        rows: (domain, new cell, lead cells, emails, access emails, projects, tail cells),
         written in the given order; usage columns are computed from the projects only.
         """
         sheet.append(
             ["domain", *new_header, *lead_header, "user_count"] + usage_header + tail_header
             + (["emails"] if args.include_emails else [])
         )
-        for domain, review_category, lead, emails, access_emails, projects, tail in rows:
-            row = [domain, *([review_status(domain, review_category)] if new_header else []), *lead, len(emails)]
+        for domain, new_cell, lead, emails, access_emails, projects, tail in rows:
+            row = [domain, *([new_cell] if new_header else []), *lead, len(emails)]
             if usage_enabled:
                 row += usage_cells(access_emails, projects)
             row += tail
@@ -970,80 +1029,74 @@ def main():
 
     def company_rows(projects_for):
         return [
-            (d, "company", [], c["emails"], access.get(d, set()), projects_for(d),
+            (d, review_status(d, "company"), [], c["emails"], access.get(d, set()), projects_for(d),
              [", ".join(sorted(c["merged"])), "; ".join(c["notes"])])
             for d, c in sorted(companies.items(), key=lambda kv: (-len(kv[1]["emails"]), kv[0]))
             if projects_for(d) is not None
         ]
 
-    # Every company usage row lands in exactly one project, so summing a
-    # company's projects gives the same totals as its overall usage.
-    company_tail = (["merged_domains", "note"], [30, 50])
-    write_domain_sheet(
-        ws, company_rows(lambda d: projects_by_company[d] if usage_enabled else []), [], [], *company_tail
-    )
+    def institution_review(inst) -> str:
+        """The new cell for an institution: its domains' review status, naming
+        the domains when only some of them are new or changed."""
+        flagged = [(d, status) for d, c, _ in inst["domains"] if (status := review_status(d, c["category"]))]
+        if flagged and len(flagged) == len(inst["domains"]) and len({status for _, status in flagged}) == 1:
+            return flagged[0][1]
+        return "; ".join(f"{d}: {status}" for d, status in flagged)
 
-    if usage_enabled:
-        def sovereign_projects(d):
-            projects = [p for p in projects_by_company[d] if p["organisation"] == SOVEREIGN_AI_ORGANISATION]
-            return projects or None
+    def institution_rows(projects_for):
+        return [
+            (key, institution_review(inst), [inst["category"]], inst["emails"], excluded_access.get(key, set()),
+             projects_for(key),
+             [", ".join(sorted(inst["merged"])), "; ".join(inst["matched_by"]), "; ".join(inst["notes"])])
+            for key, inst in sorted(
+                institutions.items(), key=lambda kv: (kv[1]["category"], -len(kv[1]["emails"]), kv[0])
+            )
+            if projects_for(key) is not None
+        ]
 
-        sovereign_rows = company_rows(sovereign_projects)
-        write_domain_sheet(wb.create_sheet("Sovereign AI"), sovereign_rows, [], [], *company_tail)
-        eprint(f"{SOVEREIGN_AI_ORGANISATION}: {len(sovereign_rows)} company domain(s) with projects in the organisation.")
-
-    write_domain_sheet(
-        wb.create_sheet("Excluded"),
-        [
-            (d, c["category"], [c["category"]], emails, excluded_access.get(d, set()),
-             projects_by_excluded[d] if usage_enabled else [],
-             [institution_of(d, c), c["matched_by"], c.get("note", "")])
-            for d, emails, c in sorted(excluded_rows, key=lambda r: (r[2]["category"], -len(r[1]), r[0]))
-        ],
-        ["category"], [14],
-        ["institution", "matched_by", "note"], [30, 30, 50],
-    )
-
-    if usage_enabled:
-        monthly = wb.create_sheet("Monthly usage")
-        monthly.append(["company", "month", f"{USAGE_COMPONENT_TYPE}_{unit}", "users", "partial_month"])
-        for company in sorted(hours, key=lambda c: (-company_hours[c], c)):
-            for month in sorted(hours[company]):
-                monthly.append([
-                    company,
+    def write_monthly_sheet(sheet, entity, hours_, month_users_, entity_hours):
+        sheet.append([entity, "month", f"{USAGE_COMPONENT_TYPE}_{unit}", "users", "partial_month"])
+        for key in sorted(hours_, key=lambda k: (-entity_hours[k], k)):
+            for month in sorted(hours_[key]):
+                sheet.append([
+                    key,
                     month,
-                    float(hours[company][month]),
-                    len(month_users[company][month]),
+                    float(hours_[key][month]),
+                    len(month_users_[key][month]),
                     "yes" if month == current_month else "",
                 ])
         for col, width in zip("ABCDE", (30, 10, 16, 8, 14)):
-            monthly.column_dimensions[col].width = width
+            sheet.column_dimensions[col].width = width
 
-        by_month = wb.create_sheet("By month")
-        by_month.append(["month", f"{USAGE_COMPONENT_TYPE}_{unit}", "companies_active", "users_active", "partial_month"])
-        for month in sorted({m for c in hours.values() for m in c}):
-            active = [c for c in hours if hours[c].get(month, 0) > 0]
-            by_month.append([
+    def write_by_month_sheet(sheet, entities, hours_, month_users_):
+        sheet.append(["month", f"{USAGE_COMPONENT_TYPE}_{unit}", f"{entities}_active", "users_active", "partial_month"])
+        for month in sorted({m for k in hours_.values() for m in k}):
+            active = [k for k in hours_ if hours_[k].get(month, 0) > 0]
+            sheet.append([
                 month,
-                float(sum((hours[c][month] for c in active), Decimal(0))),
+                float(sum((hours_[k][month] for k in active), Decimal(0))),
                 len(active),
-                len(set().union(*(month_users[c][month] for c in active))),
+                len(set().union(*(month_users_[k][month] for k in active))),
                 "yes" if month == current_month else "",
             ])
-        for col, width in zip("ABCDE", (10, 16, 18, 14, 14)):
-            by_month.column_dimensions[col].width = width
+        for col, width in zip("ABCDE", (10, 16, 22, 14, 14)):
+            sheet.column_dimensions[col].width = width
 
-        by_project = wb.create_sheet("Projects")
-        by_project.append([
-            "company", "organisation", "project", "project_start_date", "project_end_date",
+    def write_projects_sheet(sheet, entity, projects_by, entity_hours, keep=lambda p: True):
+        """One row per entity per offering project, for the projects keep() accepts."""
+        sheet.append([
+            entity, "organisation", "project", "project_start_date", "project_end_date",
             f"{USAGE_COMPONENT_TYPE}_{unit}",
             "users_with_usage", "current_members", "former_members", "first_usage_month", "last_usage_month",
         ])
-        for company in sorted(projects_by_company, key=lambda c: (-company_hours.get(c, 0), c)):
-            for p in projects_by_company[company]:
+        written = 0
+        for key in sorted(projects_by, key=lambda k: (-entity_hours.get(k, 0), k)):
+            for p in projects_by[key]:
+                if not keep(p):
+                    continue
                 used = months_with_usage(p["hours"])
-                by_project.append([
-                    company,
+                sheet.append([
+                    key,
                     p["organisation"],
                     p["project"],
                     project_dates.get(p["uuid"], {}).get("start_date"),
@@ -1055,40 +1108,94 @@ def main():
                     used[0] if used else None,
                     used[-1] if used else None,
                 ])
+                written += 1
         for col, width in zip("ABCDEFGHIJK", (30, 40, 40, 18, 18, 16, 16, 16, 16, 18, 18)):
-            by_project.column_dimensions[col].width = width
+            sheet.column_dimensions[col].width = width
+        return written
 
-        unmatched_ws = wb.create_sheet("Unmatched usage")
-        unmatched_ws.append(
+    def write_unmatched_sheet(sheet):
+        sheet.append(
             ["month", f"{USAGE_COMPONENT_TYPE}_{unit}", "organisation", "project"] + (["username"] if args.include_emails else [])
         )
         for r in sorted(unmatched, key=lambda r: (r.get("billing_period") or "", r.get("project_name") or "")):
             row = [(r.get("billing_period") or "")[:7], float(r["usage"]), r.get("customer_name"), r.get("project_name")]
             if args.include_emails:
                 row.append(r.get("username"))
-            unmatched_ws.append(row)
+            sheet.append(row)
         for col, width in zip("ABCDE", (10, 16, 40, 40, 30)):
-            unmatched_ws.column_dimensions[col].width = width
+            sheet.column_dimensions[col].width = width
 
-        totals = wb.create_sheet("Sector totals")
-        hours_col = f"{USAGE_COMPONENT_TYPE}_{unit}"
-        totals.append(["sector", hours_col, "share_of_per_user_total", "domains_with_usage", "users_with_usage"])
+    def write_sector_totals_sheet(sheet):
+        sheet.append(["sector", f"{USAGE_COMPONENT_TYPE}_{unit}", "share_of_per_user_total", "domains_with_usage", "users_with_usage"])
 
         def share(h):
             return round(float(h / all_hours), 4) if all_hours else None
 
         for sector in SECTORS:
             h = sector_hours.get(sector, Decimal(0))
-            totals.append([sector, float(h), share(h), len(sector_domains[sector]), len(sector_users[sector])])
-        totals.append(["unmatched (no email)", float(unmatched_hours), share(unmatched_hours), None, None])
-        totals.append(["TOTAL (per-user usage)", float(all_hours), share(all_hours), None, None])
-        for row in totals.iter_rows(min_row=2, min_col=3, max_col=3):
+            sheet.append([sector, float(h), share(h), len(sector_domains[sector]), len(sector_users[sector])])
+        sheet.append(["unmatched (no email)", float(unmatched_hours), share(unmatched_hours), None, None])
+        sheet.append(["TOTAL (per-user usage)", float(all_hours), share(all_hours), None, None])
+        for row in sheet.iter_rows(min_row=2, min_col=3, max_col=3):
             for cell in row:
                 cell.number_format = "0.0%"
         for col, width in zip("ABCDE", (28, 16, 24, 20, 18)):
-            totals.column_dimensions[col].width = width
+            sheet.column_dimensions[col].width = width
 
+    # Company workbook.
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Company domains"
+    # Every company usage row lands in exactly one project, so summing a
+    # company's projects gives the same totals as its overall usage.
+    company_tail = (["merged_domains", "note"], [30, 50])
+    write_domain_sheet(ws, company_rows(lambda d: projects_by_company[d]), [], [], *company_tail)
+    if usage_enabled:
+        def sovereign_projects(d):
+            projects = [p for p in projects_by_company[d] if p["organisation"] == SOVEREIGN_AI_ORGANISATION]
+            return projects or None
+
+        sovereign_rows = company_rows(sovereign_projects)
+        write_domain_sheet(wb.create_sheet("Sovereign AI"), sovereign_rows, [], [], *company_tail)
+        eprint(f"{SOVEREIGN_AI_ORGANISATION}: {len(sovereign_rows)} company domain(s) with projects in the organisation.")
+        write_monthly_sheet(wb.create_sheet("Monthly usage"), "company", hours, month_users, company_hours)
+        write_by_month_sheet(wb.create_sheet("By month"), "companies", hours, month_users)
+        write_projects_sheet(wb.create_sheet("Projects"), "company", projects_by_company, company_hours)
+        write_unmatched_sheet(wb.create_sheet("Unmatched usage"))
+        write_sector_totals_sheet(wb.create_sheet("Sector totals"))
     wb.save(args.output)
+
+    # Non-company workbook: same layout, one row per institution. The second
+    # sheet lists the University of Bristol (Isambard-AI) organisation's
+    # projects, which would otherwise swamp the projects sheet.
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Non-company domains"
+    write_domain_sheet(
+        ws, institution_rows(lambda k: projects_by_institution[k]),
+        ["category"], [14],
+        ["merged_domains", "matched_by", "note"], [30, 30, 50],
+    )
+    if usage_enabled:
+        def in_bristol(p):
+            return p["organisation"] == BRISTOL_ORGANISATION
+
+        n = write_projects_sheet(
+            wb.create_sheet(BRISTOL_SHEET), "institution", projects_by_institution, institution_hours, in_bristol
+        )
+        eprint(f"{BRISTOL_ORGANISATION}: {n} institution/project row(s).")
+        if not n:
+            eprint(f"Warning: no non-company usage or members in organisation {BRISTOL_ORGANISATION!r} — check the name.")
+        write_monthly_sheet(
+            wb.create_sheet("Monthly usage"), "institution", excluded_hours, excluded_month_users, institution_hours
+        )
+        write_by_month_sheet(wb.create_sheet("By month"), "institutions", excluded_hours, excluded_month_users)
+        write_projects_sheet(
+            wb.create_sheet("Other projects"), "institution", projects_by_institution, institution_hours,
+            lambda p: not in_bristol(p),
+        )
+        write_sector_totals_sheet(wb.create_sheet("Sector totals"))
+    wb.save(non_company_output)
 
     to_review = sorted(
         [(d, "company", len(c["emails"])) for d, c in companies.items()]
@@ -1099,7 +1206,7 @@ def main():
         eprint("\n(Pass --previous LAST_MONTH.xlsx to flag domains that are new since that report.)")
     elif flagged:
         eprint(
-            f"\n{len(flagged)} domain(s) new or changed since {args.previous.name} (new column in the sheet); "
+            f"\n{len(flagged)} domain(s) new or changed since {args.previous.name} (new column in both workbooks); "
             f"add an override to {args.overrides.name} for any that are classified wrongly:"
         )
         for d, cat, n, status in flagged:
@@ -1108,7 +1215,8 @@ def main():
         eprint(f"\nNo domains new or changed since {args.previous.name}.")
 
     eprint(
-        f"\n{len(companies)} candidate company domain(s) written to {args.output}. "
+        f"\n{len(companies)} candidate company domain(s) written to {args.output}, "
+        f"{len(institutions)} non-company institution(s) to {non_company_output}. "
         f"Review single-user domains especially closely — they're the likeliest "
         f"false positives (personal-looking domain, contractor, typo) or, if a "
         f"generic-looking address was actually a company alias, false negatives."

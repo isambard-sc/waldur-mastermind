@@ -3,7 +3,9 @@
 `company_domain_report.py` estimates **how many companies use the Waldur
 instance** (portal-api.isambard.ac.uk by default) and how many **Isambard-AI
 Phase 2 node hours** each one has used, broken down by organisation, project
-and month. It writes an Excel workbook.
+and month. It writes two Excel workbooks with the same layout: one for
+companies and one for everything else (universities, research institutes,
+government, ...), grouped by institution.
 
 `verify_usage_totals.py` is a separate cross-check of the usage numbers (see
 [Verifying the usage totals](#verifying-the-usage-totals)).
@@ -44,9 +46,10 @@ WALDUR_TOKEN=<staff token> uv run company_domain_report.py
 - Run it as `uv run company_domain_report.py`, not `uv run python ...`. Inside a
   checkout of the main project, `uv run python` picks up the project's own
   `pyproject.toml` and tries to build its dependencies.
-- It writes `company_domains_YYYY-MM-DD.xlsx` in the current directory (today's
-  date, so two runs in one month do not overwrite each other). Progress and a
-  summary go to stderr.
+- It writes `company_domains_YYYY-MM-DD.xlsx` and
+  `non_company_domains_YYYY-MM-DD.xlsx` in the current directory (today's date,
+  so two runs in one month do not overwrite each other). Progress and a summary
+  go to stderr.
 - A run takes a few minutes. The usage fetch is the slow part, and grows with
   the number of months of history.
 - The **first** run downloads the eduGAIN metadata (about 100 MB, one or two
@@ -55,7 +58,7 @@ WALDUR_TOKEN=<staff token> uv run company_domain_report.py
   next to the script on first use. `--refresh-edugain` forces a re-download and
   `--no-edugain` skips that rule entirely.
 
-Emails are **not** written to the workbook unless you pass `--include-emails`.
+Emails are **not** written to either workbook unless you pass `--include-emails`.
 
 ## Why this is an estimate
 
@@ -103,7 +106,7 @@ Notes:
   scopes are skipped because they cannot be suffix-matched. The cache file records
   the source and fetch time, and is refreshed when older than 30 days.
 - Only `company` domains count towards the company total. Everything else goes to
-  the **Excluded** sheet, which is kept for reference.
+  the **non-company workbook**, which has the same layout and is kept for reference.
 
 ## domain_overrides.csv
 
@@ -118,7 +121,7 @@ domain,category,same_as,note
 |--------|---------|
 | `domain` | Matches this domain and all of its subdomains. |
 | `category` | `company`, `academic`, `research`, `government`, `health`, `nonprofit` or `generic`. Only `company` keeps the domain in the company count. |
-| `same_as` | For **company** rows: count this domain as part of another company domain (e.g. a typo or rebrand), so the two merge into one row. For **excluded** rows: group this domain under another in the Excluded sheet's `institution` column (e.g. `gla.ac.uk` -> `glasgow.ac.uk`). Optional. |
+| `same_as` | For **company** rows: count this domain as part of another company domain (e.g. a typo or rebrand), so the two merge into one row. For **non-company** rows: group this domain under another institution in the non-company workbook (e.g. `gla.ac.uk` -> `glasgow.ac.uk`), for aliases automatic grouping can't see. Optional. |
 | `note` | Free text, shown in the report. Prefix it with `guess:` if unverified. |
 
 Lines starting with `#` are comments. An unknown category stops the run with an
@@ -178,7 +181,8 @@ For each per-user usage row:
    hours are attributed to the (company, organisation, project, month) it
    happened in.
 5. Rows are then routed to the company the domain belongs to (after merging
-   `same_as` domains), or to the excluded domain's own row.
+   `same_as` domains), or to the institution a non-company domain belongs to
+   (see [Non-company workbook](#non-company-workbook)).
 
 Only **node hours on one offering** are counted (`type=node`; the unit comes
 from the API and is normally hours). Zero-usage rows are ignored, so a user with
@@ -209,9 +213,25 @@ with placeholder names; they still count as users of their email domain.
 
 ## Workbook sheets and columns
 
-All sheets are written to one `.xlsx`. The three domain sheets share one layout.
+Each run writes two workbooks with the same layout. The domain sheets
+(Company domains, Sovereign AI, Non-company domains) share one set of columns,
+and the monthly, by-month and projects sheets share theirs.
 
-### Company domains
+| Company workbook (`company_domains_*.xlsx`) | Non-company workbook (`non_company_domains_*.xlsx`) |
+|---|---|
+| Company domains | Non-company domains |
+| Sovereign AI | UoB (Isambard-AI) projects |
+| Monthly usage | Monthly usage |
+| By month | By month |
+| Projects | Other projects |
+| Unmatched usage | |
+| Sector totals | Sector totals (identical) |
+
+With `--no-usage` each workbook has only its first sheet, without the usage columns.
+
+### Company workbook
+
+#### Company domains
 
 One row per surviving company (domains merged with `same_as` are one row),
 sorted by `user_count` descending, then domain A-Z. This is **not** the order
@@ -236,73 +256,110 @@ companies joined.
 
 The `organisations` and `projects` cells show the **10 most-used** (most node
 hours first) followed by `(+N more)`, to keep rows readable. `project_count` gives
-the full number. `LIST_LIMIT` at the top of the script changes the cap. For
-companies the full list is on the **Projects** sheet.
+the full number. `LIST_LIMIT` at the top of the script changes the cap. The full
+list is on the projects sheets.
 
-### Sovereign AI
+#### Sovereign AI
 
 Same columns, for companies whose users recorded usage in, or were members of, an
 offering project belonging to the **Sovereign AI** organisation. Usage,
 organisation and project columns count **only** those projects; `user_count`,
 `users_with_access`, `merged_domains`, `note` and emails stay company-wide.
 
-### Excluded
-
-Same layout for every domain that was **not** counted as a company, so the data
-can be reused later. Differences: `category` follows `domain`, and in place of
-`merged_domains`/`note` there are:
-
-| Column | Meaning |
-|--------|---------|
-| `category` | `academic`, `research`, `government`, `health`, `nonprofit` or `generic`. |
-| `institution` | A key for pivoting by institution: the override's `same_as`, else the override or eduGAIN scope that matched (`mail.mcgill.ca` -> `mcgill.ca`), else the registrable domain (`eng.ox.ac.uk` -> `ox.ac.uk`). Generic providers stay as they are. |
-| `matched_by` | The rule that put it here (`override ...`, `generic provider list`, suffix rule, `eduGAIN scope ...`). |
-| `note` | The override's note. |
-
-Sorted by category, then `user_count`. Nothing here is in any company count. As the
-excluded `projects` cell is capped, the full per-project list for excluded
-domains is not in the workbook.
-
-### Monthly usage
+#### Monthly usage
 
 Node hours and active users per company per month.
 
-### By month
+#### By month
 
 Per month across all companies: node hours, companies active, users active.
 
-### Projects
+#### Projects
 
 One row per company per offering project: organisation, project, project start and
 end date, node hours (0 if none), users with usage, current members, former
-members, first and last month with usage. Companies only.
+members, first and last month with usage.
 
-### Unmatched usage
+#### Unmatched usage
 
 Usage rows whose user could not be resolved to an email. Cluster usernames only
-appear with `--include-emails`.
+appear with `--include-emails`. Only in the company workbook, as these rows
+belong to no sector.
 
-### Sector totals
+#### Sector totals
 
 Node hours, share of total, domains with usage and users with usage per sector
-(`company`, and each excluded category), plus an `unmatched` row and a `TOTAL`.
+(`company`, and each non-company category), plus an `unmatched` row and a `TOTAL`.
 The TOTAL is the per-user grand total across all projects that ever had Phase 2
 usage; it is what `verify_usage_totals.py` compares against allocation-level
-usage.
+usage. The same sheet is in both workbooks.
 
-With `--no-usage` the Sovereign AI sheet, the last five sheets and all usage
-columns are left out.
+### Non-company workbook
+
+Everything that was **not** counted as a company, kept so the data can be reused.
+None of it is in any company count. Its total node hours equal the summary's
+non-company total.
+
+#### Grouping by institution
+
+Rows are **institutions**, not raw domains, the way `same_as` merges a company's
+domains into one row. A domain's institution is:
+
+1. the override's `same_as`, if set (e.g. `gla.ac.uk` -> `glasgow.ac.uk`);
+2. else the override or eduGAIN scope that matched (`mail.mcgill.ca` -> `mcgill.ca`);
+3. else the registrable domain (`eng.ox.ac.uk` -> `ox.ac.uk`).
+
+Generic mail providers stay as they are (`gmail.com` is one row). The domains
+folded into a row are listed in `merged_domains`.
+
+#### Non-company domains
+
+Same columns as Company domains, with these differences:
+
+| Column | Meaning |
+|--------|---------|
+| `domain` | The institution key (see above). |
+| `new` | As for companies, worked out per domain. If only some of an institution's domains are new or changed, they are named, e.g. `eng.cam.ac.uk: yes`. |
+| `category` | `academic`, `research`, `government`, `health`, `nonprofit` or `generic`. If an institution's domains ever had different categories, the one with most users wins. |
+| `merged_domains` | The other domains grouped into this institution. |
+| `matched_by` | The rule(s) that excluded its domains (`override ...`, `generic provider list`, suffix rule, `eduGAIN scope ...`). |
+| `note` | Override notes. |
+
+Sorted by category, then `user_count`.
+
+#### UoB (Isambard-AI) projects
+
+Projects-sheet rows (one per institution per project) for every project in the
+**University of Bristol (Isambard-AI)** organisation. That organisation has so
+many projects that they would swamp the projects sheet, so they get their own.
+The sheet name is shortened because Excel limits sheet names to 31 characters.
+If nothing matches the organisation name, the run prints a warning.
+
+#### Monthly usage, By month
+
+As in the company workbook, per institution.
+
+#### Other projects
+
+As the company Projects sheet, per institution, for every project **not** in the
+University of Bristol (Isambard-AI) organisation.
+
+#### Sector totals
+
+Identical to the company workbook's.
 
 ## Monthly workflow
 
-1. **Run the script** with a staff token. It saves a dated workbook and
-   automatically compares it with the most recent earlier dated
-   `company_domains_*.xlsx` in the same folder. Use `--previous FILE` to choose a
-   different baseline, or `--no-previous` to skip the comparison. The very first
-   dated run needs `--previous` pointing at an older, undated report.
-2. **Look at the `new` column** on Company domains and Excluded (the end of the
-   run's output lists the same domains). Flagged rows are domains that appeared
-   since last month, or whose category changed.
+1. **Run the script** with a staff token. It saves the two dated workbooks and
+   automatically compares them with the most recent earlier dated
+   `company_domains_*.xlsx` in the same folder, and the
+   `non_company_domains_*.xlsx` of the same date if there is one. Use
+   `--previous FILE` (a company report) to choose a different baseline, or
+   `--no-previous` to skip the comparison. Reports from before the split, which
+   had an Excluded sheet instead of a second workbook, still work as a baseline.
+2. **Look at the `new` column** on Company domains and Non-company domains (the
+   end of the run's output lists the same domains). Flagged rows are domains that
+   appeared since last month, or whose category changed.
 3. **Decide for each flagged domain** whether its category is right, using the
    domain, organisations and projects, the note, `matched_by`, and a web search if
    needed.
@@ -322,10 +379,10 @@ maintain it, and last month's report already records what is new.
 |--------|--------|
 | `--token TOKEN` | Waldur API token (or `WALDUR_TOKEN`, or typed at a prompt). |
 | `--base-url URL` | API base URL (default `https://portal-api.isambard.ac.uk`, or `WALDUR_BASE_URL`). |
-| `--output FILE` | Output path (default `company_domains_YYYY-MM-DD.xlsx`). |
+| `--output FILE` | Company workbook path (default `company_domains_YYYY-MM-DD.xlsx`). The non-company workbook goes next to it as `non_company_domains_YYYY-MM-DD.xlsx`, or `<name>_non_company.xlsx` for other names. |
 | `--include-emails` | Add individual emails (and cluster usernames on the Unmatched sheet). Off by default. |
 | `--overrides FILE` | Overrides CSV (default `domain_overrides.csv` next to the script). |
-| `--previous FILE` | Report to compare against for the `new` column. |
+| `--previous FILE` | Company report to compare against for the `new` column; its non-company workbook is read too if it exists. |
 | `--no-previous` | No comparison, no `new` column. |
 | `--no-edugain` | Skip the eduGAIN rule (and the download). |
 | `--refresh-edugain` | Re-download the eduGAIN scopes even if the cache is fresh. |
@@ -515,7 +572,7 @@ is the number to compare against this script's per-user TOTAL: they should match
 - **Classification rules are heuristics.** Suffix and eduGAIN matching can both
   miss a university (add an override) or catch something that is not one.
 - **Capped project lists.** Domain sheets show the 10 most-used organisations and
-  projects. The Projects sheet has the full list for companies only.
+  projects. The projects sheets of both workbooks have the full lists.
 
 ## Files
 
@@ -525,4 +582,4 @@ is the number to compare against this script's per-user TOTAL: they should match
 | `domain_overrides.csv` | Manual domain decisions. Commit changes. |
 | `verify_usage_totals.py` | Cross-check against allocation-level usage. Imports helpers from the report script, so keep them together. |
 | `edugain_scopes.json` | Generated cache of eduGAIN scopes. Not committed. |
-| `company_domains_YYYY-MM-DD.xlsx` | Generated reports. Not committed. |
+| `company_domains_YYYY-MM-DD.xlsx`, `non_company_domains_YYYY-MM-DD.xlsx` | Generated reports. Not committed. |
