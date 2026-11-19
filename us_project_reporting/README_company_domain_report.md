@@ -213,17 +213,18 @@ with placeholder names; they still count as users of their email domain.
 
 ## Workbook sheets and columns
 
-Each run writes two workbooks with the same layout. The domain sheets
-(Company domains, Sovereign AI, Non-company domains) share one set of columns,
-and the monthly, by-month and projects sheets share theirs.
+Each run writes two workbooks with the same layout. The two domain sheets share
+one set of columns, the four projects sheets share theirs, and so do the monthly
+and by-month sheets. In each workbook the second sheet holds the projects of one
+large organisation, and the third holds every other project.
 
 | Company workbook (`company_domains_*.xlsx`) | Non-company workbook (`non_company_domains_*.xlsx`) |
 |---|---|
 | Company domains | Non-company domains |
-| Sovereign AI | UoB (Isambard-AI) projects |
+| Sovereign AI (projects) | UoB (Isambard-AI) projects |
+| Other projects | Other projects |
 | Monthly usage | Monthly usage |
 | By month | By month |
-| Projects | Other projects |
 | Unmatched usage | |
 | Sector totals | Sector totals (identical) |
 
@@ -261,10 +262,16 @@ list is on the projects sheets.
 
 #### Sovereign AI
 
-Same columns, for companies whose users recorded usage in, or were members of, an
-offering project belonging to the **Sovereign AI** organisation. Usage,
-organisation and project columns count **only** those projects; `user_count`,
-`users_with_access`, `merged_domains`, `note` and emails stay company-wide.
+One row per company per project in the **Sovereign AI** organisation, for the
+companies whose users recorded usage in, or were members of, one of its offering
+projects. Same columns as Other projects below.
+
+#### Other projects
+
+One row per company per offering project **not** in the Sovereign AI
+organisation: organisation, project, project start and end date, node hours (0 if
+none), users with usage, current members, former members, first and last month
+with usage. Together with the Sovereign AI sheet this is every company project.
 
 #### Monthly usage
 
@@ -273,12 +280,6 @@ Node hours and active users per company per month.
 #### By month
 
 Per month across all companies: node hours, companies active, users active.
-
-#### Projects
-
-One row per company per offering project: organisation, project, project start and
-end date, node hours (0 if none), users with usage, current members, former
-members, first and last month with usage.
 
 #### Unmatched usage
 
@@ -331,18 +332,18 @@ Sorted by category, then `user_count`.
 
 Projects-sheet rows (one per institution per project) for every project in the
 **University of Bristol (Isambard-AI)** organisation. That organisation has so
-many projects that they would swamp the projects sheet, so they get their own.
-The sheet name is shortened because Excel limits sheet names to 31 characters.
-If nothing matches the organisation name, the run prints a warning.
+many projects that they get their own sheet, as Sovereign AI's do in the company
+workbook. The sheet name is shortened because Excel limits sheet names to 31
+characters. If nothing matches the organisation name, the run prints a warning.
+
+#### Other projects
+
+As the company workbook's Other projects, per institution, for every project
+**not** in the University of Bristol (Isambard-AI) organisation.
 
 #### Monthly usage, By month
 
 As in the company workbook, per institution.
-
-#### Other projects
-
-As the company Projects sheet, per institution, for every project **not** in the
-University of Bristol (Isambard-AI) organisation.
 
 #### Sector totals
 

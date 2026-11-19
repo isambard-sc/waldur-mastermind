@@ -1005,7 +1005,7 @@ def main():
         ]
 
     def write_domain_sheet(sheet, rows, lead_header, lead_widths, tail_header, tail_widths):
-        """Shared layout of the Company domains, Sovereign AI and Non-company domains sheets.
+        """Shared layout of the Company domains and Non-company domains sheets.
 
         domain, [new], <lead columns>, user_count, <usage columns>, <tail columns>, [emails].
         rows: (domain, new cell, lead cells, emails, access emails, projects, tail cells),
@@ -1027,12 +1027,11 @@ def main():
         for i, width in enumerate(widths):
             sheet.column_dimensions[get_column_letter(i + 1)].width = width
 
-    def company_rows(projects_for):
+    def company_rows():
         return [
-            (d, review_status(d, "company"), [], c["emails"], access.get(d, set()), projects_for(d),
+            (d, review_status(d, "company"), [], c["emails"], access.get(d, set()), projects_by_company[d],
              [", ".join(sorted(c["merged"])), "; ".join(c["notes"])])
             for d, c in sorted(companies.items(), key=lambda kv: (-len(kv[1]["emails"]), kv[0]))
-            if projects_for(d) is not None
         ]
 
     def institution_review(inst) -> str:
@@ -1043,15 +1042,14 @@ def main():
             return flagged[0][1]
         return "; ".join(f"{d}: {status}" for d, status in flagged)
 
-    def institution_rows(projects_for):
+    def institution_rows():
         return [
             (key, institution_review(inst), [inst["category"]], inst["emails"], excluded_access.get(key, set()),
-             projects_for(key),
+             projects_by_institution[key],
              [", ".join(sorted(inst["merged"])), "; ".join(inst["matched_by"]), "; ".join(inst["notes"])])
             for key, inst in sorted(
                 institutions.items(), key=lambda kv: (kv[1]["category"], -len(kv[1]["emails"]), kv[0])
             )
-            if projects_for(key) is not None
         ]
 
     def write_monthly_sheet(sheet, entity, hours_, month_users_, entity_hours):
@@ -1148,31 +1146,33 @@ def main():
     ws.title = "Company domains"
     # Every company usage row lands in exactly one project, so summing a
     # company's projects gives the same totals as its overall usage.
-    company_tail = (["merged_domains", "note"], [30, 50])
-    write_domain_sheet(ws, company_rows(lambda d: projects_by_company[d]), [], [], *company_tail)
+    write_domain_sheet(ws, company_rows(), [], [], ["merged_domains", "note"], [30, 50])
     if usage_enabled:
-        def sovereign_projects(d):
-            projects = [p for p in projects_by_company[d] if p["organisation"] == SOVEREIGN_AI_ORGANISATION]
-            return projects or None
+        def in_sovereign(p):
+            return p["organisation"] == SOVEREIGN_AI_ORGANISATION
 
-        sovereign_rows = company_rows(sovereign_projects)
-        write_domain_sheet(wb.create_sheet("Sovereign AI"), sovereign_rows, [], [], *company_tail)
-        eprint(f"{SOVEREIGN_AI_ORGANISATION}: {len(sovereign_rows)} company domain(s) with projects in the organisation.")
+        n = write_projects_sheet(
+            wb.create_sheet("Sovereign AI"), "company", projects_by_company, company_hours, in_sovereign
+        )
+        eprint(f"{SOVEREIGN_AI_ORGANISATION}: {n} company/project row(s).")
+        write_projects_sheet(
+            wb.create_sheet("Other projects"), "company", projects_by_company, company_hours,
+            lambda p: not in_sovereign(p),
+        )
         write_monthly_sheet(wb.create_sheet("Monthly usage"), "company", hours, month_users, company_hours)
         write_by_month_sheet(wb.create_sheet("By month"), "companies", hours, month_users)
-        write_projects_sheet(wb.create_sheet("Projects"), "company", projects_by_company, company_hours)
         write_unmatched_sheet(wb.create_sheet("Unmatched usage"))
         write_sector_totals_sheet(wb.create_sheet("Sector totals"))
     wb.save(args.output)
 
     # Non-company workbook: same layout, one row per institution. The second
     # sheet lists the University of Bristol (Isambard-AI) organisation's
-    # projects, which would otherwise swamp the projects sheet.
+    # projects, as the company workbook's lists Sovereign AI's.
     wb = Workbook()
     ws = wb.active
     ws.title = "Non-company domains"
     write_domain_sheet(
-        ws, institution_rows(lambda k: projects_by_institution[k]),
+        ws, institution_rows(),
         ["category"], [14],
         ["merged_domains", "matched_by", "note"], [30, 30, 50],
     )
@@ -1186,14 +1186,14 @@ def main():
         eprint(f"{BRISTOL_ORGANISATION}: {n} institution/project row(s).")
         if not n:
             eprint(f"Warning: no non-company usage or members in organisation {BRISTOL_ORGANISATION!r} — check the name.")
-        write_monthly_sheet(
-            wb.create_sheet("Monthly usage"), "institution", excluded_hours, excluded_month_users, institution_hours
-        )
-        write_by_month_sheet(wb.create_sheet("By month"), "institutions", excluded_hours, excluded_month_users)
         write_projects_sheet(
             wb.create_sheet("Other projects"), "institution", projects_by_institution, institution_hours,
             lambda p: not in_bristol(p),
         )
+        write_monthly_sheet(
+            wb.create_sheet("Monthly usage"), "institution", excluded_hours, excluded_month_users, institution_hours
+        )
+        write_by_month_sheet(wb.create_sheet("By month"), "institutions", excluded_hours, excluded_month_users)
         write_sector_totals_sheet(wb.create_sheet("Sector totals"))
     wb.save(non_company_output)
 
