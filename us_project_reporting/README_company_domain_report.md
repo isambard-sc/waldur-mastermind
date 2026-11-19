@@ -381,8 +381,8 @@ Sorted by category, then `user_count`.
 Projects-sheet rows (one per institution per project and offering) for every
 project in the **University of Bristol (Isambard-AI)** organisation. That
 organisation has so many projects that they get their own sheet, as Sovereign
-AI's do in the company workbook. The sheet name is shortened because Excel limits sheet names to 31
-characters. If nothing matches the organisation name, the run prints a warning.
+AI's do in the company workbook. The sheet name is shortened because Excel limits
+sheet names to 31 characters. If nothing matches the organisation name, the run prints a warning.
 
 #### Other projects
 
