@@ -745,12 +745,15 @@ def main():
     if args.no_edugain:
         eprint("    (eduGAIN layer disabled with --no-edugain)")
     merged = sum(len(c["merged"]) for c in companies.values())
-    eprint(f"  => candidate companies: {len(companies)}" + (f" ({merged} alias domain(s) merged)" if merged else ""))
+    eprint(
+        f"  => candidate companies: {len(companies)}" + (f" ({merged} alias domain(s) merged)" if merged else "")
+        + (" — before leaving out those with no project on the offering" if not args.no_usage else "")
+    )
 
     generic_user_total = sum(len(e) for _, e, c in excluded_rows if c["category"] == "generic")
     if generic_user_total:
         eprint(
-            f"\nNote: {generic_user_total} user(s) are on generic providers "
+            f"\nNote: {generic_user_total} user(s) on Waldur are on generic providers "
             f"(e.g. a company contact who used personal Gmail) and are excluded "
             f"from the domain-distinct count — see {non_company_output} "
             f"if you want to hand-attribute any of them to a company."

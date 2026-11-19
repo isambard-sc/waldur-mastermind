@@ -70,8 +70,8 @@ check came back 0), so it is not used.
 Instead the script works bottom-up: it takes every user's email address, groups
 users by the domain after the `@`, discards domains that are clearly not
 companies (universities, government, consumer mail providers, ...), and counts
-each remaining domain with a project on the offering as one company. Usernames here are professional email
-addresses, which is what makes this workable.
+each remaining domain with a project on the offering as one company. Usernames
+here are professional email addresses, which is what makes this workable.
 
 The result is a **list for a human to review**, not ground truth. It can:
 
@@ -189,8 +189,9 @@ Only **node hours on one offering** are counted (`type=node`; the unit comes
 from the API and is normally hours). Zero-usage rows are ignored, so a user with
 a zero in a month is not counted as active in that month.
 
-**Companies with no usage stay in the list** with 0 hours. Their organisations
-and projects are still shown if they were ever members of an offering project.
+**Companies with no usage stay in the list** with 0 hours, as long as their
+users are or were members of an offering project (see below). Those projects
+and their organisations are shown.
 
 ### Which projects are listed against a domain
 
@@ -243,9 +244,8 @@ With `--no-usage` each workbook has only its first sheet, without the usage colu
 
 One row per surviving company with at least one offering project (see
 [Which projects are listed against a domain](#which-projects-are-listed-against-a-domain);
-domains merged with `same_as` are one row),
-sorted by `user_count` descending, then domain A-Z. This is **not** the order
-companies joined.
+domains merged with `same_as` are one row), sorted by `user_count` descending,
+then domain A-Z. This is **not** the order companies joined.
 
 | Column | Meaning |
 |--------|---------|
