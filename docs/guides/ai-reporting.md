@@ -123,6 +123,11 @@ Why they hold together:
 2. Run `waldur clean_settings_cache`. Waldur caches its public configuration until a setting changes, so
    without this the AI reporting menu can stay hidden after a deploy.
 
+Deploy at a quiet time: a question running while the worker pods are replaced loses its answer. It shows as
+"interrupted" once the stale check runs (within 25 minutes), and the user can ask again. To clear it sooner,
+once it has had no progress for 15 minutes: `waldur shell -c "from waldur_mastermind.ai_reporting.tasks import
+fail_stale_reporting_messages; print(fail_stale_reporting_messages())"`.
+
 **Upgrading the harness:**
 
 1. Build and push the new images with new tags.
