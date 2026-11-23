@@ -20,11 +20,11 @@ from waldur_mastermind.ai_reporting.models import (
     ReportingUsageRecord,
 )
 from waldur_mastermind.ai_reporting.tasks import (
+    _harness_overrides,
     ask_harness,
     fail_stale_reporting_messages,
 )
 
-# What a harness that doesn't stream sends.
 # The harness always streams.
 _JSON = {"Content-Type": "application/x-ndjson"}
 
@@ -1232,3 +1232,13 @@ class HarnessOutputBoundsTest(test.APITestCase):
         ask_harness(self.message.pk)
 
         self.assertEqual(self.message.files.count(), 1)
+
+
+class HarnessSettingsTest(test.APITestCase):
+    @override_constance_config(AI_REPORTING_MAX_TURNS=-1)
+    def test_an_old_minus_one_max_turns_leaves_the_harness_default(self):
+        self.assertNotIn("max_turns", _harness_overrides())
+
+    @override_constance_config(AI_REPORTING_MAX_TURNS=12)
+    def test_a_real_max_turns_is_sent(self):
+        self.assertEqual(_harness_overrides()["max_turns"], 12)

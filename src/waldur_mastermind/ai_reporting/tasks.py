@@ -101,7 +101,11 @@ def _read_capped(response, limit: int) -> bytes:
 def _harness_overrides() -> dict:
     """The settings the harness takes from Waldur. The model is the harness's
     own (WALDUR_AGENT_MODEL), next to the IAM policy that allows it."""
-    overrides = {"max_turns": config.AI_REPORTING_MAX_TURNS}
+    overrides = {}
+    # Below 1 (an old -1 meant "the harness's default") is left to the harness,
+    # which would otherwise clamp it to a single step.
+    if config.AI_REPORTING_MAX_TURNS >= 1:
+        overrides["max_turns"] = config.AI_REPORTING_MAX_TURNS
     if config.AI_REPORTING_NAME:
         overrides["name"] = config.AI_REPORTING_NAME
     if config.AI_REPORTING_CUSTOM_INSTRUCTIONS:

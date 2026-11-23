@@ -116,6 +116,13 @@ Why they hold together:
 
 ## Operating it
 
+**Deploying mastermind:**
+
+1. Run `waldur migrate` on a worker pod; Helm doesn't run migrations.
+   `waldur showmigrations ai_reporting` should show `[X] 0001_squashed_0007`.
+2. Run `waldur clean_settings_cache`. Waldur caches its public configuration until a setting changes, so
+   without this the AI reporting menu can stay hidden after a deploy.
+
 **Upgrading the harness:**
 
 1. Build and push the new images with new tags.
