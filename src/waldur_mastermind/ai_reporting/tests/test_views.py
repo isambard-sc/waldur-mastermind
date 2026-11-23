@@ -247,7 +247,10 @@ class AskActionTest(test.APITestCase):
         third = self.client.post(self.ask_url, {"prompt": "three", "new_session": True})
 
         self.assertEqual(third.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
-        self.assertIn("2 questions running", third.data["detail"])
+        self.assertEqual(
+            third.data["detail"],
+            "You already have 2 questions running. Wait for one to finish.",
+        )
         self.assertEqual(ReportingSession.objects.filter(user=self.staff).count(), 2)
 
     @mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay")

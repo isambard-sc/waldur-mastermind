@@ -62,8 +62,9 @@ def enforce_per_user_limit(user) -> None:
         session__user=user, status=ReportingMessage.Status.PENDING
     ).count()
     if running >= limit:
+        # No retry time: DRF would add "Expected available in 60 seconds", but a
+        # question takes minutes.
         raise Throttled(
-            wait=60,
             detail=f"You already have {running} questions running. Wait for one to finish.",
         )
 
@@ -78,7 +79,6 @@ def enforce_concurrency_limit() -> None:
     ).count()
     if running >= limit:
         raise Throttled(
-            wait=60,
             detail="AI reporting is busy answering other questions. Please try again in a few minutes.",
         )
 
