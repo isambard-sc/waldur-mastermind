@@ -30,7 +30,9 @@ from waldur_mastermind.ai_reporting.models import (
 )
 
 _USAGE_STATS_MAX_DAYS = 365
-_BUSY_MESSAGE = "Wait for your current question to finish before asking another."
+_BUSY_MESSAGE = (
+    "Wait for the answer in this conversation before asking another question in it."
+)
 _USAGE_STATS_DEFAULT_DAYS = 30
 
 
@@ -110,20 +112,19 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
         context = self.get_serializer_context()
 
         with transaction.atomic():
-            # One question per user, and a site-wide limit, both checked
-            # under one lock.
+            # All three limits are checked under one lock: one question at a
+            # time per conversation, a few per user, and a site-wide limit.
             limits.lock_asks()
-            pending = ReportingMessage.objects.filter(
-                session__user=request.user, status=ReportingMessage.Status.PENDING
-            ).first()
-
+            pending = (
+                ReportingMessage.objects.filter(
+                    session=requested_session, status=ReportingMessage.Status.PENDING
+                ).first()
+                if requested_session is not None
+                else None
+            )
             if pending is not None:
-                if new_session or pending.prompt != prompt:
-                    raise IncorrectStateException(_BUSY_MESSAGE)
-                if (
-                    requested_session is not None
-                    and pending.session_id != requested_session.id
-                ):
+                # A follow-up needs the answer before it, so it waits.
+                if pending.prompt != prompt:
                     raise IncorrectStateException(_BUSY_MESSAGE)
                 # The same question sent twice (a double click or a retry):
                 # return the one in progress.
@@ -135,6 +136,7 @@ class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
                 )
 
             # Before anything is created, so a 429 leaves no empty conversation.
+            limits.enforce_per_user_limit(request.user)
             limits.enforce_concurrency_limit()
 
             session = (

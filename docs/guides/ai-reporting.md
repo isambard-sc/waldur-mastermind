@@ -20,8 +20,9 @@ explains how the pieces fit together and how to operate them.
 
 1. **Ask.** Homeport POSTs `/api/ai-reporting-messages/ask/` with the prompt and either the conversation's
    `session` uuid or `new_session: true`. The view checks the role setting and the token limits, then, under
-   one site-wide lock, that this user has no question running and that fewer than
-   `AI_REPORTING_MAX_CONCURRENT_QUESTIONS` are running. It saves a `pending` `ReportingMessage`, queues the Celery task `ask_harness` and returns 202.
+   one site-wide lock, that no question is running in that conversation, that the user has fewer than
+   `AI_REPORTING_MAX_QUESTIONS_PER_USER` running, and that fewer than `AI_REPORTING_MAX_CONCURRENT_QUESTIONS`
+   are running in all. It saves a `pending` `ReportingMessage`, queues the Celery task `ask_harness` and returns 202.
 2. **Call the harness.** `ask_harness` checks access again, then POSTs `/query` to the harness URL from
    `HarnessConnection`. The request is signed with Waldur's Ed25519 private key (timestamp, user, path and body);
    the harness holds only the public key and rejects anything unsigned or older than 2 minutes. It carries the
@@ -60,7 +61,8 @@ Waldur treats the harness as untrusted: every line, body and file it returns is 
 | `AI_REPORTING_MAX_TURNS` | 25 | Steps per question, 1 to 40 |
 | `AI_REPORTING_TOKEN_LIMIT_DAILY` | -1 | Tokens per user per rolling day; -1 for unlimited |
 | `AI_REPORTING_GLOBAL_DAILY_TOKEN_BUDGET` | 5,000,000 | Tokens per UTC day across all users; -1 for unlimited |
-| `AI_REPORTING_MAX_CONCURRENT_QUESTIONS` | 3 | Questions running at once across all users; each holds a Celery worker |
+| `AI_REPORTING_MAX_CONCURRENT_QUESTIONS` | 6 | Questions running at once across all users; each holds a Celery worker |
+| `AI_REPORTING_MAX_QUESTIONS_PER_USER` | 3 | Questions one user can have running at once, each in its own conversation |
 | `AI_REPORTING_MESSAGE_RETENTION_DAYS` | 90 | Days to keep questions and answers; -1 to keep them |
 | `AI_REPORTING_FILE_RETENTION_DAYS` | 21 | Days to keep generated files; -1 to keep them |
 
@@ -107,7 +109,8 @@ Why they hold together:
 | AI reporting isn't set up yet: the harness signing key is missing. | No private key on the Connection tab | Administration > AI reporting |
 | The AI reporting service couldn't answer this question. | Harness unreachable; keys don't match (harness logs a 401); harness error or Bedrock failure | Celery worker log (`ask_harness:`), then `kubectl logs -n waldur-harness deploy/waldur-harness` |
 | AI reporting is busy answering other questions. | The concurrency limit (Waldur's or the harness's) is reached | `AI_REPORTING_MAX_CONCURRENT_QUESTIONS`, `MAX_CONCURRENT_RUNS` |
-| Wait for your current question to finish before asking another. | This user already has a question running | Wait, or the stale check fails it after 15 minutes |
+| Wait for the answer in this conversation before asking another question in it. | A question is already running in this conversation | Wait, or ask in a new conversation |
+| You already have N questions running. Wait for one to finish. | The per-user limit | `AI_REPORTING_MAX_QUESTIONS_PER_USER` |
 | This question took too long to answer. | Waldur's deadline passed, or the stream stalled | Harness logs for that time |
 | This question was interrupted. | A Celery worker was lost mid-question (deploy, crash) | Worker restarts |
 | You've reached your daily AI reporting token limit. / site-wide daily token budget | The token limits | Usage page, Constance limits |

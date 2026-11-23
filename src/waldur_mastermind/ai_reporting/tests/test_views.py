@@ -202,11 +202,14 @@ class AskActionTest(test.APITestCase):
         mock_delay.assert_not_called()
 
     @mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay")
-    def test_a_different_question_while_one_is_pending_is_refused(self, mock_delay):
-        self.client.post(self.ask_url, {"prompt": "first", "new_session": True})
+    def test_a_follow_up_waits_for_the_answer_in_its_conversation(self, mock_delay):
+        first = self.client.post(self.ask_url, {"prompt": "first", "new_session": True})
         second = self.client.post(
             self.ask_url,
-            {"prompt": "second, while first is pending", "new_session": True},
+            {
+                "prompt": "second, while first is pending",
+                "session": first.data["session"],
+            },
         )
 
         self.assertEqual(second.status_code, status.HTTP_409_CONFLICT)
@@ -226,16 +229,26 @@ class AskActionTest(test.APITestCase):
         self.assertEqual(mock_delay.call_count, 1)
 
     @mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay")
-    def test_question_in_another_session_waits_for_the_pending_one(self, mock_delay):
-        """The harness answers one question per user at a time."""
+    def test_questions_in_different_conversations_run_side_by_side(self, mock_delay):
         self.client.post(self.ask_url, {"prompt": "first", "new_session": True})
         response = self.client.post(
             self.ask_url, {"prompt": "second", "new_session": True}
         )
 
-        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
-        self.assertEqual(mock_delay.call_count, 1)
-        self.assertEqual(ReportingSession.objects.filter(user=self.staff).count(), 1)
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertEqual(mock_delay.call_count, 2)
+        self.assertEqual(ReportingSession.objects.filter(user=self.staff).count(), 2)
+
+    @override_constance_config(AI_REPORTING_MAX_QUESTIONS_PER_USER=2)
+    @mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay")
+    def test_a_user_can_only_run_a_few_at_once(self, mock_delay):
+        self.client.post(self.ask_url, {"prompt": "one", "new_session": True})
+        self.client.post(self.ask_url, {"prompt": "two", "new_session": True})
+        third = self.client.post(self.ask_url, {"prompt": "three", "new_session": True})
+
+        self.assertEqual(third.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        self.assertIn("2 questions running", third.data["detail"])
+        self.assertEqual(ReportingSession.objects.filter(user=self.staff).count(), 2)
 
     @mock.patch("waldur_mastermind.ai_reporting.views.tasks.ask_harness.delay")
     def test_new_session_actually_creates_a_second_session_row(self, mock_delay):

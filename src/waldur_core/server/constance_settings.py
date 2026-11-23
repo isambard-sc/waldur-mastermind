@@ -1614,9 +1614,14 @@ CONSTANCE_CONFIG = {
         "Maximum tokens per day (UTC) across all users. -1 for unlimited.",
     ),
     "AI_REPORTING_MAX_CONCURRENT_QUESTIONS": (
-        3,
+        6,
         "Maximum questions answered at once across all users, at least 1. Each "
         "holds a background worker.",
+    ),
+    "AI_REPORTING_MAX_QUESTIONS_PER_USER": (
+        3,
+        "Maximum questions one user can have running at once, each in its own "
+        "conversation. At least 1.",
     ),
     "AI_REPORTING_MESSAGE_RETENTION_DAYS": (
         90,
@@ -2424,6 +2429,7 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "AI_REPORTING_TOKEN_LIMIT_DAILY",
         "AI_REPORTING_GLOBAL_DAILY_TOKEN_BUDGET",
         "AI_REPORTING_MAX_CONCURRENT_QUESTIONS",
+        "AI_REPORTING_MAX_QUESTIONS_PER_USER",
     ),
     "AI reporting retention": (
         "AI_REPORTING_MESSAGE_RETENTION_DAYS",

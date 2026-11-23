@@ -53,6 +53,21 @@ def lock_asks() -> None:
     HarnessConnection.objects.select_for_update().filter(pk=connection.pk).first()
 
 
+def enforce_per_user_limit(user) -> None:
+    """Raise Throttled (429) if `user` already has as many questions running
+    as AI_REPORTING_MAX_QUESTIONS_PER_USER, each in its own conversation.
+    Call after lock_asks()."""
+    limit = max(config.AI_REPORTING_MAX_QUESTIONS_PER_USER, 1)
+    running = ReportingMessage.objects.filter(
+        session__user=user, status=ReportingMessage.Status.PENDING
+    ).count()
+    if running >= limit:
+        raise Throttled(
+            wait=60,
+            detail=f"You already have {running} questions running. Wait for one to finish.",
+        )
+
+
 def enforce_concurrency_limit() -> None:
     """Raise Throttled (429) if too many questions are already running. Each
     one holds a Celery worker shared with the rest of Waldur, so there is no

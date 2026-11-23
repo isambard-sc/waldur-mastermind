@@ -9,6 +9,7 @@ from rest_framework.exceptions import Throttled
 from waldur_core.structure.tests import factories as structure_factories
 from waldur_mastermind.ai_reporting.limits import (
     enforce_concurrency_limit,
+    enforce_per_user_limit,
     enforce_usage_limits,
 )
 from waldur_mastermind.ai_reporting.models import (
@@ -212,3 +213,26 @@ class ConcurrentQuestionsLimitTest(test.APITestCase):
     def test_finished_questions_do_not_count(self):
         ReportingMessage.objects.update(status=ReportingMessage.Status.DONE)
         enforce_concurrency_limit()  # must not raise
+
+
+class PerUserQuestionsLimitTest(test.APITestCase):
+    def setUp(self):
+        self.user = structure_factories.UserFactory()
+        self.other = structure_factories.UserFactory()
+        for owner in (self.user, self.user, self.other):
+            ReportingMessage.objects.create(
+                session=ReportingSession.objects.create(user=owner), prompt="x"
+            )
+
+    @override_constance_config(AI_REPORTING_MAX_QUESTIONS_PER_USER=2)
+    def test_blocks_at_the_limit(self):
+        with self.assertRaises(Throttled):
+            enforce_per_user_limit(self.user)
+
+    @override_constance_config(AI_REPORTING_MAX_QUESTIONS_PER_USER=2)
+    def test_other_users_questions_do_not_count(self):
+        enforce_per_user_limit(self.other)  # must not raise
+
+    @override_constance_config(AI_REPORTING_MAX_QUESTIONS_PER_USER=3)
+    def test_allows_while_under(self):
+        enforce_per_user_limit(self.user)  # must not raise
