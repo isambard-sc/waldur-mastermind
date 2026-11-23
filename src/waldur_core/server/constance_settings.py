@@ -136,6 +136,14 @@ AI_ASSISTANT_ENABLED_ROLES_CHOICES = [
     ("anonymous", "All users including anonymous"),
 ]
 
+# No "anonymous" option - ai_reporting has no anonymous/unauthenticated mode
+# at all, unlike the AI assistant above.
+AI_REPORTING_ENABLED_ROLES_CHOICES = [
+    ("disabled", "Disabled"),
+    ("staff", "Staff users"),
+    ("staff_and_support", "Staff and support users"),
+]
+
 NOTIFY_SYSTEM_CHOICES = [
     ("AdminAnnouncement", "AdminAnnouncement"),
     ("BroadcastMessage", "BroadcastMessage"),
@@ -366,6 +374,7 @@ CONSTANCE_CONFIG_CHOICES = {
     "SSH_KEY_ALLOWED_TYPES": SSH_KEY_TYPE_CHOICES,
     "ENABLED_REPORTING_SCREENS": REPORTING_SCREEN_CHOICES,
     "AI_ASSISTANT_ENABLED_ROLES": AI_ASSISTANT_ENABLED_ROLES_CHOICES,
+    "AI_REPORTING_ENABLED_ROLES": AI_REPORTING_ENABLED_ROLES_CHOICES,
     "MATRIX_EXTERNAL_LOGIN_METHOD": MATRIX_EXTERNAL_LOGIN_METHOD_CHOICES,
 }
 
@@ -1556,6 +1565,68 @@ CONSTANCE_CONFIG = {
         "placeholders. Overridden by the active SystemPrompt record when set.",
         "text_field",
     ),
+    # AI reporting settings (waldur_mastermind.ai_reporting - a separate feature from
+    # the AI Assistant above: a staff/support tool that asks a question and gets a
+    # report, not a conversational assistant. Harness lives in a separate repo,
+    # waldur-ai-harness; where it's reached is set through the API, not here -
+    # see models.HarnessConnection.)
+    "AI_REPORTING_ENABLED": (
+        False,
+        "Enable AI reporting.",
+    ),
+    "AI_REPORTING_ENABLED_ROLES": (
+        "staff_and_support",
+        "Controls which user roles can access AI reporting. 'disabled': No "
+        "one. 'staff': Staff users only. 'staff_and_support': Staff and "
+        "support users.",
+        "choice_field",
+    ),
+    "AI_REPORTING_NAME": (
+        "Isambard Reporting Assistant",
+        "Display name of the AI reporting assistant.",
+    ),
+    "AI_REPORTING_CUSTOM_INSTRUCTIONS": (
+        "",
+        "Additional instructions added to the AI reporting system prompt.",
+        "text_field",
+    ),
+    "AI_REPORTING_LINK_DOMAINS": (
+        "",
+        "Domains whose links in AI reporting answers are clickable, "
+        "comma-separated, e.g. 'docs.isambard.ac.uk, bristol.ac.uk'. "
+        "Subdomains are included. Other links are shown as text.",
+    ),
+    "AI_REPORTING_HISTORY_QUESTIONS": (
+        10,
+        "Number of earlier questions in a conversation sent with each new one. "
+        "-1 for all.",
+    ),
+    "AI_REPORTING_MAX_TURNS": (
+        25,
+        "Maximum number of steps the assistant may take to answer a question, 1 to 40.",
+    ),
+    "AI_REPORTING_TOKEN_LIMIT_DAILY": (
+        -1,
+        "Maximum tokens per user per day. -1 for unlimited.",
+    ),
+    "AI_REPORTING_GLOBAL_DAILY_TOKEN_BUDGET": (
+        5000000,
+        "Maximum tokens per day (UTC) across all users. -1 for unlimited.",
+    ),
+    "AI_REPORTING_MAX_CONCURRENT_QUESTIONS": (
+        3,
+        "Maximum questions answered at once across all users, at least 1. Each "
+        "holds a background worker.",
+    ),
+    "AI_REPORTING_MESSAGE_RETENTION_DAYS": (
+        90,
+        "Number of days to keep questions and answers, including their files. "
+        "-1 to keep them indefinitely.",
+    ),
+    "AI_REPORTING_FILE_RETENTION_DAYS": (
+        21,
+        "Number of days to keep generated files. -1 to keep them indefinitely.",
+    ),
     # Anonymous AI assistant settings
     "ANONYMOUS_CHAT_USER_SLUG_SALT": (
         "",
@@ -2340,6 +2411,24 @@ CONSTANCE_CONFIG_FIELDSETS = {
         "ANONYMOUS_CHAT_REVIEW_DAILY_TOKEN_BUDGET",
         "ANONYMOUS_CHAT_ARTIFACT_RETENTION_DAYS",
     ),
+    "AI reporting general": (
+        "AI_REPORTING_NAME",
+        "AI_REPORTING_ENABLED",
+        "AI_REPORTING_ENABLED_ROLES",
+        "AI_REPORTING_CUSTOM_INSTRUCTIONS",
+        "AI_REPORTING_LINK_DOMAINS",
+        "AI_REPORTING_HISTORY_QUESTIONS",
+        "AI_REPORTING_MAX_TURNS",
+    ),
+    "AI reporting limits": (
+        "AI_REPORTING_TOKEN_LIMIT_DAILY",
+        "AI_REPORTING_GLOBAL_DAILY_TOKEN_BUDGET",
+        "AI_REPORTING_MAX_CONCURRENT_QUESTIONS",
+    ),
+    "AI reporting retention": (
+        "AI_REPORTING_MESSAGE_RETENTION_DAYS",
+        "AI_REPORTING_FILE_RETENTION_DAYS",
+    ),
     "Software catalog general": (
         "SOFTWARE_CATALOG_UPDATE_EXISTING_PACKAGES",
         "SOFTWARE_CATALOG_CLEANUP_ENABLED",
@@ -2503,6 +2592,15 @@ PUBLIC_CONSTANCE_SETTINGS = (
     "AI_ASSISTANT_ENABLED",
     "AI_ASSISTANT_ENABLED_ROLES",
     "AI_ASSISTANT_NAME",
+    "AI_REPORTING_ENABLED",
+    "AI_REPORTING_ENABLED_ROLES",
+    # So the Files tab can show "deleted automatically after N days" without
+    # hardcoding it - see ai_reporting.tasks.cleanup_old_reporting_files.
+    "AI_REPORTING_FILE_RETENTION_DAYS",
+    # Same reason, for the History tab - see
+    # ai_reporting.tasks.cleanup_old_reporting_messages.
+    "AI_REPORTING_MESSAGE_RETENTION_DAYS",
+    "AI_REPORTING_LINK_DOMAINS",
     "MATRIX_ENABLED",
     "MATRIX_EXTERNAL_LOGIN_METHOD",
     "AFFILIATES_ENABLED",

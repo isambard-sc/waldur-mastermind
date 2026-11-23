@@ -338,6 +338,7 @@ Detailed guides are in `docs/guides/`:
 - **Awards Site**: `awards-site-upgrade-plan.md` - Archiving the old proposals and upgrading the awards deployment
 - **Resource Projects**: `resource-projects.md` - ResourceProject model, offering roles, invitations, and RoleAvailability
 - **Proposal Forms**: `proposal-forms.md` - Formbricks application flows (fork-only): setup, flows, API, security
+- **AI Reporting**: `ai-reporting.md` - How AI reporting and its harness fit together, settings, time limits, operations
 - **Build Commands**: `build-commands.md` - Test/lint/build commands
 - **OpenAPI Schema**: `openapi.md` - drf-spectacular customization patterns
 

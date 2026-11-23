@@ -205,6 +205,7 @@ class EncryptedFieldDiscoveryTest(SimpleTestCase):
         self.assertEqual(
             _labels(encrypted_scalar_fields()),
             {
+                "ai_reporting.HarnessConnection.signing_private_key",
                 "marketplace.ResourceApiKey.key_ciphertext",
                 "matrix_chat.MatrixBotIdentity.access_token",
                 "matrix_chat.MatrixBotIdentity.cross_signing_seeds",
