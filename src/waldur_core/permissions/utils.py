@@ -796,12 +796,14 @@ def change_user_role(
     UserRole there) to ``role``, as one step.
 
     The new role is checked as a grant first (validate_role_grant, leaving
-    out the role it replaces), then the previous role is revoked and the new
-    one granted in the same transaction: if anything fails, nothing changes
+    out the role it replaces), then the new role is granted and the previous
+    one revoked in the same transaction: if anything fails, nothing changes
     and the user keeps the role they had. The user is never without a role
     on the scope, so nothing that reacts to someone *losing* access (deleting
     their accounts on a cluster, say) runs when their role only changes:
-    side effects queued on commit see the new role in place.
+    side effects queued on commit see the new role in place. Granting first
+    matters for the handlers that run at once, too: revoking a user's only
+    role first deactivated their account (DEACTIVATE_USER_IF_NO_ROLES).
 
     ``expiration_time``: the previous role's unless given (None: permanent).
     Returns the new UserRole.
@@ -815,8 +817,9 @@ def change_user_role(
     if expiration_time is KEEP_EXPIRATION:
         expiration_time = previous.expiration_time
     reason = f"Role changed from {previous.role.name} to {role.name}."
+    new = add_user(scope, user, role, changed_by, expiration_time, reason=reason)
     previous.revoke(changed_by, reason=reason)
-    return add_user(scope, user, role, changed_by, expiration_time, reason=reason)
+    return new
 
 
 def add_user(

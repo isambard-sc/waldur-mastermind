@@ -909,6 +909,30 @@ class HistoricalRemoteAllocation(UsageMixin):
         return self.__str__()
 
 
+def usage_unit_name(units) -> str:
+    """The canonical name of an allocation's units as a usage unit (e.g.
+    "node hours" -> "NHR", "gbp" -> "GBP"), or "NHR" if they are not a
+    well-known unit."""
+    try:
+        return openportal.UsageUnit(str(units)).name
+    except Exception:
+        return "NHR"
+
+
+def declare_time_unit(report, time_unit: str = "NHR") -> None:
+    """Declare a report from before units (openportal 0.95) to be in
+    ``time_unit``. Every such report was time, 3600 counts per hour, so a
+    unit that is not time (a currency award) falls back to NHR. A report with
+    a unit is left alone."""
+    if report.unit is not None:
+        return
+    name = usage_unit_name(time_unit)
+    try:
+        report.set_time_unit(name)
+    except ValueError:
+        report.set_time_unit("NHR")
+
+
 class CachedProjectUsageReport(models.Model):
     """
     Caches the full ProjectUsageReport JSON from OpenPortal for a given
@@ -933,8 +957,16 @@ class CachedProjectUsageReport(models.Model):
         unique_together = [("year", "month", "project_identifier", "resource")]
         indexes = [models.Index(fields=["project_identifier"])]
 
-    def get_report(self) -> "openportal.ProjectUsageReport":
-        return openportal.ProjectUsageReport.from_json(json.dumps(self.report))
+    def get_report(self, time_unit: str = "NHR") -> "openportal.ProjectUsageReport":
+        """The cached report. One cached before usage reports carried a unit
+        (openportal 0.95) is declared ``time_unit`` as it is read: every
+        report from before units was time, 3600 counts per hour. On a site
+        that is NHR (the cluster's node-seconds); on an awarding portal it is
+        the award's unit, which the site scaled to. Not written back."""
+        report = openportal.ProjectUsageReport.from_json(json.dumps(self.report))
+        if report.unit is None:
+            declare_time_unit(report, time_unit)
+        return report
 
     def __str__(self):
         status = "complete" if self.is_complete else "incomplete"
@@ -1018,6 +1050,13 @@ class UserInfo(models.Model):
                 flags=re.IGNORECASE,
                 inverse_match=True,
                 message=_("Cannot contain 'admin' or 'root'."),
+            ),
+            # The user a spend-profile forfeit is billed to in usage reports
+            # (spend_profiles.FORFEIT_USER): no person may have that name.
+            validators.RegexValidator(
+                regex=r"^forfeit$",
+                inverse_match=True,
+                message=_("'forfeit' is reserved."),
             ),
             validators.MinLengthValidator(4),
             validators.MaxLengthValidator(MAX_USER_SHORTNAME_LENGTH),
@@ -2875,6 +2914,7 @@ class ManagedProjectAuditEventType(models.TextChoices):
     DETAILS_UPDATED = "details_updated", _("Award details updated")
     PROJECT_ATTACHED = "project_attached", _("Waldur project attached")
     PROJECT_DETACHED = "project_detached", _("Waldur project detached")
+    FORFEIT_CHARGED = "forfeit_charged", _("Spend profile forfeit charged")
 
 
 class ManagedProjectAuditEntry(models.Model):
@@ -3262,6 +3302,43 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         ),
     )
 
+    # How the award's allocation may be spent over time, sent to the site in
+    # AwardDetails.spend_profile: [{"from": "YYYY-MM-DD", "minimum": "250 NHR",
+    # "maximum": "250 NHR"}, ...], sorted by date. Each entry applies until
+    # the next one's date (the last until the award's end); a control an entry
+    # leaves out does not apply in its period. None: no profile is sent (the
+    # site keeps whatever it holds); []: no profile.
+    spend_profile = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        verbose_name=_("spend profile"),
+        help_text=_(
+            "Dated minimum and/or maximum spends for the award, enforced by "
+            "the site: a list of {from, minimum, maximum}. None: none sent; "
+            "[]: no profile."
+        ),
+    )
+
+    # What the site's portal software says it supports for this award's
+    # offering (get_supported_features), e.g. award_spend_minimums. None:
+    # not known yet, or the site could not be asked.
+    site_features = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        verbose_name=_("site features"),
+        help_text=_(
+            "Features the site's portal reported supporting for this award's "
+            "offering; null if not known."
+        ),
+    )
+    site_features_checked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_("site features checked at"),
+    )
+
     breakdown = models.JSONField(
         default=dict,
         blank=True,
@@ -3361,6 +3438,17 @@ class RemoteProject(core_models.UuidMixin, models.Model):
 
     def get_last_confirmed_details(self) -> "openportal.AwardDetails | None":
         return self._load_award_details(self.last_confirmed_details)
+
+    def usage_unit(self) -> str:
+        """The unit the award's usage is reported in: its allocation's units
+        (the site scales its usage to them), or NHR if it has none."""
+        try:
+            allocation = self.award_details().allocation
+        except Exception:
+            allocation = None
+        if allocation is None:
+            return "NHR"
+        return usage_unit_name(allocation.units)
 
     def award_details(self) -> "openportal.AwardDetails":
         """
@@ -3500,6 +3588,9 @@ class RemoteProject(core_models.UuidMixin, models.Model):
         # rather than treated as unset.
         if self.allowed_domains is not None:
             extras["allowed_domains"] = self.allowed_domains
+        # As with allowed_domains, [] ("no profile") is sent, not dropped.
+        if self.spend_profile is not None:
+            extras["spend_profile"] = self.spend_profile
         if self.breakdown:
             extras["breakdown"] = self.breakdown
 
@@ -3926,3 +4017,70 @@ class RemoteProjectAuditEntry(models.Model):
 
     def __repr__(self) -> str:
         return self.__str__()
+
+
+class AwardForfeit(models.Model):
+    """A spend-profile forfeit charged to an award (ManagedProject).
+
+    When a period of an award's spend profile ends, the site charges the sum
+    of the minimums so far less everything charged so far, if positive, as
+    usage by the user "forfeit" on the period's last day. The charge is made
+    by adding it to the usage report as it arrives from the cluster
+    (spend_profiles.add_forfeits), so it is billed, credited and reported to
+    the awarding portal like any other usage.
+
+    The report is fetched afresh on every sync, so this record is what puts
+    the same forfeit back into it each time: worked out once, when the period
+    ended, and kept with its working. A forfeit of 0 is recorded too, so the
+    period is not worked out again.
+    """
+
+    managed_project = models.ForeignKey(
+        ManagedProject,
+        on_delete=models.CASCADE,
+        related_name="forfeits",
+    )
+    project = models.ForeignKey(
+        structure_models.Project,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text=_("The project the award was on when the forfeit was charged."),
+    )
+    project_identifier = models.CharField(
+        max_length=MAX_PROJECTIDENTIFIER_LENGTH,
+        help_text=_(
+            "The usage report (OpenPortal project identifier) the forfeit is added to."
+        ),
+    )
+    period_from = models.DateField(help_text=_("The first day of the period."))
+    date = models.DateField(
+        help_text=_("The period's last day: the day the forfeit is charged on.")
+    )
+    amount = models.DecimalField(
+        max_digits=20,
+        decimal_places=4,
+        help_text=_("The forfeit, in the award's allocation units."),
+    )
+    units = models.CharField(max_length=32, blank=True)
+    hours = models.DecimalField(
+        max_digits=20,
+        decimal_places=4,
+        help_text=_("The forfeit as node-hours of usage, as added to the report."),
+    )
+    working = models.JSONField(
+        default=dict,
+        help_text=_("How the forfeit was worked out."),
+    )
+    created = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("managed_project", "period_from")
+        ordering = ["managed_project", "date"]
+        verbose_name = _("Award forfeit")
+
+    def __str__(self) -> str:
+        return (
+            f"{self.managed_project} forfeit {self.amount} {self.units} on {self.date}"
+        )

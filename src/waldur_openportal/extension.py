@@ -35,6 +35,12 @@ class OpenPortalExtension(WaldurExtension):
                 "schedule": crontab(minute=20, hour=2),
                 "args": (),
             },
+            # What each site's portal supports (spend profile enforcement).
+            "waldur-openportal-refresh-site-features": {
+                "task": "waldur_openportal.refresh_site_features",
+                "schedule": crontab(minute=50, hour=2),
+                "args": (),
+            },
             # Rejects awards still waiting for approval, with no project,
             # once their end date has passed (e.g. embargoed awards).
             "waldur-openportal-reject-ended-waiting-awards": {

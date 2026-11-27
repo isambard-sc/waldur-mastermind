@@ -82,6 +82,7 @@ class RemoteBackendFixture(TestCase):
         allocation.get_project_details.return_value = (
             details if details is not None else award_details(project_id=PROJECT)
         )
+        allocation.remote_project.usage_unit.return_value = "NHR"
         return allocation
 
 
@@ -563,6 +564,8 @@ class UsageReportTest(RemoteBackendFixture):
         return mock.Mock(
             dates=dates,
             is_complete=is_complete,
+            unit=mock.Mock(name="NHR-unit"),
+            total=mock.Mock(return_value=mock.Mock(value=hours)),
             total_usage=mock.Mock(hours=hours),
         )
 
@@ -705,7 +708,7 @@ class ReconcileHistoricalUsageTest(RemoteBackendFixture):
         self.backend._adjust_project_credits_for_reconciliation = mock.Mock()
 
         resource_patcher = mock.patch(
-            "waldur_openportal.remotebackend.marketplace_models.Resource.objects.get",
+            "waldur_openportal.usage_reconciliation.marketplace_models.Resource.objects.get",
             return_value=self.resource,
         )
         resource_patcher.start()
@@ -862,12 +865,15 @@ class SyncUsageTest(RemoteBackendFixture):
         return mock.Mock(is_complete=is_complete, node_usage=0)
 
     def usage_report(self, hours=10.0, is_complete=True):
-        return mock.Mock(
+        report = mock.Mock(
             is_complete=is_complete,
+            total=mock.Mock(return_value=mock.Mock(value=hours)),
             total_usage=mock.Mock(hours=hours, seconds=int(hours * 3600)),
             to_json=mock.Mock(return_value=json.dumps({"total": hours})),
             dates=[],
         )
+        report.unit.name = "NHR"
+        return report
 
     def test_both_the_current_and_the_previous_month_are_collected(self):
         self.backend.sync_usage(self.make_allocation())
@@ -987,3 +993,44 @@ class SyncStorageTest(RemoteBackendFixture):
 
         self.backend.add_allocated_project.assert_called_once_with(allocation)
         self.client.get_storage_report.assert_not_called()
+
+
+class ReportUnitTest(RemoteBackendFixture):
+    """A site's usage report is billed against the award only in the award's
+    unit: one from before units is taken to be in it, one in another unit is
+    refused."""
+
+    def report(self, unit):
+        report = openportal.ProjectUsageReport(
+            openportal.ProjectIdentifier(PROJECT),
+            unit=openportal.UsageUnit(unit or "NHR"),
+        )
+        daily = openportal.DailyProjectUsageReport()
+        daily.add_unattributed_usage(openportal.UsageUnit(unit or "NHR").usage(5))
+        report.add_report(datetime.date(2026, 1, 15), daily)
+        if unit is None:
+            data = json.loads(report.to_json())
+            data.pop("usage_unit", None)
+            report = openportal.ProjectUsageReport.from_json(json.dumps(data))
+        return report
+
+    def checked(self, unit, award_unit="GPUHR"):
+        allocation = self.make_allocation()
+        allocation.remote_project.usage_unit.return_value = award_unit
+        return self.backend._report_in_award_unit(allocation, self.report(unit))
+
+    def test_a_report_from_before_units_is_in_the_awards_unit(self):
+        report = self.checked(None)
+        self.assertEqual(report.unit.name, "GPUHR")
+        self.assertAlmostEqual(self.backend._report_amount(report), 5.0)
+
+    def test_a_report_in_the_awards_unit_is_counted(self):
+        report = self.checked("GPUHR")
+        self.assertAlmostEqual(self.backend._report_amount(report), 5.0)
+
+    def test_a_currency_is_counted_as_an_amount_not_hours(self):
+        report = self.checked("GBP", award_unit="GBP")
+        self.assertAlmostEqual(self.backend._report_amount(report), 5.0)
+
+    def test_a_report_in_another_unit_is_refused(self):
+        self.assertIsNone(self.checked("NHR"))

@@ -29,6 +29,11 @@ class OpenPortalOtherError(OpenPortalError):
             return self._message
 
 
+class OpenPortalTimeoutError(OpenPortalError):
+    """The remote portal did not answer in time. Unlike a refusal, this says
+    nothing about what it supports: ask again later."""
+
+
 class OpenPortalUnsupportedCommandError(OpenPortalError):
     """
     Raised when the remote portal does not understand a command we sent,

@@ -34,7 +34,12 @@ def _d(day, month=3):
 
 
 def _report(key, days, user=None):
-    report = openportal.ProjectUsageReport(openportal.ProjectIdentifier(key))
+    """A month's report as cached before reports carried a unit (openportal
+    0.95): built in NHR, with the unit then left out, as production holds
+    them."""
+    report = openportal.ProjectUsageReport(
+        openportal.ProjectIdentifier(key), unit=openportal.UsageUnit("NHR")
+    )
     for day, hours in days.items():
         daily = openportal.DailyProjectUsageReport()
         if user:
@@ -42,7 +47,9 @@ def _report(key, days, user=None):
         else:
             daily.add_unattributed_usage(openportal.Usage.from_hours(hours))
         report.add_report(day, daily)
-    return json.loads(report.to_json())
+    data = json.loads(report.to_json())
+    data.pop("usage_unit", None)
+    return data
 
 
 def _cache(key, days, resource=DEST, user=None):

@@ -34,7 +34,17 @@ from waldur_core.structure.filters import GenericRoleFilter
 from waldur_core.structure.managers import filter_queryset_for_user
 from waldur_core.structure.permissions import IsAdminOrOwner, _has_owner_access
 
-from . import config, executors, filters, models, serializers, tasks, utils
+from . import (
+    config,
+    executors,
+    filters,
+    models,
+    remote_project_service,
+    serializers,
+    spend_profiles,
+    tasks,
+    utils,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1619,8 +1629,9 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
     current_project.
 
     Write actions (add_note, set_earliest_approve,
-    set_membership_control, set_allowed_domains, set_links): staff,
-    support, or CustomerOwner of the organisation.
+    set_membership_control, set_allowed_domains, set_links,
+    set_spend_profile, refresh_site_features): staff, support, or
+    CustomerOwner of the organisation.
 
     Sensitive fields in the serializer (raw AwardDetails JSON, notes,
     earliest_approve) are filtered to privileged users by the
@@ -1661,6 +1672,7 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
             "set_membership_control": (serializers.SetMembershipControlSerializer),
             "set_allowed_domains": (serializers.SetAllowedDomainsSerializer),
             "set_links": serializers.SetLinksSerializer,
+            "set_spend_profile": serializers.SetSpendProfileSerializer,
         }
         return action_map.get(self.action, serializers.RemoteProjectSerializer)
 
@@ -1810,6 +1822,100 @@ class RemoteProjectViewSet(core_views.ActionsViewSet):
         )
 
         return Response(status=status.HTTP_202_ACCEPTED)
+
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.RemoteProjectSerializer},
+        request=serializers.SetSpendProfileSerializer,
+        description="Replace the award's spend profile: dated minimum and/or "
+        "maximum spends, in the award's allocation units and within the "
+        "award's dates, enforced by the site. A period that has begun keeps "
+        "its date and cannot be removed; one that has ended keeps its "
+        "controls; new periods start today or later. [] removes the profile "
+        "before any period has begun. The award is then re-sent to the site.",
+    )
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="set-spend-profile",
+    )
+    def set_spend_profile(self, request, uuid=None):
+        remote_project = self.get_object()
+        self._check_write_permission(request, remote_project)
+        remote_project.ensure_not_erred()
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        raw = [
+            {
+                key: (value.isoformat() if key == "from" else value)
+                for key, value in entry.items()
+                if value is not None
+            }
+            for entry in serializer.validated_data["spend_profile"]
+        ]
+        try:
+            entries = spend_profiles.parse(raw)
+            award = remote_project.award_details()
+            spend_profiles.validate_for_award(entries, award)
+            profile = [spend_profiles.entry_json(entry) for entry in entries]
+            spend_profiles.validate_change(
+                remote_project.spend_profile,
+                profile,
+                spend_profiles.today(),
+                getattr(award, "end_date", None),
+            )
+        except spend_profiles.SpendProfileError as e:
+            raise ValidationError({"spend_profile": str(e)})
+
+        previous = remote_project.spend_profile
+        if profile == previous:
+            return Response(
+                serializers.RemoteProjectSerializer(
+                    remote_project, context={"request": request}
+                ).data
+            )
+        remote_project.spend_profile = profile
+        remote_project.save(update_fields=["spend_profile", "modified"])
+
+        described = [str(entry) for entry in entries] or ["no spend profile"]
+        models.RemoteProjectAuditEntry.objects.create(
+            remote_project=remote_project,
+            event_type=models.RemoteProjectAuditEventType.AWARD_UPDATED,
+            performed_by=request.user,
+            previous_details={"spend_profile": previous},
+            new_details={"spend_profile": profile},
+            note="Spend profile set: " + "; ".join(described),
+        )
+        self._trigger_update(remote_project)
+
+        return Response(
+            serializers.RemoteProjectSerializer(
+                remote_project, context={"request": request}
+            ).data
+        )
+
+    @extend_schema(
+        responses={status.HTTP_200_OK: serializers.RemoteProjectSerializer},
+        request=None,
+        description="Ask the site what its portal supports for this award's "
+        "offering (e.g. award_spend_minimums, award_spend_maximums) and keep "
+        "the answer in site_features. A site that does not answer in time "
+        "leaves the last answer.",
+    )
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="refresh-site-features",
+    )
+    def refresh_site_features(self, request, uuid=None):
+        remote_project = self.get_object()
+        self._check_write_permission(request, remote_project)
+        remote_project_service.refresh_site_features(remote_project)
+        return Response(
+            serializers.RemoteProjectSerializer(
+                remote_project, context={"request": request}
+            ).data
+        )
 
     @extend_schema(
         responses={status.HTTP_200_OK: serializers.RemoteProjectSerializer},

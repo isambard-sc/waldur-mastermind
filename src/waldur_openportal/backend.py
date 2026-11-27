@@ -13,14 +13,15 @@ from waldur_core.structure.backend import ServiceBackend
 from waldur_core.structure.exceptions import ServiceBackendError
 from waldur_openportal import signals
 from waldur_openportal.client import OpenPortalClient
+from waldur_openportal.usage_reconciliation import UsageReconciliationMixin
 
-from . import exceptions, models
+from . import exceptions, models, spend_profiles
 from . import utils as openportal_utils
 
 logger = logging.getLogger(__name__)
 
 
-class OpenPortalBackend(ServiceBackend):
+class OpenPortalBackend(UsageReconciliationMixin, ServiceBackend):
     def __init__(self, settings):
         self.settings = settings
 
@@ -770,6 +771,18 @@ class OpenPortalBackend(ServiceBackend):
                 continue
 
             report = self.client.get_usage_report(project, month)
+            # A cluster agent from before usage units (openportal 0.95) sends
+            # none; its figures were node-seconds, as op-slurm now says.
+            models.declare_time_unit(report, "NHR")
+
+            # A spend profile's forfeit is usage like any other: it is added
+            # here, to the report as it arrives, and counted from then on.
+            try:
+                report = spend_profiles.add_forfeits(
+                    allocation, report, month, str(self.client.destination())
+                )
+            except Exception as e:
+                logger.error(f"Failed to add forfeits for {allocation} in {month}: {e}")
 
             logger.debug(f"Total usage for project in {month} = {report.total_usage}")
             self._update_usage_from_report(
@@ -794,6 +807,17 @@ class OpenPortalBackend(ServiceBackend):
                     "report": json.loads(report.to_json()),
                 },
             )
+
+            # Usage reported after the month was billed (late hours from
+            # the cluster, a forfeit) is billed once the month is complete.
+            try:
+                self._reconcile_historical_usage(
+                    allocation, historical_report, first_day
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to reconcile historical usage for {allocation} in {month}: {e}"
+                )
 
     def sync_storage(self, allocation: models.Allocation):
         """

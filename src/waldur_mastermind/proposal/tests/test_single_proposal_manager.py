@@ -131,3 +131,24 @@ class TransferToTeamMemberTest(SingleManagerBase):
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(self.roles(self.newcomer), [RoleEnum.PROPOSAL_MANAGER])
         self.assertEqual(self.roles(self.applicant), [RoleEnum.PROPOSAL_ADMIN])
+
+
+@override_config(
+    DEACTIVATE_USER_IF_NO_ROLES=True, INVITATION_DISABLE_MULTIPLE_ROLES=True
+)
+class TransferKeepsAccountsActiveTest(TransferToTeamMemberTest):
+    """Neither the new manager nor the previous one is left, even for a
+    moment, with no role: with DEACTIVATE_USER_IF_NO_ROLES, either would
+    otherwise have their account deactivated and drop off the team."""
+
+    def test_both_accounts_stay_active(self):
+        UserRole.objects.filter(user__in=[self.newcomer, self.applicant]).exclude(
+            object_id=self.proposal.id
+        ).delete()
+        response = self.transfer()
+        self.assertEqual(response.status_code, 200, response.data)
+        for user in (self.newcomer, self.applicant):
+            user.refresh_from_db()
+            self.assertTrue(user.is_active)
+        self.assertEqual(self.roles(self.newcomer), [RoleEnum.PROPOSAL_MANAGER])
+        self.assertEqual(self.roles(self.applicant), [RoleEnum.PROPOSAL_ADMIN])

@@ -1153,12 +1153,16 @@ def get_remote_project_usage_report(
             )
             if overlap is None:
                 continue
-            piece = cached_report.get_report().filter(openportal.DateRange(*overlap))
+            piece = cached_report.get_report(remote_project.usage_unit()).filter(
+                openportal.DateRange(*overlap)
+            )
             piece.remap_project(common)
             pieces.append(piece)
 
     if not pieces:
-        return openportal.ProjectUsageReport(common)
+        return openportal.ProjectUsageReport(
+            common, unit=openportal.UsageUnit(remote_project.usage_unit())
+        )
     if len(pieces) == 1:
         return pieces[0]
     return openportal.ProjectUsageReport.combine(pieces)
@@ -1249,6 +1253,8 @@ def get_remote_project_total_hours(remote_project: "models.RemoteProject") -> fl
 def get_award_usage_hours(
     managed_project: "models.ManagedProject",
     project: structure_models.Project | None = None,
+    range_start: datetime.date | None = None,
+    range_end: datetime.date | None = None,
 ) -> float:
     """
     The node-hours of usage an award has had: for each project it has been
@@ -1264,12 +1270,25 @@ def get_award_usage_hours(
     a project from before the award was attached to it - for example under
     the award it held previously - is not this award's.
 
-    Pass project to count only the usage on that project.
+    Pass project to count only the usage on that project, and range_start
+    and/or range_end (inclusive) to count only the usage on those days.
     """
     windows_by_project = {}
     for attached_project, start, end in _get_managed_project_attachment_windows(
         managed_project, project, from_award_start=True
     ):
+        if range_start is not None or range_end is not None:
+            clipped = _clip_window_to_range(
+                start,
+                end,
+                range_start or start,
+                range_end or end or datetime.date.max,
+            )
+            if clipped is None:
+                continue
+            start, end = clipped
+            if end == datetime.date.max:
+                end = None
         windows_by_project.setdefault(attached_project.id, (attached_project, []))[
             1
         ].append((start, end))
@@ -2158,6 +2177,12 @@ def resolve_useridentifiers(identifiers: list) -> dict:
     """
     result = {}
     for identifier in identifiers:
+        if str(identifier).startswith("forfeit."):
+            # A spend-profile forfeit's user (spend_profiles.FORFEIT_USER):
+            # never a person, whatever a slug might match.
+            result[identifier] = None
+            continue
+
         association = (
             models.Association.objects.filter(useridentifier=identifier)
             .select_related("user")

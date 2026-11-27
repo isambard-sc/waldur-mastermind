@@ -670,17 +670,23 @@ def allocate_proposal(proposal: proposal_models.Proposal, approved_by=None):
         offering_seen[offering] += 1
         index = offering_seen[offering] if offering_counts[offering] > 1 else None
         with transaction.atomic():
+            name = _allocated_resource_name(project.name, offering.name, index)
+            # An order needs a name in its attributes, as one placed through
+            # the API has: a backend that creates its resource from the order
+            # (OpenPortal's, for one) reads it there, and without it the
+            # resource was left Errored. A name given in the request is kept;
+            # otherwise the order takes the resource's.
+            attributes = dict(awarded.attributes or {})
+            if not (attributes.get("name") or "").strip():
+                attributes["name"] = name
             attrs = dict(
                 project=project,
                 offering=offering,
                 plan=awarded.effective_plan,
-                attributes=awarded.attributes,
+                attributes=attributes,
                 limits=awarded.limits,
             )
-            resource = marketplace_models.Resource(
-                **attrs,
-                name=_allocated_resource_name(project.name, offering.name, index),
-            )
+            resource = marketplace_models.Resource(**attrs, name=name)
             # Before init_cost: the prepaid multiplier in Plan.get_estimate and
             # in the invoice item builder both read this field, so setting it
             # afterwards would price and bill a six-month grant as one month.

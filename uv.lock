@@ -1087,7 +1087,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/49/e8/58c7f85958bda41dafea50497cbd59738c5c43dbbea5ee83d651234398f4/greenlet-3.2.4-cp313-cp313-macosx_11_0_universal2.whl", hash = "sha256:1a921e542453fe531144e91e1feedf12e07351b1cf6c9e8a3325ea600a715a31", size = 272814, upload-time = "2025-08-07T13:15:50.011Z" },
     { url = "https://files.pythonhosted.org/packages/62/dd/b9f59862e9e257a16e4e610480cfffd29e3fae018a68c2332090b53aac3d/greenlet-3.2.4-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:cd3c8e693bff0fff6ba55f140bf390fa92c994083f838fece0f63be121334945", size = 641073, upload-time = "2025-08-07T13:42:57.23Z" },
     { url = "https://files.pythonhosted.org/packages/f7/0b/bc13f787394920b23073ca3b6c4a7a21396301ed75a655bcb47196b50e6e/greenlet-3.2.4-cp313-cp313-manylinux2014_ppc64le.manylinux_2_17_ppc64le.whl", hash = "sha256:710638eb93b1fa52823aa91bf75326f9ecdfd5e0466f00789246a5280f4ba0fc", size = 655191, upload-time = "2025-08-07T13:45:29.752Z" },
-    { url = "https://files.pythonhosted.org/packages/f2/d6/6adde57d1345a8d0f14d31e4ab9c23cfe8e2cd39c3baf7674b4b0338d266/greenlet-3.2.4-cp313-cp313-manylinux2014_s390x.manylinux_2_17_s390x.whl", hash = "sha256:c5111ccdc9c88f423426df3fd1811bfc40ed66264d35aa373420a34377efc98a", size = 649516, upload-time = "2025-08-07T13:53:16.314Z" },
     { url = "https://files.pythonhosted.org/packages/7f/3b/3a3328a788d4a473889a2d403199932be55b1b0060f4ddd96ee7cdfcad10/greenlet-3.2.4-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:d76383238584e9711e20ebe14db6c88ddcedc1829a9ad31a584389463b5aa504", size = 652169, upload-time = "2025-08-07T13:18:32.861Z" },
     { url = "https://files.pythonhosted.org/packages/ee/43/3cecdc0349359e1a527cbf2e3e28e5f8f06d3343aaf82ca13437a9aa290f/greenlet-3.2.4-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:23768528f2911bcd7e475210822ffb5254ed10d71f4028387e5a99b4c6699671", size = 610497, upload-time = "2025-08-07T13:18:31.636Z" },
     { url = "https://files.pythonhosted.org/packages/b8/19/06b6cf5d604e2c382a6f31cafafd6f33d5dea706f4db7bdab184bad2b21d/greenlet-3.2.4-cp313-cp313-musllinux_1_1_aarch64.whl", hash = "sha256:00fadb3fedccc447f517ee0d3fd8fe49eae949e1cd0f6a611818f4f6fb7dc83b", size = 1121662, upload-time = "2025-08-07T13:42:41.117Z" },
@@ -1725,14 +1724,14 @@ wheels = [
 
 [[package]]
 name = "openportal"
-version = "0.93.0"
+version = "0.95.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/20/f0/ec1776e48c7e57e0b020d7a2fa15005c3762feb1947b11ff12783b6bd743/openportal-0.93.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:b0e5cee7fe8fc6e18e8ee0caf62e6280fb94db52b4cc8c54b737d4fa39005995", size = 3056443, upload-time = "2026-09-04T08:06:03.023Z" },
-    { url = "https://files.pythonhosted.org/packages/8a/f3/79083127f66ba567e6dc3a6000d93248ff02868e06593533019b5be34522/openportal-0.93.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:d25f589076c29c3195a4314ebe8ef96021caccb07cff90b1322cff31563d7cb4", size = 3064960, upload-time = "2026-09-04T08:05:54.297Z" },
-    { url = "https://files.pythonhosted.org/packages/7e/44/473f9a2f2cb8a84056114b3e4b2bdeec1169f464dd2f7eab6aaaae2859f8/openportal-0.93.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:416cea803ab31c6b39ba6c4e38eaf46b42b8f9c19474f510a27f5b3dc0eed7aa", size = 3174689, upload-time = "2026-09-04T08:05:58.631Z" },
-    { url = "https://files.pythonhosted.org/packages/ae/75/cd56ca93235c8aad9c6ad4e3b9cdae56bae95083117cf5a91553939cdf69/openportal-0.93.0-cp310-abi3-musllinux_1_1_aarch64.whl", hash = "sha256:b1cd8e37d46a26f8fb8f6d18cf952730ccfc4f909f4b8bbb0db24baaab260c70", size = 3245996, upload-time = "2026-09-04T08:05:56.843Z" },
-    { url = "https://files.pythonhosted.org/packages/6a/0f/82dbe7e996174499ae916dd25fbf0eefa6f87cbe590f983fcb4e45d94389/openportal-0.93.0-cp310-abi3-musllinux_1_1_x86_64.whl", hash = "sha256:f1dc2e6f38ee4f410853469610a5464c9737b4ff8421892e398329cc0a811c5a", size = 3444492, upload-time = "2026-09-04T08:06:00.975Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/49/4c8fe635aae2821938130ad1fa54df376776078aa0025e667605baeb7593/openportal-0.95.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:f588ec2de77be70c499d2938dbe4fbd42e0e8617f6e738d0e35fa85c8e18c09d", size = 3007659, upload-time = "2026-11-24T06:56:17.883Z" },
+    { url = "https://files.pythonhosted.org/packages/fd/eb/a0f562027778cdb91a9ba3927192b67961c9e033026ff63eeb128a2a5423/openportal-0.95.0-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:7151ea2ed6512b4c433a21549adf2ad5330b2d31a2778ba29e55dd3561d25e27", size = 3016276, upload-time = "2026-11-24T06:56:11.122Z" },
+    { url = "https://files.pythonhosted.org/packages/23/94/d7f392f286520a9819fdb4a2b4c45fb12faa20d3988ddce91c885d0f8004/openportal-0.95.0-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:8f79b7973c0488e503f058a375afff632c54cfc3b98f6789b5081bcbd0f3dc57", size = 3129155, upload-time = "2026-11-24T06:56:14.423Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/ce/e24a5d0beadcabf0e542a214b3baa2e2f3bce83194207769bbb007d407d6/openportal-0.95.0-cp310-abi3-musllinux_1_1_aarch64.whl", hash = "sha256:28357de18d45bb57249f3eaef6dafa8e9460a01614e3fe90f1737e368e15089b", size = 3198317, upload-time = "2026-11-24T06:56:12.998Z" },
+    { url = "https://files.pythonhosted.org/packages/09/88/99a7ee78cc889b40f03ce1b5569878f8de7781e8be5044ca7514f578e1fd/openportal-0.95.0-cp310-abi3-musllinux_1_1_x86_64.whl", hash = "sha256:42a0e87aa4974a5446a953e57dfb1e9d05acd837f29b2320b089213df6d0bd97", size = 3395913, upload-time = "2026-11-24T06:56:16.139Z" },
 ]
 
 [[package]]
@@ -3427,7 +3426,7 @@ requires-dist = [
     { name = "matrix-nio", extras = ["e2e"], specifier = "==0.26.0" },
     { name = "nh3", specifier = ">=0.2.18,<1.0.0" },
     { name = "openai", specifier = ">=2.26.0" },
-    { name = "openportal", specifier = ">=0.93.0" },
+    { name = "openportal", specifier = ">=0.95.0" },
     { name = "openpyxl", specifier = ">=3.1.5" },
     { name = "openstacksdk", specifier = ">=4.7.1" },
     { name = "opentelemetry-proto", specifier = ">=1.37,<2" },

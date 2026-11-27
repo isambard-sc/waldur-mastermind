@@ -307,7 +307,9 @@ class OpenPortalClient:
         # Give the job another 100ms to finish...
         if not op_job.wait(100):
             logger.error(f"Job {cmd_label} timed out - skipping!")
-            raise exceptions.OpenPortalError(f"Job '{cmd_label}' timed out - skipping!")
+            raise exceptions.OpenPortalTimeoutError(
+                f"Job '{cmd_label}' timed out - skipping!"
+            )
 
         if op_job.is_error:
             logger.error(f"Job {cmd_label} has failed: {op_job.error_message}")
@@ -317,6 +319,26 @@ class OpenPortalClient:
         else:
             logger.debug(f"Job finished: {cmd_label} - SUCCESS")
             return op_job.result
+
+    def get_supported_features(self) -> list[str]:
+        """The features the site's portal software supports for this
+        offering (get_supported_features), e.g. award_spend_minimums.
+
+        A site too old to know the instruction refuses it, which means it
+        supports none: [] is returned. A timeout raises
+        OpenPortalTimeoutError, as it says nothing either way."""
+        try:
+            features = self.run(f"{self.destination()} get_supported_features")
+        except exceptions.OpenPortalTimeoutError:
+            raise
+        except exceptions.OpenPortalError as e:
+            logger.info(
+                "%s does not report its features (%s): taking it to support none.",
+                self.destination(),
+                e,
+            )
+            return []
+        return sorted(str(feature) for feature in (features or []))
 
     def list_accounts(self) -> list[Account]:
         """

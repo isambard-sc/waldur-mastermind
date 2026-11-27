@@ -807,15 +807,19 @@ class UneditedAwardProvisionsAsRequestedTest(test.APITestCase):
             offering = r.requested_offering.offering
             seen[offering.id] = seen.get(offering.id, 0) + 1
             index = seen[offering.id] if counts[offering.id] > 1 else None
+            name = utils._allocated_resource_name(project.name, offering.name, index)
             expected.append(
                 {
                     "offering": offering.id,
                     "plan": r.requested_offering.plan_id,
                     "limits": r.limits,
-                    "attributes": r.attributes,
-                    "name": utils._allocated_resource_name(
-                        project.name, offering.name, index
-                    ),
+                    # The order is given the resource's name when the request
+                    # has none (test_allocated_order_names).
+                    "attributes": {
+                        **(r.attributes or {}),
+                        "name": (r.attributes or {}).get("name") or name,
+                    },
+                    "name": name,
                     "end_date": utils._requested_end_date(r, project, today),
                     "request_comment": r.purchase_order_reference or None,
                     "attachment": r.attachment.name if r.attachment else "",

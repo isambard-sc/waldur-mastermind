@@ -1699,7 +1699,21 @@ class OpenPortalBoard:
                         f"Failed to get the allocation mapping for {allocation_units} from template {template}: {e}"
                     )
 
-        report = openportal.ProjectUsageReport(managed_project.get_remote_identifier())
+        # Built in node-hours, the cluster's unit, and converted to the
+        # award's unit below.
+        report = openportal.ProjectUsageReport(
+            managed_project.get_remote_identifier(),
+            unit=openportal.UsageUnit("NHR"),
+        )
+        award_unit = None
+        if details.allocation is not None and details.allocation.units:
+            try:
+                award_unit = openportal.UsageUnit(str(details.allocation.units))
+            except Exception as e:
+                logger.warning(
+                    f"Award {managed_project} is in {details.allocation.units}, "
+                    f"which is not a usage unit: {e}"
+                )
         this_month = date.today().month
         this_year = date.today().year
 
@@ -1824,6 +1838,10 @@ class OpenPortalBoard:
 
         if scale_factor is None or scale_factor <= 0:
             logger.warning(f"Invalid scale factor: {scale_factor}")
+        elif award_unit is not None:
+            # Re-expressed in the award's unit, and labelled so: the awarding
+            # portal reads the figures as that unit.
+            report.convert(award_unit, scale_factor)
         elif scale_factor != 1.0:
             report.scale_total(scale_factor)
 
@@ -1839,7 +1857,7 @@ class OpenPortalBoard:
 
         if not attached_ranges:
             return openportal.ProjectUsageReport(
-                managed_project.get_remote_identifier()
+                managed_project.get_remote_identifier(), unit=report.unit
             )
 
         filtered_reports = [

@@ -17,7 +17,7 @@ from waldur_core.structure.permissions import _has_admin_access
 from waldur_mastermind.marketplace import models as marketplace_models
 from waldur_mastermind.marketplace import serializers as marketplace_serializers
 
-from . import models
+from . import models, spend_profiles
 
 logger = logging.getLogger(__name__)
 
@@ -765,6 +765,50 @@ class AwardDetailsField(rf_serializers.JSONField):
     pass
 
 
+class SpendPeriodProgressSerializer(rf_serializers.Serializer):
+    """One period of an award's spend profile and its spend so far, every
+    amount in the award's allocation units. See spend_profiles.progress."""
+
+    locals()["from"] = rf_serializers.DateField()
+    to = rf_serializers.DateField(allow_null=True)
+    minimum = rf_serializers.CharField(allow_null=True)
+    maximum = rf_serializers.CharField(allow_null=True)
+    status = rf_serializers.ChoiceField(choices=["ended", "current", "upcoming"])
+    spend = rf_serializers.FloatField(
+        allow_null=True,
+        help_text="Charged on the period's days so far; null if not begun.",
+    )
+    cumulative_spend = rf_serializers.FloatField(
+        allow_null=True,
+        help_text="Charged from the award's start to the period's end (or "
+        "today); null if not begun.",
+    )
+    cumulative_minimum = rf_serializers.FloatField(
+        allow_null=True, help_text="The minimums so far; null if none."
+    )
+    cap = rf_serializers.FloatField(
+        allow_null=True,
+        help_text="The most the award may have been charged by the period's "
+        "end: the maximums so far, or the whole award if it has no maximum.",
+    )
+    headroom = rf_serializers.FloatField(
+        allow_null=True,
+        help_text="cap less cumulative_spend; null if not begun.",
+    )
+    forfeit = rf_serializers.FloatField(
+        allow_null=True,
+        help_text="Charged when the period ended for spending less than the "
+        "minimums so far; null if none.",
+    )
+
+
+class SpendProgressSerializer(rf_serializers.Serializer):
+    units = rf_serializers.CharField(allow_null=True)
+    allocation = rf_serializers.FloatField(allow_null=True)
+    spend = rf_serializers.FloatField(help_text="Charged to the award so far.")
+    periods = SpendPeriodProgressSerializer(many=True)
+
+
 class ManagedProjectAccountingSummarySerializer(rf_serializers.Serializer):
     """
     Read-only serializer summarising the OpenPortal award (ManagedProject)
@@ -781,6 +825,12 @@ class ManagedProjectAccountingSummarySerializer(rf_serializers.Serializer):
     allocation_credits = rf_serializers.FloatField(read_only=True, allow_null=True)
     usage_credits = rf_serializers.FloatField(read_only=True)
     remaining_credits = rf_serializers.FloatField(read_only=True, allow_null=True)
+    spend_profile = SpendProgressSerializer(
+        read_only=True,
+        allow_null=True,
+        help_text="The award's spend profile, period by period, with its "
+        "spend so far; null if the award has none.",
+    )
 
     def to_representation(self, project):
         from . import utils as openportal_utils
@@ -808,6 +858,21 @@ class ManagedProjectAccountingSummarySerializer(rf_serializers.Serializer):
             if allocation_credits is not None
             else None
         )
+
+        data["spend_profile"] = None
+        managed_project = models.ManagedProject.objects.filter(project=project).first()
+        if managed_project is not None:
+            try:
+                progress = spend_profiles.progress(
+                    managed_project, spend_profiles.today()
+                )
+            except Exception as e:
+                logger.error(
+                    f"Error computing spend profile progress for project {project}: {e}"
+                )
+                progress = None
+            if progress is not None:
+                data["spend_profile"] = SpendProgressSerializer(progress).data
 
         return data
 
@@ -1088,6 +1153,41 @@ class SetAllowedDomainsSerializer(rf_serializers.Serializer):
     )
 
 
+class SpendProfileEntrySerializer(rf_serializers.Serializer):
+    """One period of an award's spend profile, as AwardDetails carries it:
+    the controls from ``from`` until the next entry's date (the last until
+    the award ends). A control left out does not apply in that period; an
+    entry with neither means no controls from its date."""
+
+    locals()["from"] = rf_serializers.DateField(
+        help_text="The date these controls apply from."
+    )
+    minimum = rf_serializers.CharField(
+        required=False,
+        allow_null=True,
+        help_text="The least to spend in this period, e.g. '250 NHR', in the "
+        "award's allocation units. Left out: no minimum.",
+    )
+    maximum = rf_serializers.CharField(
+        required=False,
+        allow_null=True,
+        help_text="The most that may be spent in this period, e.g. '250 NHR', "
+        "in the award's allocation units. Left out: no maximum.",
+    )
+
+    def to_representation(self, instance):
+        # As AwardDetails spells an entry: a control not set is left out.
+        data = super().to_representation(instance)
+        return {key: value for key, value in data.items() if value is not None}
+
+
+class SetSpendProfileSerializer(rf_serializers.Serializer):
+    """Replace an award's spend profile. [] removes it, which is allowed only
+    before any of its periods has begun."""
+
+    spend_profile = SpendProfileEntrySerializer(many=True, allow_empty=True)
+
+
 class SetLinksSerializer(rf_serializers.Serializer):
     """
     Update any combination of the four award links in one call.
@@ -1210,6 +1310,21 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
     breakdown = rf_serializers.DictField(
         child=rf_serializers.CharField(), read_only=True
     )
+    spend_profile = SpendProfileEntrySerializer(
+        many=True,
+        read_only=True,
+        allow_null=True,
+        help_text="Dated minimum and/or maximum spends for the award, "
+        "enforced by the site. Null: none set.",
+    )
+    site_features = rf_serializers.ListField(
+        child=rf_serializers.CharField(),
+        read_only=True,
+        allow_null=True,
+        help_text="What the site's portal says it supports for this award's "
+        "offering, e.g. award_spend_minimums and award_spend_maximums. Null: "
+        "not known.",
+    )
 
     resource_uuid = rf_serializers.SerializerMethodField()
     resource_name = rf_serializers.SerializerMethodField()
@@ -1249,6 +1364,10 @@ class RemoteProjectSerializer(rf_serializers.ModelSerializer):
             "membership_control",
             "allowed_domains",
             "breakdown",
+            # Spend controls (always visible)
+            "spend_profile",
+            "site_features",
+            "site_features_checked_at",
             # Privileged
             "last_sent_details",
             "last_confirmed_details",

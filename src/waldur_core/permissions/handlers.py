@@ -401,6 +401,9 @@ def reactivate_user_if_gaining_roles(sender, instance, current_user=None, **kwar
         return
 
     user = instance.user
+    # The account as saved: the UserRole may carry a copy of the user loaded
+    # before a revoke deactivated it, which still reads as active.
+    user.refresh_from_db(fields=["is_active"])
     if should_reactivate_user(user):
         reactivate_user_with_logging(user, "Gained a new role")
 

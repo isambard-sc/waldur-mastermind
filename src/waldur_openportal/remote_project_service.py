@@ -7,7 +7,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from waldur_core.core.enums import CoreStates
-from waldur_openportal import models
+from waldur_openportal import exceptions, models
 
 logger = logging.getLogger(__name__)
 
@@ -702,3 +702,25 @@ def record_resource_deleted(remote_project, note=""):
     )
 
     return audit_entry
+
+
+def refresh_site_features(remote_project):
+    """Ask the site what its portal supports for this award's offering
+    (get_supported_features) and keep the answer. A site that cannot be
+    reached in time leaves the last answer as it was. Returns the features,
+    or None if the site did not answer."""
+    from waldur_openportal.client import OpenPortalClient
+
+    try:
+        features = OpenPortalClient(remote_project.destination).get_supported_features()
+    except exceptions.OpenPortalError as e:
+        logger.info(
+            "Site features for %s not refreshed: %s", remote_project.destination, e
+        )
+        return None
+    remote_project.site_features = features
+    remote_project.site_features_checked_at = timezone.now()
+    remote_project.save(
+        update_fields=["site_features", "site_features_checked_at", "modified"]
+    )
+    return features

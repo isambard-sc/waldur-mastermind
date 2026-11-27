@@ -8,6 +8,7 @@ import time
 import openportal
 from celery import shared_task
 from constance import config as constance_config
+from django.utils import timezone
 
 from waldur_core.core import utils as core_utils
 from waldur_core.core.enums import CoreStates, ReviewStates
@@ -24,6 +25,7 @@ from . import (
     models,
     project_updates,
     remote_project_service,
+    spend_profiles,
     utils,
 )
 from .board import OpenPortalBoard, _trim_job
@@ -694,6 +696,31 @@ def sync_remote_allocation_storage(serialized_allocation):
     backend.sync_storage(allocation)
 
 
+@shared_task(name="waldur_openportal.refresh_site_features")
+@run_once_task(takeover_timeout=60 * 60)
+def refresh_site_features():
+    """Ask each site, once per offering, what its portal supports (e.g.
+    award_spend_minimums), and keep the answer on every award sent there.
+    Answers are snapshots: sites upgrade, so this is asked daily. A site that
+    does not answer in time keeps its last answer."""
+    from waldur_openportal.client import OpenPortalClient
+
+    destinations = (
+        models.RemoteProject.objects.exclude(state=models.RemoteProjectState.DELETED)
+        .values_list("destination", flat=True)
+        .distinct()
+    )
+    for destination in destinations:
+        try:
+            features = OpenPortalClient(destination).get_supported_features()
+        except Exception as e:
+            logger.info("Site features for %s not refreshed: %s", destination, e)
+            continue
+        models.RemoteProject.objects.filter(destination=destination).update(
+            site_features=features, site_features_checked_at=timezone.now()
+        )
+
+
 @shared_task(name="waldur_openportal.refresh_remote_projects")
 @run_once_task(takeover_timeout=60 * 60)
 def refresh_remote_projects():
@@ -838,6 +865,22 @@ def sync_allocation_limits():
                     f"Project {project} has no OpenPortal allocations - skipping"
                 )
                 continue
+
+            # An award's spend profile caps what may be spent so far:
+            # the credits stay the award's, the limit is the cap's.
+            managed_project = models.ManagedProject.objects.filter(
+                project=project
+            ).first()
+            if managed_project is not None and credits_available > 0:
+                withheld = spend_profiles.withheld_credits(
+                    managed_project, spend_profiles.today()
+                )
+                if withheld > 0:
+                    logger.debug(
+                        f"Spend profile of {managed_project} withholds "
+                        f"{withheld} of {credits_available} credits"
+                    )
+                    credits_available = max(0.0, credits_available - withheld)
 
             # Calculate the total usage so far this month across OpenPortal allocations
             # for this project - if it exceeds the number of project credits available
@@ -1762,6 +1805,13 @@ def run_job(serialized_job):
         elif command == "get_project" or command == "get_award":
             identifier = openportal.ProjectIdentifier(args[0])
             result = board.get_award(identifier)
+        elif command == "is_feature_supported":
+            # Asked by an awarding portal before relying on, e.g., a spend
+            # profile being enforced here. Answered from what this portal
+            # does; a name it has never heard of is simply not supported.
+            result = args[0] in spend_profiles.SUPPORTED_FEATURES
+        elif command == "get_supported_features":
+            result = sorted(spend_profiles.SUPPORTED_FEATURES)
         elif command == "get_projects":
             identifier = openportal.PortalIdentifier(args[0])
             result = board.get_projects(identifier)

@@ -435,7 +435,8 @@ def hand_over_single_proposal_manager(sender, instance, current_user=None, **kwa
     admin_role = Role.objects.filter(name=RoleEnum.PROPOSAL_ADMIN).first()
     reason = f"Proposal management handed over to {new_manager.full_name}."
     for user_role in previous:
-        user_role.revoke(current_user, reason=reason)
+        # The administrator role first: revoking a user's only role would
+        # deactivate their account (DEACTIVATE_USER_IF_NO_ROLES).
         if (
             admin_role
             and not UserRole.objects.filter(
@@ -449,6 +450,7 @@ def hand_over_single_proposal_manager(sender, instance, current_user=None, **kwa
                 created_by=current_user,
                 reason=reason,
             )
+        user_role.revoke(current_user, reason=reason)
     if proposal.created_by_id != new_manager.id:
         proposal.created_by = new_manager
         proposal.save(update_fields=["created_by"])

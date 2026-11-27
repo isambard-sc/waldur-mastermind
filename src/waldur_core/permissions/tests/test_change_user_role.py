@@ -197,3 +197,36 @@ class ChangeUserRoleApiTest(test.APITransactionTestCase):
         self.assertEqual(
             active_roles(self.project, self.user), [ProjectRole.MEMBER.name]
         )
+
+
+@override_config(DEACTIVATE_USER_IF_NO_ROLES=True)
+class ChangeUserRoleKeepsTheUserActiveTest(TestCase):
+    """A user whose only role is the one being changed is never left with no
+    roles, so their account is not deactivated by the change."""
+
+    def setUp(self):
+        self.project = factories.ProjectFactory()
+        self.user = factories.UserFactory()
+        self.previous = utils.add_user(self.project, self.user, ProjectRole.MEMBER)
+
+    def test_the_account_stays_active(self):
+        utils.change_user_role(
+            self.project, self.user, self.previous, ProjectRole.ADMIN
+        )
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.is_active)
+        self.assertEqual(
+            active_roles(self.project, self.user), [ProjectRole.ADMIN.name]
+        )
+
+    def test_a_user_deactivated_meanwhile_is_reactivated_by_a_new_role(self):
+        """Reactivation reads the account as saved, not a copy loaded before
+        it was deactivated."""
+        stale = self.user
+        UserRole.objects.get(pk=self.previous.pk).revoke()  # its own copy
+        self.assertFalse(type(stale).all_objects.get(pk=stale.pk).is_active)
+        self.assertTrue(stale.is_active)  # the copy loaded earlier
+
+        utils.add_user(self.project, stale, ProjectRole.ADMIN)
+
+        self.assertTrue(type(stale).all_objects.get(pk=stale.pk).is_active)
