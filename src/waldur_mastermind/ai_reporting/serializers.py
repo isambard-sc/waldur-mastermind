@@ -1,0 +1,192 @@
+import base64
+
+from rest_framework import serializers
+
+from waldur_mastermind.ai_reporting import models
+
+
+class AskRequestSerializer(serializers.Serializer):
+    prompt = serializers.CharField(
+        allow_blank=False, trim_whitespace=True, max_length=10_000
+    )
+    # Exactly one of these: the conversation to continue, or a new one.
+    session = serializers.SlugRelatedField(
+        slug_field="uuid",
+        queryset=models.ReportingSession.objects.none(),
+        required=False,
+        allow_null=True,
+        default=None,
+    )
+    new_session = serializers.BooleanField(default=False)
+
+    def validate(self, attrs):
+        if (attrs["session"] is None) == (not attrs["new_session"]):
+            raise serializers.ValidationError(
+                "Pass either 'session' or 'new_session': true."
+            )
+        return attrs
+
+    def get_fields(self):
+        fields = super().get_fields()
+        # Only the caller's own sessions, so someone else's uuid gets the same
+        # "does not exist" error as one that was never created.
+        request = self.context.get("request")
+        if request is not None and request.user.is_authenticated:
+            fields["session"].queryset = models.ReportingSession.objects.filter(
+                user=request.user
+            )
+        return fields
+
+
+class ReportingFileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = models.ReportingFile
+        fields = ["uuid", "name", "file"]
+        read_only_fields = fields
+
+
+class ReportingFileListSerializer(ReportingFileSerializer):
+    """For the standalone files list. Adds the question and session, since
+    there's no surrounding message to read them from."""
+
+    session = serializers.SlugRelatedField(
+        source="message.session", slug_field="uuid", read_only=True
+    )
+    prompt = serializers.CharField(source="message.prompt", read_only=True)
+    title = serializers.CharField(source="message.title", read_only=True)
+
+    class Meta(ReportingFileSerializer.Meta):
+        fields = [
+            *ReportingFileSerializer.Meta.fields,
+            "created",
+            "session",
+            "prompt",
+            "title",
+        ]
+        read_only_fields = fields
+
+
+class ReportingMessageSerializer(serializers.ModelSerializer):
+    session = serializers.SlugRelatedField(slug_field="uuid", read_only=True)
+    files = ReportingFileSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = models.ReportingMessage
+        fields = [
+            "uuid",
+            "session",
+            "prompt",
+            "title",
+            "answer",
+            "status",
+            "progress",
+            "new_files",
+            "files",
+            "error_message",
+            "created",
+        ]
+        read_only_fields = fields
+
+
+class ReportingSessionSerializer(serializers.ModelSerializer):
+    # Annotated by ReportingSessionViewSet.get_queryset.
+    last_activity = serializers.DateTimeField(read_only=True)
+    message_count = serializers.IntegerField(read_only=True)
+    first_prompt = serializers.SerializerMethodField()
+    title = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.ReportingSession
+        fields = [
+            "uuid",
+            "created",
+            "last_activity",
+            "message_count",
+            "first_prompt",
+            "title",
+        ]
+        read_only_fields = fields
+
+    def _first_message(self, obj):
+        # Uses the view's prefetch when present, to avoid a query per row.
+        messages = getattr(obj, "ordered_messages", None)
+        return messages[0] if messages else obj.messages.order_by("created").first()
+
+    def get_first_prompt(self, obj) -> str:
+        first = self._first_message(obj)
+        return first.prompt if first else ""
+
+    def get_title(self, obj) -> str:
+        """The first question's title, used as the conversation's label."""
+        first = self._first_message(obj)
+        return first.title if first else ""
+
+
+class UsageStatsDailySerializer(serializers.Serializer):
+    date = serializers.DateField()
+    input_tokens = serializers.IntegerField()
+    output_tokens = serializers.IntegerField()
+    requests = serializers.IntegerField()
+
+
+class UsageStatsByUserSerializer(serializers.Serializer):
+    # Null once the user has been deleted; their usage is kept.
+    user = serializers.UUIDField(allow_null=True)
+    full_name = serializers.CharField(allow_blank=True)
+    username = serializers.CharField(allow_null=True)
+    input_tokens = serializers.IntegerField()
+    output_tokens = serializers.IntegerField()
+    requests = serializers.IntegerField()
+
+
+class UsageStatsResponseSerializer(serializers.Serializer):
+    """Site-wide token usage, not scoped to the caller."""
+
+    period_days = serializers.IntegerField()
+    total_input_tokens = serializers.IntegerField()
+    total_output_tokens = serializers.IntegerField()
+    total_requests = serializers.IntegerField()
+    total_cache_read_tokens = serializers.IntegerField()
+    total_cache_write_tokens = serializers.IntegerField()
+    daily = UsageStatsDailySerializer(many=True)
+    by_user = UsageStatsByUserSerializer(many=True)
+
+
+class HarnessConnectionSerializer(serializers.ModelSerializer):
+    """signing_private_key is write-only: omit it to keep the stored key, or
+    send an empty string to clear it. signing_private_key_set says whether
+    one is stored."""
+
+    signing_private_key = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_blank=True,
+        help_text="Base64-encoded raw Ed25519 private key bytes (see models.HarnessConnection).",
+    )
+    signing_private_key_set = serializers.SerializerMethodField()
+
+    class Meta:
+        model = models.HarnessConnection
+        fields = (
+            "base_url",
+            "signing_private_key",
+            "signing_private_key_set",
+            "modified",
+        )
+        read_only_fields = ("modified",)
+
+    def get_signing_private_key_set(self, connection) -> bool:
+        return bool(connection.signing_private_key)
+
+    def validate_signing_private_key(self, value):
+        if not value:
+            return value
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except Exception:
+            raise serializers.ValidationError("Not valid base64.")
+        if len(raw) != 32:
+            raise serializers.ValidationError(
+                "Not a raw Ed25519 private key: expected 32 bytes once base64-decoded."
+            )
+        return value

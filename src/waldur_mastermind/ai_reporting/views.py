@@ -1,0 +1,346 @@
+import uuid
+from datetime import timedelta
+
+from django.db import transaction
+from django.db.models import Count, Max, Prefetch, Sum
+from django.db.models.functions import TruncDate
+from django.utils import timezone
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    extend_schema,
+    extend_schema_view,
+)
+from rest_framework import decorators, status, views
+from rest_framework.exceptions import ValidationError
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+
+from waldur_core.core import permissions as core_permissions
+from waldur_core.core.exceptions import IncorrectStateException
+from waldur_core.core.utils import is_uuid_like
+from waldur_core.core.views import ActionsViewSet, ConstanceCheckExtensionMixin
+from waldur_core.structure import permissions as structure_permissions
+from waldur_mastermind.ai_reporting import limits, permissions, serializers, tasks
+from waldur_mastermind.ai_reporting.models import (
+    HarnessConnection,
+    ReportingFile,
+    ReportingMessage,
+    ReportingSession,
+    ReportingUsageRecord,
+)
+
+_USAGE_STATS_MAX_DAYS = 365
+_BUSY_MESSAGE = (
+    "Wait for the answer in this conversation before asking another question in it."
+)
+_USAGE_STATS_DEFAULT_DAYS = 30
+
+
+@extend_schema_view(
+    list=extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "session",
+                uuid.UUID,
+                OpenApiParameter.QUERY,
+                description="Filter to one of the caller's own AI reporting sessions.",
+                extensions={"x-waldur-operation-id": "ai_reporting_sessions_retrieve"},
+            ),
+        ]
+    )
+)
+class ReportingMessageViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
+    """Ask the AI reporting harness a question and poll for its answer.
+
+    Messages are only created via `ask`, so a client can't fabricate a
+    status or answer. Every action returns 424 while AI_REPORTING_ENABLED is
+    off, and all but usage_stats are limited to AI_REPORTING_ENABLED_ROLES.
+    """
+
+    extension_name = "AI_REPORTING"
+
+    queryset = (
+        ReportingMessage.objects.all()
+        .select_related("session__user")
+        .prefetch_related("files")
+    )
+    serializer_class = serializers.ReportingMessageSerializer
+    lookup_field = "uuid"
+    http_method_names = ["get", "post", "options"]
+    permission_classes = [IsAuthenticated, core_permissions.ActionsPermission]
+    disabled_actions = ["create", "update", "partial_update", "destroy"]
+
+    def get_queryset(self):
+        # Everyone, staff included, only sees their own messages.
+        queryset = super().get_queryset().filter(session__user=self.request.user)
+
+        # Lets the frontend restore a single conversation.
+        session_uuid = self.request.query_params.get("session", "")
+        if session_uuid:
+            if not is_uuid_like(session_uuid):
+                raise ValidationError({"session": "Must be a valid UUID."})
+            queryset = queryset.filter(session__uuid=session_uuid)
+
+        return queryset
+
+    list_permissions = [permissions.check_enabled_roles]
+    retrieve_permissions = [permissions.check_enabled_roles]
+    ask_permissions = [permissions.check_enabled_roles]
+    ask_serializer_class = serializers.AskRequestSerializer
+
+    @extend_schema(
+        summary="Ask the AI reporting harness a question",
+        description=(
+            "Queues the question and returns immediately - poll the returned "
+            "message for the answer. Pass 'session' to continue a conversation or "
+            "'new_session' to start one; one of the two is required."
+        ),
+        responses={202: serializers.ReportingMessageSerializer},
+    )
+    @decorators.action(detail=False, methods=["post"])
+    def ask(self, request):
+        request_serializer = self.get_serializer(data=request.data)
+        request_serializer.is_valid(raise_exception=True)
+
+        # 429 before anything is created if a usage limit is reached.
+        limits.enforce_usage_limits(request.user)
+
+        prompt = request_serializer.validated_data["prompt"]
+        new_session = request_serializer.validated_data["new_session"]
+        requested_session = request_serializer.validated_data["session"]
+        # Passes the request so file URLs come out absolute.
+        context = self.get_serializer_context()
+
+        with transaction.atomic():
+            # All three limits are checked under one lock: one question at a
+            # time per conversation, a few per user, and a site-wide limit.
+            limits.lock_asks()
+            pending = (
+                ReportingMessage.objects.filter(
+                    session=requested_session, status=ReportingMessage.Status.PENDING
+                ).first()
+                if requested_session is not None
+                else None
+            )
+            if pending is not None:
+                # A follow-up needs the answer before it, so it waits.
+                if pending.prompt != prompt:
+                    raise IncorrectStateException(_BUSY_MESSAGE)
+                # The same question sent twice (a double click or a retry):
+                # return the one in progress.
+                return Response(
+                    serializers.ReportingMessageSerializer(
+                        pending, context=context
+                    ).data,
+                    status=status.HTTP_202_ACCEPTED,
+                )
+
+            # Before anything is created, so a 429 leaves no empty conversation.
+            limits.enforce_per_user_limit(request.user)
+            limits.enforce_concurrency_limit()
+
+            session = (
+                ReportingSession.objects.create(user=request.user)
+                if new_session
+                else requested_session
+            )
+            message = ReportingMessage.objects.create(session=session, prompt=prompt)
+            # After commit, or a fast worker may not find the message yet.
+            transaction.on_commit(lambda: tasks.ask_harness.delay(message.pk))
+
+        return Response(
+            serializers.ReportingMessageSerializer(message, context=context).data,
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    # Staff/support only, whatever AI_REPORTING_ENABLED_ROLES says - other
+    # users' usage is more sensitive than being able to use the tool.
+    usage_stats_permissions = [
+        structure_permissions.is_staff_or_support,
+        permissions.check_support_scope,
+    ]
+    usage_stats_serializer_class = serializers.UsageStatsResponseSerializer
+
+    @extend_schema(
+        summary="Site-wide AI reporting token usage",
+        description=(
+            "Token usage totals and a daily trend across all users, not just the caller."
+        ),
+        parameters=[
+            OpenApiParameter(
+                "days",
+                int,
+                location=OpenApiParameter.QUERY,
+                description=f"Trailing window in days (1-{_USAGE_STATS_MAX_DAYS}, default {_USAGE_STATS_DEFAULT_DAYS}).",
+            ),
+        ],
+        responses={200: serializers.UsageStatsResponseSerializer},
+    )
+    @decorators.action(detail=False, methods=["get"])
+    def usage_stats(self, request):
+        try:
+            days = int(request.query_params.get("days", _USAGE_STATS_DEFAULT_DAYS))
+        except ValueError:
+            days = _USAGE_STATS_DEFAULT_DAYS
+        days = max(1, min(days, _USAGE_STATS_MAX_DAYS))
+        since = timezone.now() - timedelta(days=days)
+
+        # Site-wide, so not self.get_queryset(). Reads ReportingUsageRecord,
+        # which outlives message retention cleanup.
+        queryset = ReportingUsageRecord.objects.filter(created__gte=since)
+
+        totals = queryset.aggregate(
+            total_input_tokens=Sum("input_tokens"),
+            total_output_tokens=Sum("output_tokens"),
+            total_requests=Count("id"),
+            total_cache_read_tokens=Sum("cache_read_tokens"),
+            total_cache_write_tokens=Sum("cache_write_tokens"),
+        )
+
+        daily = list(
+            queryset.annotate(date=TruncDate("created"))
+            .values("date")
+            .annotate(
+                input_tokens=Sum("input_tokens"),
+                output_tokens=Sum("output_tokens"),
+                requests=Count("id"),
+            )
+            .order_by("date")
+        )
+
+        by_user = [
+            {
+                "user": row["user__uuid"],
+                # Blank for a deleted user, whose records are kept.
+                "full_name": " ".join(
+                    filter(None, [row["user__first_name"], row["user__last_name"]])
+                ),
+                "username": row["user__username"],
+                "input_tokens": row["input_tokens"],
+                "output_tokens": row["output_tokens"],
+                "requests": row["requests"],
+            }
+            for row in queryset.values(
+                "user__uuid",
+                "user__username",
+                "user__first_name",
+                "user__last_name",
+            )
+            .annotate(
+                input_tokens=Sum("input_tokens"),
+                output_tokens=Sum("output_tokens"),
+                requests=Count("id"),
+            )
+            .order_by("-input_tokens")
+        ]
+
+        response_data = {
+            "period_days": days,
+            "total_input_tokens": totals["total_input_tokens"] or 0,
+            "total_output_tokens": totals["total_output_tokens"] or 0,
+            "total_requests": totals["total_requests"] or 0,
+            "total_cache_read_tokens": totals["total_cache_read_tokens"] or 0,
+            "total_cache_write_tokens": totals["total_cache_write_tokens"] or 0,
+            "daily": daily,
+            "by_user": by_user,
+        }
+        return Response(serializers.UsageStatsResponseSerializer(response_data).data)
+
+
+class ReportingSessionViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
+    """The caller's own conversations, most recently active first. Read-only -
+    sessions are created by ReportingMessageViewSet.ask. Sessions whose
+    messages have all been cleaned up are hidden."""
+
+    extension_name = "AI_REPORTING"
+
+    queryset = ReportingSession.objects.all()
+    serializer_class = serializers.ReportingSessionSerializer
+    lookup_field = "uuid"
+    http_method_names = ["get", "options"]
+    permission_classes = [IsAuthenticated, core_permissions.ActionsPermission]
+
+    def get_queryset(self):
+        return (
+            ReportingSession.objects.filter(user=self.request.user)
+            .annotate(
+                last_activity=Max("messages__created"),
+                message_count=Count("messages"),
+            )
+            .filter(message_count__gt=0)
+            .prefetch_related(
+                Prefetch(
+                    "messages",
+                    queryset=ReportingMessage.objects.order_by("created"),
+                    to_attr="ordered_messages",
+                )
+            )
+            .order_by("-last_activity", "-id")
+        )
+
+    list_permissions = [permissions.check_enabled_roles]
+    retrieve_permissions = [permissions.check_enabled_roles]
+
+
+class ReportingFileViewSet(ConstanceCheckExtensionMixin, ActionsViewSet):
+    """The caller's own files across all sessions, so one can be found or
+    deleted without digging through the chat. Files are also deleted
+    automatically after AI_REPORTING_FILE_RETENTION_DAYS."""
+
+    extension_name = "AI_REPORTING"
+
+    queryset = ReportingFile.objects.all().select_related("message__session__user")
+    serializer_class = serializers.ReportingFileListSerializer
+    lookup_field = "uuid"
+    http_method_names = ["get", "delete", "options"]
+    permission_classes = [IsAuthenticated, core_permissions.ActionsPermission]
+
+    def get_queryset(self):
+        return (
+            super()
+            .get_queryset()
+            .filter(message__session__user=self.request.user)
+            .order_by("-created", "-id")
+        )
+
+    list_permissions = [permissions.check_enabled_roles]
+    retrieve_permissions = [permissions.check_enabled_roles]
+    destroy_permissions = [permissions.check_enabled_roles]
+
+
+class HarnessConnectionView(views.APIView):
+    """The site's AI reporting harness connection. Staff may change it;
+    support may read it."""
+
+    # Includes the access-token scopes: staff scope to change, support to read.
+    permission_classes = (
+        IsAuthenticated,
+        core_permissions.IsStaffWriterOrSupportReader,
+    )
+
+    @extend_schema(
+        operation_id="ai_reporting_harness_connection_retrieve",
+        responses=serializers.HarnessConnectionSerializer,
+    )
+    def get(self, request):
+        serializer = serializers.HarnessConnectionSerializer(HarnessConnection.get())
+        return Response(serializer.data)
+
+    @extend_schema(
+        operation_id="ai_reporting_harness_connection_partial_update",
+        request=serializers.HarnessConnectionSerializer,
+        responses=serializers.HarnessConnectionSerializer,
+    )
+    def patch(self, request):
+        with transaction.atomic():
+            connection = HarnessConnection.objects.select_for_update().get(
+                pk=HarnessConnection.get().pk
+            )
+            serializer = serializers.HarnessConnectionSerializer(
+                connection,
+                data=request.data,
+                partial=True,
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+        return Response(serializer.data)

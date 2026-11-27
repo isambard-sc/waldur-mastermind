@@ -27,6 +27,7 @@ accepted limitations. For the resource API key lifecycle specifically, see
 | `matrix_chat.MatrixHistoryExport.data_key` | whole value | key a Matrix history export's files are encrypted under; without it the export is unreadable |
 | `proposal_forms.FormbricksConnection.api_key` | whole value | Formbricks Management API key (fork-only); see [Proposal forms](guides/proposal-forms.md) |
 | `proposal_forms.FormbricksConnection.webhook_secret` | whole value | Formbricks webhook signing secret (fork-only) |
+| `ai_reporting.HarnessConnection.signing_private_key` | whole value | Ed25519 key that signs requests to the AI reporting harness |
 | Constance settings of type `secret_field` | whole value | see [Secret settings](#secret-settings) |
 
 Encryption is transparent: values are encrypted at the database-serialization
